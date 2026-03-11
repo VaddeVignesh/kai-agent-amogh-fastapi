@@ -1,0 +1,4456 @@
+from __future__ import annotations
+
+import os
+import traceback
+from dataclasses import asdict, is_dataclass
+from typing import Any, Dict, TypedDict
+
+from langgraph.graph import StateGraph, END
+import re
+import sys
+
+from app.orchestration.planner import Planner, ExecutionPlan
+from app.registries.intent_registry import INTENT_REGISTRY, SUPPORTED_INTENTS, resolve_intent
+from app.services.response_merger import compact_payload
+
+# =========================================================
+# Debug logging
+# =========================================================
+
+def _debug_enabled() -> bool:
+    return (os.getenv("KAI_DEBUG") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _dprint(*args: Any, **kwargs: Any) -> None:
+    if _debug_enabled():
+        try:
+            print(*args, **kwargs)
+        except UnicodeEncodeError:
+            # Windows consoles may use legacy encodings (cp1252). Fall back to an ASCII-safe render.
+            sep = kwargs.get("sep", " ")
+            end = kwargs.get("end", "\n")
+            safe_parts = []
+            for a in args:
+                s = str(a)
+                safe_parts.append(s.encode("ascii", errors="backslashreplace").decode("ascii"))
+            try:
+                print(sep.join(safe_parts), end=end)
+            except Exception:
+                # Last-resort: don't crash debug logging.
+                return
+
+# =========================================================
+# Helpers
+# =========================================================
+
+def _json_safe(obj: Any) -> Any:
+    """Convert any object to JSON-safe format"""
+    if obj is None:
+        return None
+    if hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
+        return obj.to_dict()
+    if is_dataclass(obj):
+        return asdict(obj)
+    if isinstance(obj, (dict, list, str, int, float, bool)):
+        return obj
+    return {"value": str(obj)}
+
+# =========================================================
+# Graph State
+# =========================================================
+
+class GraphState(TypedDict, total=False):
+    session_id: str
+    # user_input is the effective query used for planning/execution.
+    # raw_user_input is what the user actually typed this turn (e.g. "2301" answering a clarification).
+    user_input: str
+    raw_user_input: str
+    session_ctx: Dict[str, Any]
+
+    intent_key: str
+    slots: Dict[str, Any]
+    missing_keys: list[str]
+    clarification: str
+
+    plan_type: str
+    plan: Dict[str, Any]
+    step_index: int
+    artifacts: Dict[str, Any]
+
+    mongo: Any
+    finance: Any
+    ops: Any
+    
+    data: Dict[str, Any]
+    merged: Dict[str, Any]
+    answer: str
+
+# =========================================================
+# Router
+# =========================================================
+
+class GraphRouter:
+    """
+    Hybrid router with composite query support.
+    Handles slot merging, composite null safety, scenario detection, token optimization, ranking intents.
+    """
+
+    def __init__(self, *, llm, redis_store, mongo_agent, finance_agent, ops_agent):
+        self.llm = llm
+        self.redis = redis_store
+        self.mongo_agent = mongo_agent
+        self.finance_agent = finance_agent
+        self.ops_agent = ops_agent
+
+        self.planner = Planner(llm)
+        self.graph = self._build_graph()
+
+    # =========================================================
+    # Trace (UI-facing debug, not chain-of-thought)
+    # =========================================================
+
+    @staticmethod
+    def _step_goal_text(*, intent_key: str, agent: str, op: str, step_inputs: Dict[str, Any], slots: Dict[str, Any]) -> str:
+        """
+        Human-readable "goal" per step for UI trace.
+        Keep it short, concrete, and step-specific.
+        """
+        intent_key = (intent_key or "out_of_scope").strip()
+        agent = (agent or "").strip().lower()
+        op = (op or "").strip().lower()
+
+        if agent == "mongo" and op == "resolve_anchor":
+            return "Resolve/confirm voyage/vessel anchors in MongoDB (so downstream ranking uses the right entity filters)."
+
+        if agent == "finance" and op == "dynamic_sql":
+            limit = step_inputs.get("limit") or slots.get("limit")
+            metric = slots.get("metric")
+            if intent_key.startswith("ranking.") and metric:
+                return f"Fetch top {limit} voyages by {metric} from finance KPIs (Postgres), returning voyage_ids for downstream steps."
+            if intent_key.startswith("ranking."):
+                return f"Fetch top {limit} voyages for the ranking intent (Postgres finance KPIs), returning voyage_ids for downstream steps."
+            return f"Run a finance analysis query in Postgres (dynamic SQL) and return voyage_ids for downstream steps (limit={limit})."
+
+        if agent == "ops" and op == "dynamic_sql":
+            return "Fetch ops summaries (ports/grades/remarks/delay/offhire) for the selected voyage_ids from Postgres."
+
+        if agent == "mongo" and op == "fetch_remarks":
+            return "Fetch voyage remarks + minimal fixture context (ports/grades/commissions) for the selected voyage_ids from MongoDB."
+
+        if agent == "llm" and op == "merge":
+            return "Deterministically merge finance + ops + mongo context into a single joined dataset for summarization."
+
+        return f"Execute step: {agent}.{op}"
+
+    @staticmethod
+    def _compact_for_trace(val: Any, *, max_str: int = 6000, max_list: int = 12, max_dict: int = 50, _depth: int = 0) -> Any:
+        """
+        Compact large structures so trace doesn't explode:
+        - strings: truncated
+        - lists: keep first N
+        - dicts: keep first N keys (stable order)
+        """
+        if val is None:
+            return None
+        if isinstance(val, str):
+            s = val.strip()
+            if len(s) <= max_str:
+                return s
+            return s[:max_str].rstrip() + "\n-- (truncated) --"
+        if isinstance(val, (int, float, bool)):
+            return val
+        # Only depth-cap complex nested structures. Always preserve primitive leaf values
+        # (e.g. voyageIds inside $in lists) so the UI trace remains informative.
+        if _depth > 4:
+            return "...(depth cap)..."
+        if isinstance(val, list):
+            if len(val) <= max_list:
+                return [GraphRouter._compact_for_trace(v, max_str=max_str, max_list=max_list, max_dict=max_dict, _depth=_depth + 1) for v in val]
+            head = val[:max_list]
+            return [
+                *[GraphRouter._compact_for_trace(v, max_str=max_str, max_list=max_list, max_dict=max_dict, _depth=_depth + 1) for v in head],
+                f"...({len(val) - max_list} more)",
+            ]
+        if isinstance(val, dict):
+            items = list(val.items())
+            if len(items) > max_dict:
+                items = items[:max_dict]
+                out = {k: GraphRouter._compact_for_trace(v, max_str=max_str, max_list=max_list, max_dict=max_dict, _depth=_depth + 1) for k, v in items}
+                out["..."] = f"({len(val) - max_dict} more keys)"
+                return out
+            return {k: GraphRouter._compact_for_trace(v, max_str=max_str, max_list=max_list, max_dict=max_dict, _depth=_depth + 1) for k, v in val.items()}
+        # Fallback
+        return str(val)
+
+    @staticmethod
+    def _trace(state: GraphState, event: Dict[str, Any]) -> None:
+        """
+        Append a structured execution trace event into state.artifacts.trace.
+        This is intended for UI debug panels and MUST NOT contain private model reasoning.
+        """
+        artifacts = state.get("artifacts")
+        if not isinstance(artifacts, dict):
+            artifacts = {}
+        trace = artifacts.get("trace")
+        if not isinstance(trace, list):
+            trace = []
+        # Compact potentially large values (voyage_id lists, mongo specs, generated SQL, etc.)
+        safe_event: Dict[str, Any] = GraphRouter._compact_for_trace(event or {})
+        trace.append(safe_event)
+        # hard cap
+        if len(trace) > 200:
+            trace = trace[-200:]
+        artifacts["trace"] = trace
+        state["artifacts"] = artifacts
+
+    # =========================================================
+    # Pattern Detection for Scenario Comparisons
+    # =========================================================
+    
+    @staticmethod
+    def _detect_scenario_comparison(user_input: str, extracted_slots: Dict[str, Any]) -> tuple[bool, Dict[str, Any]]:
+        """
+        Pattern-based detection for scenario comparison queries.
+        
+        Detects queries like:
+        - "Compare ACTUAL vs WHEN_FIXED"
+        - "ACTUAL versus BUDGET"
+        - "Show me ACTUAL and WHEN_FIXED"
+        - "Variance between ACTUAL and BUDGET"
+        
+        Returns: (is_scenario_comparison, updated_slots)
+        """
+        user_lower = user_input.lower()
+        
+        # Scenario keywords mapping
+        scenario_keywords = {
+            "actual": "ACTUAL",
+            "when_fixed": "WHEN_FIXED",
+            "when fixed": "WHEN_FIXED",
+            "when-fixed": "WHEN_FIXED",
+            "whenfixed": "WHEN_FIXED",
+            "budget": "BUDGET",
+            "forecast": "FORECAST",
+            "projected": "PROJECTED"
+        }
+        
+        # Comparison indicators
+        comparison_words = [
+            "compare", "vs", "versus", "v/s", "v.s.", 
+            "difference", "variance", "gap", "between",
+            "against", "comparison"
+        ]
+        
+        # Detect scenarios in query
+        found_scenarios = []
+        for keyword, scenario_name in scenario_keywords.items():
+            if keyword in user_lower:
+                if scenario_name not in found_scenarios:
+                    found_scenarios.append(scenario_name)
+        
+        # Check for comparison words
+        has_comparison = any(word in user_lower for word in comparison_words)
+        
+        # If 2+ scenarios + comparison word = scenario comparison
+        if len(found_scenarios) >= 2 and has_comparison:
+            updated_slots = dict(extracted_slots)
+            updated_slots["scenario"] = found_scenarios
+            
+            _dprint(f"   🔍 PATTERN DETECTED: Scenario comparison")
+            _dprint(f"      Scenarios found: {found_scenarios}")
+            
+            return True, updated_slots
+        
+        # Also detect if "scenario" word is present with comparison
+        if "scenario" in user_lower and has_comparison and len(found_scenarios) >= 1:
+            updated_slots = dict(extracted_slots)
+            if "scenario" not in updated_slots:
+                updated_slots["scenario"] = found_scenarios if found_scenarios else ["ACTUAL", "WHEN_FIXED"]
+            return True, updated_slots
+        
+        return False, extracted_slots
+
+    # =========================================================
+    # Nodes
+    # =========================================================
+
+    @staticmethod
+    def _is_placeholder_entity_value(value: Any) -> bool:
+        """
+        Detect generic placeholder values that should NOT be treated as real entities.
+        These often appear in follow-ups, e.g. "what is the total revenue it".
+        """
+        if value in (None, "", [], {}):
+            return True
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if not v:
+                return True
+            placeholders = {
+                # Pronouns / deictics
+                "it", "this", "that", "these", "those", "them", "they",
+                "here", "there",
+                # Generic nouns
+                "port", "a port", "the port",
+                "vessel", "ship", "a vessel", "the vessel", "the ship",
+                "voyage", "a voyage", "the voyage",
+                # Common underspecified references
+                "this voyage", "that voyage", "this vessel", "that vessel",
+                "this port", "that port",
+            }
+            return v in placeholders
+        return False
+
+    @staticmethod
+    def _drop_placeholder_entity_slots(*, extracted_slots: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove entity slots that are clearly placeholders (e.g. vessel_name='it')."""
+        slots = dict(extracted_slots or {})
+        for k in ("vessel_name", "port_name", "imo", "voyage_id"):
+            if k in slots and GraphRouter._is_placeholder_entity_value(slots.get(k)):
+                slots.pop(k, None)
+        # voyage_number sometimes arrives as a string via LLM. If it's placeholder-ish, drop it.
+        if "voyage_number" in slots and GraphRouter._is_placeholder_entity_value(slots.get("voyage_number")):
+            slots.pop("voyage_number", None)
+        # voyage_numbers list: drop if it contains non-numeric placeholder strings.
+        if "voyage_numbers" in slots and isinstance(slots.get("voyage_numbers"), list):
+            vns = slots.get("voyage_numbers") or []
+            if any(isinstance(x, str) and GraphRouter._is_placeholder_entity_value(x) for x in vns):
+                slots.pop("voyage_numbers", None)
+        return slots
+
+    def n_load_session(self, state: GraphState) -> GraphState:
+        """Load session context from Redis"""
+        state["session_ctx"] = self.redis.load_session(state["session_id"])
+        return state
+
+    def n_extract_intent(self, state: GraphState) -> GraphState:
+        """
+        Extract intent and slots from user input.
+        Clear previous slots. Pattern-based override for scenario comparisons.
+        """
+        # Preserve what the user actually typed this turn.
+        if not isinstance(state.get("raw_user_input"), str):
+            state["raw_user_input"] = state.get("user_input", "") or ""
+        raw_user_input = state.get("raw_user_input", "") or ""
+
+        # user_input is the effective query used for intent/planning/execution.
+        user_input = state.get("user_input", "") or raw_user_input
+        session_id = state.get("session_id", "")
+        session_ctx = state.get("session_ctx") or {}
+        # LangGraph may populate declared state keys with None. Ensure artifacts is always a dict.
+        if not isinstance(state.get("artifacts"), dict):
+            state["artifacts"] = {}
+
+        # =========================================================
+        # Pending clarification: treat the user's message as a slot value
+        # =========================================================
+        pending_intent = session_ctx.get("pending_intent") if isinstance(session_ctx, dict) else None
+        pending_missing = session_ctx.get("missing_keys") if isinstance(session_ctx, dict) else None
+        if isinstance(pending_intent, str) and isinstance(pending_missing, list) and pending_missing:
+            options = {}
+            if isinstance(session_ctx, dict) and isinstance(session_ctx.get("clarification_options"), dict):
+                options = session_ctx.get("clarification_options") or {}
+            pending_question = (session_ctx.get("pending_question") or "") if isinstance(session_ctx, dict) else ""
+            pending_slots_base = (session_ctx.get("pending_slots") or {}) if isinstance(session_ctx, dict) else {}
+            if not isinstance(pending_slots_base, dict):
+                pending_slots_base = {}
+            resolved_slots = self._try_resolve_missing_from_text(
+                intent_key=pending_intent,
+                missing_keys=pending_missing,
+                user_input=raw_user_input,
+                options=options,
+            )
+            if resolved_slots is not None:
+                # Clear pending clarification immediately.
+                try:
+                    self.redis.save_session(
+                        state["session_id"],
+                        {
+                            **(session_ctx or {}),
+                            "pending_intent": None,
+                            "missing_keys": None,
+                            "clarification_options": {},
+                        },
+                    )
+                except Exception:
+                    pass
+
+                intent_key = pending_intent
+                extracted_slots = {**pending_slots_base, **resolved_slots}
+                followup_used = True
+
+                # Continue through the normal cleaning logic below, but skip the LLM call.
+                # Use the ORIGINAL pending question as the effective query for planning/execution.
+                if isinstance(pending_question, str) and pending_question.strip():
+                    user_input = pending_question.strip()
+                    state["user_input"] = user_input
+                # ---------------------------------------------------------
+                # Deterministic port/vessel/voyage shaping for incomplete queries
+                # ---------------------------------------------------------
+                intent_key, extracted_slots = self._maybe_override_incomplete_entity_intent(
+                    intent_key=intent_key,
+                    extracted_slots=extracted_slots,
+                    user_input=user_input,
+                )
+
+                # Use the same cleaning pipeline section (copied from below)
+                cleaned_slots = {}
+                user_input_lower = user_input.lower()
+                aggregate_intents = [
+                    "ranking.voyages", "ranking.vessels", "ranking.cargo",
+                    "ranking.ports", "ranking.routes",
+                    "analysis.high_revenue_low_pnl", "analysis.revenue_vs_pnl",
+                    "analysis.cargo_profitability", "analysis.segment_performance",
+                    "analysis.cost_breakdown", "analysis.profitability",
+                    "ops.delayed_voyages", "ops.cargo_movements", "ops.demurrage",
+                    "aggregation.count", "aggregation.average", "aggregation.total", "aggregation.trends",
+                    "temporal.period", "temporal.trend",
+                ]
+
+                if intent_key in aggregate_intents:
+                    for key in ["limit", "date_from", "date_to", "port_name", "scenario",
+                               "metric", "group_by", "threshold", "cargo_type", "cargo_grade"]:
+                        if key in extracted_slots:
+                            cleaned_slots[key] = extracted_slots[key]
+                else:
+                    for key, value in extracted_slots.items():
+                        cleaned_slots[key] = value
+
+                state["intent_key"] = intent_key
+                state["slots"] = cleaned_slots
+                artifacts = state.get("artifacts") or {}
+                artifacts["intent_key"] = intent_key
+                artifacts["slots"] = cleaned_slots
+                artifacts["user_input"] = user_input
+                state["artifacts"] = artifacts
+                self._trace(
+                    state,
+                    {
+                        "phase": "intent_extraction",
+                        "intent_key": intent_key,
+                        "slots": cleaned_slots,
+                        "source": "clarification_followup",
+                        "raw_user_input": raw_user_input,
+                        "effective_user_input": user_input,
+                    },
+                )
+                return state
+            else:
+                # If the user asked a *new question* instead of answering the clarification,
+                # drop pending state to avoid polluting the new turn.
+                if self._looks_like_new_question(user_input):
+                    try:
+                        self.redis.save_session(
+                            state["session_id"],
+                            {**(session_ctx or {}), "pending_intent": None, "missing_keys": None},
+                        )
+                    except Exception:
+                        pass
+
+        # Fast-path for chit-chat: avoid touching external dependencies (LLM/DB/Redis memory)
+        # for greetings / identity / help messages. These should always be handled as out_of_scope.
+        if self._is_chitchat(user_input):
+            intent_key = "out_of_scope"
+            cleaned_slots: Dict[str, Any] = {}
+
+            state["intent_key"] = intent_key
+            state["slots"] = cleaned_slots
+
+            artifacts = state.get("artifacts") or {}
+            artifacts["intent_key"] = intent_key
+            artifacts["slots"] = cleaned_slots
+            artifacts["user_input"] = user_input
+            state["artifacts"] = artifacts
+            self._trace(
+                state,
+                {
+                    "phase": "intent_extraction",
+                    "intent_key": intent_key,
+                    "slots": cleaned_slots,
+                    "source": "chitchat_fastpath",
+                },
+            )
+            return state
+
+        # =========================================================
+        # Result-set follow-ups ("among these/from above/in that list")
+        # If we have a previous multi-row result set stored, route TRUE follow-ups
+        # to a deterministic handler. Avoid false-positives on brand-new questions
+        # that merely contain words like "remarks" and "explain".
+        # =========================================================
+        ul = (user_input or "").strip().lower()
+        words = [w for w in ul.split() if w]
+        has_result_set = isinstance(session_ctx, dict) and isinstance(session_ctx.get("last_result_set"), dict)
+        explicit_rs_ref = any(
+            p in ul
+            for p in (
+                "among these",
+                "among them",
+                "from above",
+                "from the above",
+                "in that list",
+                "in the list",
+                "above list",
+                "the above",
+                "those voyages",
+                "these voyages",
+            )
+        )
+        starts_like_new_request = ul.startswith(
+            (
+                "show ",
+                "show me",
+                "list ",
+                "rank ",
+                "find ",
+                "give ",
+                "tell ",
+                "summarize",
+                "compare ",
+                "for ",
+                "which ",
+                "what ",
+            )
+        )
+
+        if has_result_set and explicit_rs_ref:
+            # Explicitly referencing the prior list/result set.
+            state["intent_key"] = "followup.result_set"
+            state["slots"] = {"action": "compare_extremes"}
+            artifacts = state.get("artifacts") or {}
+            artifacts["intent_key"] = "followup.result_set"
+            artifacts["slots"] = state["slots"]
+            artifacts["user_input"] = user_input
+            state["artifacts"] = artifacts
+            self._trace(
+                state,
+                {"phase": "intent_extraction", "intent_key": "followup.result_set", "slots": state["slots"], "source": "result_set_followup"},
+            )
+            return state
+
+        # Explain remarks / what went wrong: only treat as follow-up if it's a short follow-up prompt,
+        # NOT a full new request like "Show me the top 5 ... and include remarks that explain why ...".
+        is_short_followup = len(words) <= 12
+        starts_followup_verb = ul.startswith(("explain", "why", "what went wrong", "went wrong"))
+        mentions_remarks = ("remark" in ul) or ("remarks" in ul)
+        if has_result_set and mentions_remarks and is_short_followup and starts_followup_verb and not starts_like_new_request:
+            state["intent_key"] = "followup.result_set"
+            state["slots"] = {"action": "explain_remarks"}
+            artifacts = state.get("artifacts") or {}
+            artifacts["intent_key"] = "followup.result_set"
+            artifacts["slots"] = state["slots"]
+            artifacts["user_input"] = user_input
+            state["artifacts"] = artifacts
+            self._trace(
+                state,
+                {"phase": "intent_extraction", "intent_key": "followup.result_set", "slots": state["slots"], "source": "result_set_followup"},
+            )
+            return state
+
+        # Extremes (highest/lowest) as a short follow-up prompt.
+        if (
+            has_result_set
+            and any(k in ul for k in ("highest", "lowest", "max", "min"))
+            and is_short_followup
+            and not starts_like_new_request
+        ):
+            state["intent_key"] = "followup.result_set"
+            state["slots"] = {"action": "compare_extremes"}
+            artifacts = state.get("artifacts") or {}
+            artifacts["intent_key"] = "followup.result_set"
+            artifacts["slots"] = state["slots"]
+            artifacts["user_input"] = user_input
+            state["artifacts"] = artifacts
+            self._trace(
+                state,
+                {"phase": "intent_extraction", "intent_key": "followup.result_set", "slots": state["slots"], "source": "result_set_followup"},
+            )
+            return state
+        
+        ex = self.llm.extract_intent_slots(
+            text=user_input,
+            supported_intents=list(SUPPORTED_INTENTS),
+            schema_hint={
+                "slots": [
+                    "vessel_name", "imo",
+                    "voyage_number", "voyage_id", "voyage_numbers",
+                    "date_from", "date_to",
+                    "limit", "port_name", "scenario",
+                    "cargo_type", "cargo_grade",
+                    "metric", "group_by", "threshold"
+                ]
+            },
+        )
+        
+        intent_key = ex.get("intent_key", "out_of_scope")
+        extracted_slots = ex.get("slots", {}) or {}
+        # session_ctx already loaded above
+        
+        # Fix common LLM glitch: "tell me about voyage 1901" → vessel_name="voyage 1901"
+        try:
+            vn = extracted_slots.get("voyage_number")
+            vname = extracted_slots.get("vessel_name")
+            if isinstance(vname, str):
+                vname_norm = vname.strip().lower()
+                if vname_norm.startswith("voyage ") and any(ch.isdigit() for ch in vname_norm):
+                    # If it looks like a voyage reference, drop it as a vessel name.
+                    extracted_slots.pop("vessel_name", None)
+                elif vn is not None and vname_norm == f"voyage {int(float(vn))}":
+                    extracted_slots.pop("vessel_name", None)
+        except Exception:
+            pass
+
+        # Pattern-based override for scenario comparisons
+        is_scenario_comp, updated_slots = self._detect_scenario_comparison(user_input, extracted_slots)
+        if is_scenario_comp:
+            # Override intent if LLM classified incorrectly
+            if intent_key in ["out_of_scope", "voyage.summary", "composite.query"]:
+                _dprint(f"   🔄 PATTERN OVERRIDE: {intent_key} → comparison.scenario")
+                intent_key = "comparison.scenario"
+            extracted_slots = updated_slots
+        # Fallback: when-fixed + compare/variance but pattern missed → force scenario comparison
+        ul = user_input.lower()
+        if intent_key == "out_of_scope" and ("when-fixed" in ul or "when fixed" in ul):
+            if "compare" in ul or "variance" in ul or "versus" in ul or "vs" in ul:
+                intent_key = "analysis.scenario_comparison"
+                _dprint(f"   🔄 FALLBACK: out_of_scope → analysis.scenario_comparison")
+        
+        # Convert voyage_number(s) float to int
+        if "voyage_number" in extracted_slots:
+            try:
+                vn = extracted_slots["voyage_number"]
+                if isinstance(vn, list):
+                    extracted_slots["voyage_number"] = [int(float(v)) for v in vn]
+                else:
+                    extracted_slots["voyage_number"] = int(float(vn))
+            except (ValueError, TypeError):
+                pass
+        
+        if "voyage_numbers" in extracted_slots:
+            try:
+                vns = extracted_slots["voyage_numbers"]
+                if isinstance(vns, list):
+                    extracted_slots["voyage_numbers"] = [int(float(v)) for v in vns]
+            except (ValueError, TypeError):
+                pass
+        
+        # Convert limit float to int
+        if "limit" in extracted_slots:
+            try:
+                extracted_slots["limit"] = int(float(extracted_slots["limit"]))
+            except (ValueError, TypeError):
+                pass
+        
+        # Convert threshold float to int
+        if "threshold" in extracted_slots:
+            try:
+                extracted_slots["threshold"] = int(float(extracted_slots["threshold"]))
+            except (ValueError, TypeError):
+                pass
+
+        # Drop placeholder entity slots (e.g. vessel_name="it") so follow-up resolution can work.
+        extracted_slots = self._drop_placeholder_entity_slots(extracted_slots=extracted_slots)
+
+        # =========================================================
+        # Deterministic intent for cargo-grade voyage filters
+        # "what voyages have NHC as cargo grade" should not go out_of_scope.
+        # =========================================================
+        if any(k in ul for k in ("cargo grade", "cargo grades", "grade")) and ("voyage" in ul or "voyages" in ul):
+            if extracted_slots.get("cargo_grade") or extracted_slots.get("cargo_type"):
+                extracted_slots["cargo_grade"] = extracted_slots.get("cargo_grade") or extracted_slots.get("cargo_type")
+                intent_key = "ops.voyages_by_cargo_grade"
+
+        # =========================================================
+        # Session memory (follow-up resolution)
+        # If the user asks a follow-up without repeating the entity,
+        # reuse the last known voyage/vessel from Redis session slots.
+        # =========================================================
+        followup_used = False
+        intent_key, extracted_slots, followup_used = self._apply_session_followup(
+            intent_key=intent_key,
+            extracted_slots=extracted_slots,
+            session_ctx=session_ctx,
+            user_input=user_input,
+        )
+
+        # =========================================================
+        # Lightweight parameter memory (limit/date/scenario/etc.)
+        # Only applies on follow-ups and only for safe preference-like keys.
+        # =========================================================
+        extracted_slots = self._apply_session_param_memory(
+            extracted_slots=extracted_slots,
+            session_ctx=session_ctx,
+            user_input=user_input,
+            followup_used=followup_used,
+        )
+
+        # =========================================================
+        # Deterministic port extraction + intent override for ops port queries
+        # Example: "Find voyages with Rotterdam in the route ..."
+        # =========================================================
+        intent_key, extracted_slots = self._maybe_override_to_port_query(
+            intent_key=intent_key,
+            extracted_slots=extracted_slots,
+            user_input=user_input,
+        )
+
+        # Delayed + negative PnL: avoid ops.port_query with port_name="negative PnL" → force finance.loss_due_to_delay
+        if intent_key == "ops.port_query" and extracted_slots.get("port_name"):
+            pn = str(extracted_slots.get("port_name", "")).lower()
+            if "pnl" in pn or ("negative" in pn and "port" not in pn):
+                _dprint(f"   🔄 OVERRIDE: ops.port_query (port_name={extracted_slots.get('port_name')}) → finance.loss_due_to_delay")
+                intent_key = "finance.loss_due_to_delay"
+                extracted_slots.pop("port_name", None)
+
+        # Handle incomplete entity questions ("tell me about port/vessel/voyage") deterministically.
+        intent_key, extracted_slots = self._maybe_override_incomplete_entity_intent(
+            intent_key=intent_key,
+            extracted_slots=extracted_slots,
+            user_input=user_input,
+        )
+        
+        # Clean slots based on what's in the query
+        cleaned_slots = {}
+        user_input_lower = user_input.lower()
+        
+        # Aggregate/ranking intents should not have specific entity filters
+        aggregate_intents = [
+            # Rankings - ALL types
+            "ranking.voyages", "ranking.vessels", "ranking.cargo", 
+            "ranking.ports", "ranking.routes",
+            
+            # Analysis
+            "analysis.high_revenue_low_pnl", "analysis.revenue_vs_pnl",
+            "analysis.cargo_profitability", "analysis.segment_performance",
+            "analysis.cost_breakdown", "analysis.profitability",
+            
+            # Operations
+            "ops.delayed_voyages", "ops.cargo_movements", "ops.demurrage",
+            
+            # Aggregations
+            "aggregation.count", "aggregation.average", "aggregation.total", "aggregation.trends",
+            
+            # Temporal
+            "temporal.period", "temporal.trend",
+        ]
+        
+        if intent_key in aggregate_intents:
+            # Only keep limit, date ranges, and criteria slots (NOT specific entity IDs)
+            for key in ["limit", "date_from", "date_to", "port_name", "scenario", 
+                       "metric", "group_by", "threshold", "cargo_type", "cargo_grade"]:
+                if key in extracted_slots:
+                    cleaned_slots[key] = extracted_slots[key]
+
+            # Exception: if user explicitly says include/including a specific voyage,
+            # keep the voyage_number(s) so composite can resolve and force-include it.
+            if ("include" in user_input_lower or "including" in user_input_lower):
+                if "voyage_number" in extracted_slots:
+                    cleaned_slots["voyage_number"] = extracted_slots["voyage_number"]
+                if "voyage_numbers" in extracted_slots:
+                    cleaned_slots["voyage_numbers"] = extracted_slots["voyage_numbers"]
+        else:
+            # For specific entity queries, validate slots are mentioned in query
+            for key, value in extracted_slots.items():
+                if key == "voyage_number":
+                    # Keep only if voyage number is mentioned in query
+                    if followup_used or str(value) in user_input:
+                        cleaned_slots[key] = value
+                elif key == "voyage_numbers":
+                    # Always keep voyage_numbers for comparisons
+                    cleaned_slots[key] = value
+                elif key == "vessel_name":
+                    # Keep only if vessel name is mentioned in query
+                    if followup_used or (isinstance(value, str) and value.lower() in user_input_lower):
+                        cleaned_slots[key] = value
+                elif key == "scenario":
+                    # Always keep scenario for comparisons
+                    cleaned_slots[key] = value
+                else:
+                    # Keep other slots
+                    cleaned_slots[key] = value
+
+        # =========================================================
+        # Normalize voyage_numbers to voyage_number (single)
+        # =========================================================
+        if "voyage_numbers" in cleaned_slots and isinstance(cleaned_slots["voyage_numbers"], list) and len(cleaned_slots["voyage_numbers"]) == 1:
+            cleaned_slots["voyage_number"] = cleaned_slots["voyage_numbers"][0]
+        
+        # Debug
+        _dprint(f"\n🔍 INTENT EXTRACTION:")
+        _dprint(f"   Intent: {intent_key}")
+        _dprint(f"   Slots (cleaned): {cleaned_slots}")
+        
+        # Pre-classify single vs composite
+        is_single = self._is_single_entity_query(intent_key, cleaned_slots, user_input)
+        if is_single:
+            _dprint(f"   🎯 PRE-CLASSIFIED AS SINGLE (specific entity)")
+        else:
+            _dprint(f"   🎯 LIKELY COMPOSITE (ranking + multi-agent)")
+        
+        # Update state with cleaned slots
+        state["intent_key"] = intent_key
+        state["slots"] = cleaned_slots
+        
+        # Store in artifacts
+        artifacts = state.get("artifacts") or {}
+        artifacts["intent_key"] = intent_key
+        artifacts["slots"] = cleaned_slots
+        artifacts["user_input"] = user_input
+        state["artifacts"] = artifacts
+        
+        self._trace(
+            state,
+            {
+                "phase": "intent_extraction",
+                "intent_key": intent_key,
+                "slots": cleaned_slots,
+                "likely_path": "single" if is_single else "composite",
+                "source": "llm_extract_intent_slots",
+            },
+        )
+        
+        return state
+
+    def _maybe_override_incomplete_entity_intent(
+        self,
+        *,
+        intent_key: str,
+        extracted_slots: Dict[str, Any],
+        user_input: str,
+    ) -> tuple[str, Dict[str, Any]]:
+        ui = (user_input or "").strip()
+        ul = ui.lower()
+        slots = dict(extracted_slots or {})
+
+        wants_details = any(
+            p in ul
+            for p in (
+                "tell me about",
+                "details",
+                "detail",
+                "information",
+                "info",
+                "summary",
+                "summarize",
+                "what is",
+                "what's",
+                "describe",
+                "define",
+            )
+        )
+
+        has_voyage_anchor = bool(slots.get("voyage_number") or slots.get("voyage_numbers") or slots.get("voyage_id"))
+        has_vessel_anchor = bool(slots.get("vessel_name") or slots.get("imo"))
+        has_port_anchor = bool(slots.get("port_name"))
+
+        # Port details intent ONLY when the user is asking about a port,
+        # not when "ports" appears as an attribute of a voyage/vessel summary.
+        # Safe because we only trigger it when there is no other entity anchor.
+        port_topic = bool(re.search(r"\bport\b", ul))
+        if port_topic and wants_details and not has_port_anchor and not has_voyage_anchor and not has_vessel_anchor:
+            return "port.details", slots
+
+        # Vessel summary intent if user asks about "vessel/ship" without vessel_name/imo.
+        vessel_topic = bool(re.search(r"\b(vessel|ship)\b", ul)) and any(
+            p in ul
+            for p in (
+                "tell me about vessel",
+                "tell me about ship",
+                "vessel summary",
+                "ship details",
+                "vessel details",
+            )
+        )
+        if vessel_topic and wants_details and not has_vessel_anchor and not has_voyage_anchor and not has_port_anchor:
+            return "vessel.summary", slots
+
+        # Voyage summary intent if user asks about "voyage" without voyage_number/id.
+        voyage_topic = bool(re.search(r"\bvoyage\b", ul)) and any(
+            p in ul
+            for p in (
+                "tell me about voyage",
+                "voyage summary",
+                "voyage details",
+                "details about voyage",
+                "information about voyage",
+            )
+        )
+        if voyage_topic and wants_details and not has_voyage_anchor and not has_vessel_anchor and not has_port_anchor:
+            return "voyage.summary", slots
+
+        return intent_key, slots
+
+    @staticmethod
+    def _looks_like_new_question(user_input: str) -> bool:
+        ui = (user_input or "").strip()
+        if not ui:
+            return False
+        ul = ui.lower()
+        if "?" in ui:
+            return True
+        # Common question/command verbs that should not be treated as a slot value.
+        markers = (
+            "tell me",
+            "what is",
+            "what's",
+            "who is",
+            "how ",
+            "show ",
+            "list ",
+            "find ",
+            "top ",
+            "rank",
+            "compare",
+            "summarize",
+            "summary",
+            "details",
+            "information",
+            "explain",
+        )
+        if any(m in ul for m in markers):
+            return True
+        # Long-ish inputs are likely a question, not just a value.
+        if len(ui.split()) > 4:
+            return True
+        return False
+
+    @staticmethod
+    def _try_resolve_missing_from_text(
+        *,
+        intent_key: str,
+        missing_keys: list[str],
+        user_input: str,
+        options: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any] | None:
+        ui = (user_input or "").strip()
+        if not ui:
+            return None
+
+        ul = ui.lower()
+        slots: Dict[str, Any] = {}
+        opts = options or {}
+
+        # Numeric selection (1-based) from prior suggestions.
+        idx = None
+        if ui.isdigit() and len(ui) <= 2:
+            try:
+                idx = int(ui) - 1
+            except Exception:
+                idx = None
+
+        def _pick(key: str) -> Any:
+            if idx is None:
+                return None
+            arr = opts.get(key)
+            if isinstance(arr, list) and 0 <= idx < len(arr):
+                return arr[idx]
+            return None
+
+        # A user might respond with a full sentence ("Port is Rotterdam").
+        # We'll do simple extraction by missing slot type.
+        if "voyage_number" in missing_keys:
+            picked = _pick("voyage_number") or _pick("voyage_numbers")
+            if picked is not None:
+                try:
+                    slots["voyage_number"] = int(picked)
+                except Exception:
+                    pass
+            m = re.search(r"\b(\d{3,5})\b", ui)
+            if "voyage_number" not in slots and not m:
+                return None
+            if "voyage_number" not in slots and m:
+                slots["voyage_number"] = int(m.group(1))
+
+        if "port_name" in missing_keys:
+            picked = _pick("port_name")
+            if picked:
+                slots["port_name"] = str(picked).strip()
+                return slots
+
+            # Do not treat an incomplete question as a port name (e.g. "tell me about port").
+            if any(p in ul for p in ("tell me", "what is", "what's", "summary", "summarize", "details", "information", "explain", "show ", "list ", "find ")):
+                # If they provided "port <name>" inside the sentence, we still accept it.
+                m = re.search(r"\bport\s+([A-Za-z].+)$", ui, flags=re.IGNORECASE)
+                if not m:
+                    return None
+                cand = m.group(1)
+            else:
+                # Try patterns like "port Rotterdam" / "Rotterdam"
+                m = re.search(r"\bport\s+([A-Za-z].+)$", ui, flags=re.IGNORECASE)
+                cand = (m.group(1) if m else ui)
+
+            cand = (cand or "").strip().strip("\"'").strip()
+            # Reject if still looks like the user is asking about "port" with no name.
+            if cand.lower() in {"port", "a port", "the port"}:
+                return None
+            if "port" in cand.lower() and cand.lower().endswith("port"):
+                return None
+            if not cand or len(cand) > 80:
+                return None
+            slots["port_name"] = cand
+
+        if "vessel_name" in missing_keys or "imo" in missing_keys:
+            picked = _pick("vessel_name")
+            if picked:
+                slots["vessel_name"] = str(picked).strip()
+                return slots
+
+            # If user gave an IMO, accept it; else treat as vessel name.
+            m = re.search(r"\b(\d{7})\b", ui)
+            if m:
+                slots["imo"] = m.group(1)
+            else:
+                # Avoid absorbing an incomplete question as the vessel name.
+                if any(p in ul for p in ("tell me", "what is", "what's", "summary", "summarize", "details", "information", "explain", "show ", "list ", "find ")):
+                    # Allow patterns like "vessel Stena Important"
+                    m2 = re.search(r"\b(vessel|ship)\s+([A-Za-z].+)$", ui, flags=re.IGNORECASE)
+                    if not m2:
+                        return None
+                    cand2 = (m2.group(2) or "").strip()
+                    if not cand2:
+                        return None
+                    slots["vessel_name"] = cand2.strip().strip("\"'")
+                else:
+                    if ui.isdigit():
+                        return None
+                    if not (2 <= len(ui) <= 60):
+                        return None
+                    slots["vessel_name"] = ui.strip().strip("\"'")
+
+        if "cargo_type" in missing_keys:
+            if len(ui) > 60:
+                return None
+            slots["cargo_type"] = ui.strip()
+
+        return slots if slots else None
+
+    @staticmethod
+    def _is_chitchat(user_input: str) -> bool:
+        """
+        Detect greetings / identity / help messages that should never be treated as
+        "follow-ups" inheriting prior entity anchors (voyage/vessel/port).
+        """
+        ui = (user_input or "").strip()
+        if not ui:
+            return True
+        ul = ui.lower()
+
+        # Common greetings
+        greetings = {
+            "hi", "hello", "hey", "hiya", "yo",
+            "good morning", "good afternoon", "good evening",
+        }
+        if ul in greetings:
+            return True
+        if any(ul.startswith(p) for p in ("hi ", "hello ", "hey ")):
+            return True
+
+        # Help / onboarding
+        if ul in {"help", "start", "menu", "commands"}:
+            return True
+
+        # Identity / capability questions
+        identity_phrases = (
+            "who are you",
+            "who r you",
+            "who are u",
+            "who r u",
+            "what are you",
+            "what are u",
+            "what can you do",
+            "what can u do",
+            "what do you do",
+            "what do u do",
+        )
+        if any(p in ul for p in identity_phrases):
+            return True
+
+        return False
+
+    @staticmethod
+    def _apply_session_followup(
+        *,
+        intent_key: str,
+        extracted_slots: Dict[str, Any],
+        session_ctx: Dict[str, Any],
+        user_input: str,
+    ) -> tuple[str, Dict[str, Any], bool]:
+        """
+        Resolve follow-up questions using Redis session memory.
+
+        When the user asks something like "what about expenses?" right after a voyage/vessel query,
+        the intent extractor may return no entity slots. This function injects the last known entity
+        into slots and (when appropriate) coerces the intent to voyage.summary or vessel.summary.
+        """
+        slots = dict(extracted_slots or {})
+        ui = (user_input or "").strip()
+        ul = ui.lower()
+
+        # Never treat greetings / identity / help as follow-ups that inherit anchors.
+        if GraphRouter._is_chitchat(ui):
+            return intent_key, slots, False
+
+        # If the query already includes an entity, do nothing.
+        def _has_valid_entity_slots(s: Dict[str, Any]) -> bool:
+            for k in ("voyage_number", "voyage_numbers", "voyage_id", "vessel_name", "imo", "port_name"):
+                v = (s or {}).get(k)
+                if v in (None, "", [], {}):
+                    continue
+                if k in ("vessel_name", "port_name", "imo", "voyage_id") and GraphRouter._is_placeholder_entity_value(v):
+                    continue
+                if k == "voyage_number":
+                    # must be numeric-ish; ignore placeholders like "it"
+                    if isinstance(v, (int, float)):
+                        return True
+                    if isinstance(v, str) and v.strip().isdigit():
+                        return True
+                    continue
+                if k == "voyage_numbers":
+                    if isinstance(v, list) and any(isinstance(x, (int, float)) for x in v):
+                        return True
+                    continue
+                return True
+            return False
+
+        if _has_valid_entity_slots(slots):
+            return intent_key, slots, False
+
+        # If the user is explicitly asking for a different entity family, do not inject anchors.
+        # Example: after a voyage, user says "tell me about vessel" -> should clarify vessel, not reuse voyage.
+        if any(p in ul for p in ("tell me about vessel", "vessel summary", "ship details", "tell me about ship")):
+            return intent_key, slots, False
+        if any(p in ul for p in ("tell me about port", "port details", "tell me about a port")):
+            return intent_key, slots, False
+
+        sess_slots = {}
+        if isinstance(session_ctx, dict):
+            # Prefer filtered persisted memory slots if present
+            sess_slots = session_ctx.get("memory_slots") or session_ctx.get("slots") or {}
+        if not isinstance(sess_slots, dict) or not sess_slots:
+            return intent_key, slots, False
+
+        # Ranking follow-up: "Same, but ..." should reuse last_intent/params, not entity anchors.
+        last_intent = (session_ctx.get("last_intent") or "") if isinstance(session_ctx, dict) else ""
+        if "same" in ul and last_intent.startswith("ranking."):
+            # Prefer more specific ranking based on the new wording.
+            if "commission" in ul:
+                return "ranking.voyages_by_commission", slots, False
+            if "revenue" in ul:
+                return "ranking.voyages_by_revenue", slots, False
+            if "pnl" in ul or "profit" in ul:
+                return "ranking.voyages_by_pnl", slots, False
+            return last_intent, slots, False
+
+        # Only apply on likely follow-up phrasing (avoid polluting unrelated questions).
+        followup_markers = (
+            "what about",
+            "what else",
+            "also",
+            "and ",
+            "same",
+            "more",
+            "details",
+            "breakdown",
+            "explain",
+            "why",
+            "how",
+            "show",
+            "include",
+            "any remarks",
+            "remarks",
+            "ports",
+            "grades",
+            "expenses",
+            "revenue",
+            "pnl",
+            "tce",
+            "commission",
+        )
+        looks_like_followup = any(m in ul for m in followup_markers) or len(ul.split()) <= 8
+        if not looks_like_followup:
+            return intent_key, slots, False
+
+        # Pronoun-heavy follow-ups should still inherit anchors even if the intent classifier
+        # guessed an aggregate/ranking-like intent.
+        has_coref = any(w in ul.split() for w in ("it", "this", "that", "these", "those", "them", "they"))
+        rankingish = any(k in ul for k in (
+            "top", "rank", "ranking",
+            "highest", "lowest", "best", "worst", "most", "least",
+            "which",
+            "compare", "vs", "versus", "variance", "between",
+            "loss-making", "loss making", "losing",
+        ))
+
+        # If this is clearly a ranking question (and not a coreference like "this voyage"),
+        # do NOT inject entity anchors. Ranking questions should be independent.
+        if rankingish and not has_coref:
+            # If the extractor produced out_of_scope for a ranking-ish follow-up, salvage it.
+            if intent_key in ("out_of_scope", "composite.query"):
+                if "commission" in ul:
+                    return "ranking.voyages_by_commission", slots, True
+                if "revenue" in ul:
+                    return "ranking.voyages_by_revenue", slots, True
+                if any(w in ul for w in ("pnl", "profit", "loss")):
+                    return "ranking.voyages_by_pnl", slots, True
+                return "ranking.voyages", slots, True
+            return intent_key, slots, False
+
+        # Do NOT inject entity anchors into independent queries (ranking/analysis/ops).
+        # These should run based on current query + param memory only.
+        if (
+            ((intent_key or "").startswith("ranking.") or (intent_key or "").startswith("analysis.") or (intent_key or "").startswith("ops."))
+            and (not has_coref or rankingish)
+        ):
+            return intent_key, slots, False
+
+        # Do not override explicit out-of-domain questions (e.g. weather).
+        if any(k in ul for k in ("weather", "forecast", "temperature", "rain")):
+            return intent_key, slots, False
+
+        # Prefer last-known voyage context if present; else vessel context.
+        used = False
+        new_intent = intent_key
+
+        # If this looks like an entity-scoped follow-up, prefer staying in entity summary mode.
+        # This prevents aggregate intents (aggregation.total, etc.) from dropping the injected anchors
+        # during the slot-cleaning stage.
+        wants_entity_scope = (
+            has_coref
+            or any(k in ul for k in ("remarks", "remark", "ports", "grades", "revenue", "expense", "expenses", "pnl", "profit", "tce", "commission"))
+        ) and not rankingish
+
+        if sess_slots.get("voyage_number") or sess_slots.get("voyage_id"):
+            vn = sess_slots.get("voyage_number")
+            vid = sess_slots.get("voyage_id")
+            if vn:
+                slots.setdefault("voyage_number", vn)
+            if vid:
+                slots.setdefault("voyage_id", vid)
+            if intent_key == "out_of_scope" or wants_entity_scope:
+                new_intent = "voyage.summary"
+            used = True
+
+        elif sess_slots.get("vessel_name") or sess_slots.get("imo"):
+            vname = sess_slots.get("vessel_name")
+            imo = sess_slots.get("imo")
+            if vname:
+                slots.setdefault("vessel_name", vname)
+            if imo:
+                slots.setdefault("imo", imo)
+            if intent_key == "out_of_scope" or wants_entity_scope:
+                new_intent = "vessel.summary"
+            used = True
+
+        return new_intent, slots, used
+
+    @staticmethod
+    def _apply_session_param_memory(
+        *,
+        extracted_slots: Dict[str, Any],
+        session_ctx: Dict[str, Any],
+        user_input: str,
+        followup_used: bool,
+    ) -> Dict[str, Any]:
+        """
+        Apply safe user-preference parameters from session memory.
+        Intended for follow-ups like:
+          - "show top 5" -> later "make it top 10"
+          - "last 12 months" -> later "same period but for commission"
+        """
+        slots = dict(extracted_slots or {})
+        if not followup_used:
+            return slots
+
+        if not isinstance(session_ctx, dict):
+            return slots
+
+        # Avoid parameter injection for explicit out-of-domain queries.
+        ul = (user_input or "").lower()
+        if GraphRouter._is_chitchat(user_input):
+            return slots
+        if any(k in ul for k in ("weather", "forecast", "temperature", "rain")):
+            return slots
+
+        sess_params = session_ctx.get("param_slots") or {}
+        if not isinstance(sess_params, dict) or not sess_params:
+            return slots
+
+        for k in ("limit", "date_from", "date_to", "scenario", "metric", "group_by", "threshold", "cargo_type", "cargo_grade"):
+            if k not in slots and sess_params.get(k) is not None:
+                slots[k] = sess_params[k]
+        return slots
+
+    @staticmethod
+    def _maybe_override_to_port_query(
+        *,
+        intent_key: str,
+        extracted_slots: Dict[str, Any],
+        user_input: str,
+    ) -> tuple[str, Dict[str, Any]]:
+        """
+        Fix common miss-routing for port-centric queries.
+        If the question is clearly "find voyages with <PORT>" and asks for route/grades/remarks,
+        force the intent to ops.port_query and extract port_name if missing.
+        """
+        ui = (user_input or "").strip()
+        ul = ui.lower()
+        slots = dict(extracted_slots or {})
+
+        # If port already present, use it.
+        port = slots.get("port_name")
+        if not port:
+            # Heuristic extraction for: "For port Rotterdam, ..."
+            m = re.search(r"\bfor\s+port\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*)\b", ui, flags=re.IGNORECASE)
+            if m:
+                cand = (m.group(1) or "").strip().rstrip(",")
+                if cand and len(cand) <= 40:
+                    port = cand
+                    slots["port_name"] = cand
+        if not port and (" with " in ul or " at " in ul or " visited " in ul or " calls " in ul or " called " in ul):
+            # Heuristic extraction for: "... with Rotterdam in the route ..."
+            m = re.search(r"\bwith\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*)\b", ui, flags=re.IGNORECASE)
+            if m:
+                cand = (m.group(1) or "").strip()
+                # Trim common trailing words.
+                cand = re.sub(r"\s+(in|on|for|and)$", "", cand, flags=re.IGNORECASE).strip()
+                if cand and len(cand) <= 40:
+                    port = cand
+                    slots["port_name"] = cand
+
+        wants_voyage_filter = (
+            ("find voyages" in ul)
+            or ("voyages with" in ul)
+            or ("voyages that" in ul)
+            or ("across voyages" in ul)
+            or ("for port" in ul)
+        )
+        wants_route_like = ("route" in ul) or ("in the route" in ul) or ("visited" in ul) or ("called at" in ul) or ("calls at" in ul)
+        wants_grades_or_remarks = any(k in ul for k in ("cargo grade", "cargo grades", "grades", "remarks", "remark", "offhire", "delay", "delayed"))
+
+        if port and wants_voyage_filter and wants_grades_or_remarks:
+            # Do NOT treat metric/finance phrases as port names (e.g. "delayed voyages with negative PnL" → stay loss_due_to_delay)
+            pn = str(port).lower()
+            if "pnl" in pn or "revenue" in pn or "expense" in pn or ("negative" in pn and "port" not in pn):
+                return intent_key, slots
+            # Port queries should be independent: drop carried-over voyage/vessel anchors
+            # unless the user explicitly mentions them in this query.
+            if not re.search(r"\b\d{3,5}\b", ui):
+                slots.pop("voyage_number", None)
+                slots.pop("voyage_numbers", None)
+                slots.pop("voyage_id", None)
+            if not ("imo" in ul or "vessel" in ul or "ship" in ul):
+                slots.pop("vessel_name", None)
+                slots.pop("imo", None)
+            return "ops.port_query", slots
+
+        return intent_key, slots
+
+    def _is_single_entity_query(self, intent_key: str, slots: Dict[str, Any], user_input: str) -> bool:
+        """Determine if query is for a specific single entity"""
+        # Comparison queries are NOT single entity
+        if intent_key.startswith("comparison.") or intent_key.startswith("ranking."):
+            return False
+        
+        if intent_key in ["voyage.summary", "voyage.entity", "vessel.summary", 
+                          "vessel.entity", "cargo.details", "port.details"]:
+            return True
+        
+        # Check if specific identifiers present
+        has_specific_id = bool(
+            slots.get("voyage_number") or 
+            slots.get("voyage_id") or 
+            slots.get("imo") or
+            (slots.get("vessel_name") and "tell me about" in user_input.lower())
+        )
+        
+        # Ranking/filtering keywords indicate composite
+        ranking_keywords = ["top", "best", "worst", "highest", "lowest", "most", "least", 
+                            "which", "find", "show all", "list", "compare", "vs", "versus"]
+        has_ranking = any(kw in user_input.lower() for kw in ranking_keywords)
+        
+        return has_specific_id and not has_ranking
+
+    def n_validate_slots(self, state: GraphState) -> GraphState:
+        """Validate required slots are present"""
+        intent_key = state.get("intent_key", "out_of_scope")
+        slots = state.get("slots") or {}
+
+        if intent_key not in INTENT_REGISTRY:
+            state["missing_keys"] = []
+            return state
+
+        required = INTENT_REGISTRY[intent_key].get("required_slots", [])
+        def _is_effectively_missing(k: str) -> bool:
+            v = slots.get(k)
+            if v in (None, "", [], {}):
+                return True
+            if isinstance(v, str):
+                vv = v.strip().lower()
+                # Common generic placeholders accidentally extracted by LLM/heuristics.
+                if vv in {
+                    "it", "this", "that", "these", "those", "them", "they",
+                    "port", "a port", "the port",
+                    "vessel", "ship", "a vessel", "the vessel", "the ship",
+                    "voyage", "a voyage", "the voyage",
+                }:
+                    return True
+            return False
+
+        missing = [k for k in required if _is_effectively_missing(k)]
+
+        # Heuristic: treat "tell me about vessel" as missing vessel_name/imo.
+        ui = (state.get("user_input") or "").lower()
+        if intent_key == "vessel.summary" and not (slots.get("vessel_name") or slots.get("imo")):
+            if ("vessel" in ui or "ship" in ui) and any(p in ui for p in ("tell me about", "details", "information", "summary")):
+                missing = ["vessel_name"]
+
+        # Also treat extracted vessel_name="vessel"/"ship" as missing.
+        if intent_key == "vessel.summary":
+            vn = slots.get("vessel_name")
+            if isinstance(vn, str) and vn.strip().lower() in {"vessel", "ship", "the vessel", "a vessel"} and "vessel_name" not in missing:
+                missing = ["vessel_name"]
+
+        state["missing_keys"] = missing
+        return state
+
+    def n_make_clarification(self, state: GraphState) -> GraphState:
+        """Generate clarification question for missing slots"""
+        intent_key = state.get("intent_key", "out_of_scope")
+        missing = state.get("missing_keys") or []
+        clarification, options = self._build_clarification_message(intent_key=intent_key, missing_keys=missing)
+        state["clarification"] = clarification
+        sess = state.get("session_ctx") or {}
+
+        persisted_slots = self._build_persisted_slots(
+            base=(sess.get("slots") or {}),
+            updates=(state.get("slots") or {}),
+        )
+        memory_slots = self._extract_memory_slots(persisted_slots)
+        param_slots = self._extract_param_slots(persisted_slots)
+
+        self.redis.save_session(
+            state["session_id"],
+            {
+                **sess,
+                "pending_intent": intent_key,
+                "missing_keys": missing,
+                "clarification_options": options or {},
+                # Needed to reliably continue on the next turn (e.g. user replies "2301").
+                "pending_question": state.get("user_input") or "",
+                "pending_slots": dict(state.get("slots") or {}),
+                # Persist only safe memory + preference-like params (no voyage_ids, etc.)
+                "memory_slots": memory_slots,
+                "param_slots": param_slots,
+                "slots": persisted_slots,
+            },
+        )
+
+        return state
+
+    def _build_clarification_message(self, *, intent_key: str, missing_keys: list[str]) -> tuple[str, Dict[str, Any]]:
+        missing = [m for m in (missing_keys or []) if isinstance(m, str)]
+        if not missing:
+            return ("### Quick question\n- What would you like to know?", {})
+
+        m0 = missing[0]
+        if m0 == "port_name":
+            sugg = self._suggest_ports(limit=8)
+            lines = [
+                "### Quick question",
+                "- You asked about a **port**, but didn’t specify which one.",
+                "- Which port do you want to know about?",
+            ]
+            options: Dict[str, Any] = {}
+            if sugg:
+                options["port_name"] = sugg
+                lines += ["", "### Suggestions"]
+                for i, s in enumerate(sugg, start=1):
+                    lines.append(f"- {i}. {s}")
+                lines += ["", "Reply with a value (or reply with a number from the list)."]
+            else:
+                lines += ["", "Reply with the port name (e.g. `Rotterdam`)."]
+            return ("\n".join(lines).strip(), options)
+
+        if m0 == "voyage_number":
+            sugg = self._suggest_voyage_numbers(limit=8)
+            lines = [
+                "### Quick question",
+                "- You asked about a **voyage**, but didn’t specify the voyage number.",
+                "- Which **voyage number** do you mean?",
+            ]
+            options: Dict[str, Any] = {}
+            if sugg:
+                options["voyage_number"] = sugg
+                lines += ["", "### Suggestions"]
+                for i, v in enumerate(sugg, start=1):
+                    lines.append(f"- {i}. {v}")
+                lines += ["", "Reply with a voyage number (or reply with a number from the list)."]
+            else:
+                lines += ["", "Reply with the voyage number (e.g. `1901`)."]
+            return ("\n".join(lines).strip(), options)
+
+        if m0 in ("vessel_name", "imo"):
+            sugg = self._suggest_vessels(limit=8)
+            lines = [
+                "### Quick question",
+                "- You asked about a **vessel**, but didn’t specify which one.",
+                "- Which vessel are you referring to (name or IMO)?",
+            ]
+            options: Dict[str, Any] = {}
+            if sugg:
+                options["vessel_name"] = sugg
+                lines += ["", "### Suggestions"]
+                for i, s in enumerate(sugg, start=1):
+                    lines.append(f"- {i}. {s}")
+                lines += ["", "Reply with a value (or reply with a number from the list)."]
+            else:
+                lines += ["", "Reply with the vessel name (e.g. `Stena Superior`) or IMO (7 digits)."]
+            return ("\n".join(lines).strip(), options)
+
+        if m0 == "cargo_type":
+            return (
+                "### Quick question\n"
+                "- Which **cargo type** do you mean?\n"
+                "- Reply with a cargo type/grade name.",
+                {},
+            )
+
+        return (
+            "### Quick question\n"
+            f"- I’m missing: **{', '.join(missing)}**.\n"
+            "- Reply with the missing value(s), and I’ll run the query.",
+            {},
+        )
+
+    def _suggest_ports(self, *, limit: int = 8) -> list[str]:
+        sql = """
+            SELECT p->>'port_name' AS port_name, COUNT(*) AS cnt
+            FROM ops_voyage_summary ovs,
+                 LATERAL jsonb_array_elements(ovs.ports_json) AS p
+            WHERE ovs.ports_json IS NOT NULL
+              AND (p->>'port_name') IS NOT NULL
+              AND (p->>'port_name') <> ''
+            GROUP BY 1
+            ORDER BY cnt DESC
+            LIMIT 8
+        """
+        try:
+            rows = self.ops_agent.pg.execute_dynamic_select(sql, {})
+            out = []
+            for r in rows or []:
+                if isinstance(r, dict) and r.get("port_name"):
+                    out.append(str(r["port_name"]))
+            return out[:limit]
+        except Exception:
+            return []
+
+    def _suggest_vessels(self, *, limit: int = 8) -> list[str]:
+        sql = """
+            SELECT vessel_name, COUNT(*) AS cnt
+            FROM ops_voyage_summary
+            WHERE vessel_name IS NOT NULL AND vessel_name <> ''
+            GROUP BY vessel_name
+            ORDER BY cnt DESC
+            LIMIT 8
+        """
+        try:
+            rows = self.ops_agent.pg.execute_dynamic_select(sql, {})
+            out = []
+            for r in rows or []:
+                if isinstance(r, dict) and r.get("vessel_name"):
+                    out.append(str(r["vessel_name"]))
+            return out[:limit]
+        except Exception:
+            return []
+
+    def _suggest_voyage_numbers(self, *, limit: int = 8) -> list[int]:
+        sql = """
+            SELECT DISTINCT voyage_number
+            FROM ops_voyage_summary
+            WHERE voyage_number IS NOT NULL
+            ORDER BY voyage_end_date DESC NULLS LAST
+            LIMIT 8
+        """
+        try:
+            rows = self.ops_agent.pg.execute_dynamic_select(sql, {})
+            out: list[int] = []
+            for r in rows or []:
+                if isinstance(r, dict) and r.get("voyage_number") is not None:
+                    try:
+                        out.append(int(r["voyage_number"]))
+                    except Exception:
+                        continue
+            return out[:limit]
+        except Exception:
+            return []
+
+    # =========================================================
+    # Planning Node
+    # =========================================================
+
+    def n_plan(self, state: GraphState) -> GraphState:
+        """
+        Build execution plan: single or composite. Planner intent overrides extracted intent.
+        """
+
+        sess = state.get("session_ctx") or {}
+        user_input = state.get("user_input") or ""
+
+        # 1️⃣ Build plan
+        plan: ExecutionPlan = self.planner.build_plan(
+            text=user_input,
+            session_context=sess,
+            intent_key=state.get("intent_key"),
+            slots=state.get("slots"),
+        )
+
+        # Planner overrides extracted intent
+        state["intent_key"] = plan.intent_key
+        state["plan_type"] = plan.plan_type
+
+        # 3️⃣ Store plan safely
+        state["plan"] = {
+            "plan_type": plan.plan_type,
+            "intent_key": plan.intent_key,
+            "required_slots": plan.required_slots or [],
+            "confidence": plan.confidence,
+            "steps": [asdict(s) for s in (plan.steps or [])],
+        }
+
+        state["step_index"] = 0
+
+        # 4️⃣ Initialize artifacts cleanly
+        cleaned_slots = dict(state.get("slots") or {})
+
+        prev_artifacts = state.get("artifacts") or {}
+        prev_trace = prev_artifacts.get("trace") if isinstance(prev_artifacts, dict) else None
+        if not isinstance(prev_trace, list):
+            prev_trace = []
+
+        state["artifacts"] = {
+            "slots": cleaned_slots,
+            "user_input": user_input,
+            "intent_key": plan.intent_key,
+            "trace": prev_trace,
+        }
+
+        self._trace(
+            state,
+            {
+                "phase": "planning",
+                "plan_type": plan.plan_type,
+                "intent_key": plan.intent_key,
+                "steps": [asdict(s) for s in (plan.steps or [])],
+            },
+        )
+
+        # Debug
+        _dprint(f"\n🔍 PLAN CLASSIFICATION")
+        _dprint(f"   Plan Type: {plan.plan_type}")
+        _dprint(f"   Final Intent: {plan.intent_key}")
+        _dprint(f"   Steps: {len(plan.steps)}")
+        _dprint(f"   Slots: {cleaned_slots}")
+
+        return state
+
+    # =========================================================
+    # Single Execution (Standard Flow)
+    # =========================================================
+
+    def n_run_single(self, state: GraphState) -> GraphState:
+        """Standard execution flow using intent registry."""
+        intent_key = state.get("intent_key") or state.get("plan", {}).get("intent_key", "out_of_scope")
+        cfg = INTENT_REGISTRY.get(intent_key, {})
+        session_context = state.get("session_ctx") or {}
+        slots = self._merge_slots(intent_key, session_context, state.get("slots") or {})
+        user_input = state.get("user_input") or ""
+
+        _dprint(f"\n▶️  SINGLE EXECUTION: {intent_key}")
+
+        # =========================================================
+        # Result-set follow-ups (deterministic, uses Redis memory)
+        # =========================================================
+        if intent_key == "followup.result_set":
+            rs = (session_context or {}).get("last_result_set") if isinstance(session_context, dict) else None
+            rows = (rs or {}).get("rows") if isinstance(rs, dict) else None
+            rows = rows if isinstance(rows, list) else []
+            action = (slots.get("action") or "").strip().lower()
+            ul = (user_input or "").lower()
+
+            def _num(x: Any) -> float | None:
+                try:
+                    if x is None:
+                        return None
+                    if isinstance(x, (int, float)):
+                        return float(x)
+                    s = str(x).replace(",", "").strip()
+                    return float(s)
+                except Exception:
+                    return None
+
+            # If user asks for extremes (highest/lowest) among the last list.
+            if action == "compare_extremes" or any(k in ul for k in ("highest", "lowest", "max", "min")):
+                metric = "pnl"
+                if "revenue" in ul:
+                    metric = "revenue"
+                if "expense" in ul or "cost" in ul:
+                    metric = "total_expense"
+                if "tce" in ul:
+                    metric = "tce"
+                if "commission" in ul:
+                    metric = "total_commission"
+
+                scored = []
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    vnum = r.get("voyage_number")
+                    val = _num(r.get(metric))
+                    if vnum is None or val is None:
+                        continue
+                    scored.append((val, vnum, r))
+                if not scored:
+                    state["answer"] = "I don’t have a previous result set to compare. Please run the list query again."
+                    return state
+                lo = min(scored, key=lambda t: t[0])
+                hi = max(scored, key=lambda t: t[0])
+                state["answer"] = (
+                    "### Among the previous results\n"
+                    f"- **Highest {metric.upper()}**: Voyage **{hi[1]}** ({hi[0]:,.2f})\n"
+                    f"- **Lowest {metric.upper()}**: Voyage **{lo[1]}** ({lo[0]:,.2f})"
+                )
+                return state
+
+            # Explain remarks: require a voyage selection from the last result set.
+            if action == "explain_remarks":
+                # If the user already named a voyage number in this message, use it.
+                import re as _re
+                m = _re.search(r"\b(\d{3,5})\b", user_input or "")
+                if m:
+                    slots["voyage_number"] = int(m.group(1))
+                vnum = slots.get("voyage_number")
+                if not vnum:
+                    # Ask which voyage they mean, using the last result set as suggestions.
+                    sugg = []
+                    for r in rows[:8]:
+                        if isinstance(r, dict) and r.get("voyage_number") is not None:
+                            try:
+                                sugg.append(int(r["voyage_number"]))
+                            except Exception:
+                                continue
+                    options = {"voyage_number": sugg} if sugg else {}
+                    state["clarification"] = (
+                        "### Quick question\\n"
+                        "- You said **explain remarks**, but didn’t specify **which voyage** from the previous list.\\n"
+                        "- Reply with the voyage number (or pick a number from the suggestions)."
+                    )
+                    # Persist a pending clarification specifically for this follow-up
+                    try:
+                        self.redis.save_session(
+                            state["session_id"],
+                            {
+                                **(session_context or {}),
+                                "pending_intent": "followup.result_set",
+                                "missing_keys": ["voyage_number"],
+                                "clarification_options": options,
+                                "pending_question": user_input,
+                                "pending_slots": {"action": "explain_remarks"},
+                            },
+                        )
+                    except Exception:
+                        pass
+                    return state
+
+                # Find the matching row and return its remarks.
+                chosen = None
+                for r in rows:
+                    if isinstance(r, dict) and str(r.get("voyage_number")) == str(vnum):
+                        chosen = r
+                        break
+                rem = (chosen or {}).get("remarks") if isinstance(chosen, dict) else None
+                state["answer"] = (
+                    f"### Remarks for voyage {vnum}\\n"
+                    + (str(rem).strip() if rem not in (None, "", [], {}) else "No remarks were available in the previous result set.")
+                )
+                return state
+
+        # LangGraph may populate declared state keys with None. Ensure data is always a dict.
+        if not isinstance(state.get("data"), dict):
+            state["data"] = {}
+
+        # =========================================================
+        # Voyage summary: full context (finance, ops, mongo)
+        # =========================================================
+        if intent_key == "voyage.summary":
+            voyage_number = slots.get("voyage_number")
+            voyage_id = slots.get("voyage_id")
+
+            # 1️⃣ Mongo canonical resolve first (so voyage-number-only queries can be disambiguated)
+            try:
+                mongo_data = self.mongo_agent.fetch_full_voyage_context(
+                    voyage_number=voyage_number,
+                    voyage_id=voyage_id,
+                )
+            except Exception as e:
+                _dprint(f"⚠️  Mongo failed: {e}")
+                mongo_data = {}
+
+            if isinstance(mongo_data, dict) and mongo_data:
+                canonical_vid = mongo_data.get("voyage_id")
+                canonical_imo = mongo_data.get("vessel_imo")
+                canonical_vname = mongo_data.get("vessel_name")
+                if canonical_vid and not slots.get("voyage_id"):
+                    slots["voyage_id"] = str(canonical_vid)
+                if canonical_imo and not slots.get("imo"):
+                    slots["imo"] = str(canonical_imo)
+                if canonical_vname and not slots.get("vessel_name"):
+                    slots["vessel_name"] = str(canonical_vname)
+                voyage_id = slots.get("voyage_id")
+
+            # 2️⃣ Finance
+            try:
+                finance_data = self.finance_agent.run(
+                    intent_key=intent_key,
+                    slots=slots,
+                    session_context=session_context,
+                    user_input=user_input,
+                )
+            except TypeError:
+                finance_data = self.finance_agent.run(
+                    intent_key=intent_key,
+                    slots=slots,
+                    session_context={**session_context, "user_input": user_input},
+                )
+            except Exception as e:
+                _dprint(f"⚠️  Finance failed: {e}")
+                finance_data = {"mode": "error", "rows": []}
+
+            # 3️⃣ Ops
+            ops_data = None
+            finance_fr = ""
+            if isinstance(finance_data, dict):
+                finance_fr = str(finance_data.get("fallback_reason") or "")
+            postgres_down = "Postgres is not available" in finance_fr or "connection refused" in finance_fr.lower()
+
+            if postgres_down:
+                ops_data = {"mode": "error", "rows": [], "fallback_reason": finance_fr}
+            else:
+                try:
+                    ops_data = self.ops_agent.run(
+                        intent_key=intent_key,
+                        slots=slots,
+                        session_context=session_context,
+                        user_input=user_input,
+                    )
+                except TypeError:
+                    ops_data = self.ops_agent.run(
+                        intent_key=intent_key,
+                        slots=slots,
+                        session_context={**session_context, "user_input": user_input},
+                    )
+                except Exception as e:
+                    _dprint(f"⚠️  Ops failed: {e}")
+                    ops_data = {"mode": "error", "rows": []}
+
+            finance_safe = _json_safe(finance_data)
+            ops_safe = _json_safe(ops_data)
+            mongo_safe = _json_safe(mongo_data)
+            raw_finance_rows = []
+            if isinstance(finance_safe, dict) and isinstance(finance_safe.get("rows"), list):
+                raw_finance_rows = list(finance_safe.get("rows") or [])
+
+            # Reconcile single-voyage SQL rows with Mongo's canonical vessel for this voyage_number.
+            # In some datasets, voyage_number is reused across vessels; this keeps voyage.summary strict.
+            def _norm_imo(v: Any) -> str:
+                if v in (None, ""):
+                    return ""
+                s = str(v).strip()
+                if s.endswith(".0"):
+                    s = s[:-2]
+                return s
+
+            mongo_imo = ""
+            mongo_vessel_name = ""
+            if isinstance(mongo_safe, dict):
+                mongo_imo = _norm_imo(mongo_safe.get("vessel_imo"))
+                mongo_vessel_name = str(mongo_safe.get("vessel_name") or "").strip().lower()
+
+            if voyage_number and (mongo_imo or mongo_vessel_name):
+                if isinstance(finance_safe, dict) and isinstance(finance_safe.get("rows"), list):
+                    fin_rows = finance_safe.get("rows") or []
+                    fin_filtered = []
+                    for r in fin_rows:
+                        if not isinstance(r, dict):
+                            continue
+                        row_imo = _norm_imo(r.get("vessel_imo"))
+                        row_vname = str(r.get("vessel_name") or "").strip().lower()
+                        if (mongo_imo and row_imo == mongo_imo) or (mongo_vessel_name and row_vname == mongo_vessel_name):
+                            fin_filtered.append(r)
+                    finance_safe = {**finance_safe, "rows": fin_filtered}
+
+                if isinstance(ops_safe, dict) and isinstance(ops_safe.get("rows"), list):
+                    ops_rows = ops_safe.get("rows") or []
+                    ops_filtered = []
+                    for r in ops_rows:
+                        if not isinstance(r, dict):
+                            continue
+                        row_imo = _norm_imo(r.get("vessel_imo"))
+                        row_vname = str(r.get("vessel_name") or "").strip().lower()
+                        if (mongo_imo and row_imo == mongo_imo) or (mongo_vessel_name and row_vname == mongo_vessel_name):
+                            ops_filtered.append(r)
+                    ops_safe = {**ops_safe, "rows": ops_filtered}
+
+            # If all backends are unavailable, avoid a slow/expensive LLM call and return a clear message.
+            finance_ok = isinstance(finance_safe, dict) and finance_safe.get("rows")
+            ops_ok = isinstance(ops_safe, dict) and ops_safe.get("rows")
+            mongo_ok = isinstance(mongo_safe, dict) and (
+                mongo_safe.get("remarks") or mongo_safe.get("fixtures") or mongo_safe.get("voyage_id") or mongo_safe.get("voyage_number")
+            )
+            if not finance_ok and not ops_ok and not mongo_ok:
+                vn = voyage_number or slots.get("voyage_numbers") or voyage_id or "this voyage"
+                answer = (
+                    "### Summary\n"
+                    f"- I can’t retrieve voyage details for **{vn}** right now because the data backends are unavailable.\n\n"
+                    "### What’s needed to answer\n"
+                    "- **Postgres** (finance/ops): `localhost:5432`\n"
+                    "- **MongoDB** (remarks/fixtures): `localhost:27017`\n\n"
+                    "### Next step\n"
+                    "- Start the databases (or update `POSTGRES_DSN` / `MONGO_URI`), then ask again.\n"
+                )
+                state["merged"] = {"finance": finance_safe, "ops": ops_safe, "mongo": {}, "artifacts": {"intent_key": intent_key, "slots": slots}}
+                state["answer"] = answer
+                state["slots"] = slots
+                state["finance"] = finance_safe
+                state["ops"] = ops_safe
+                state["mongo"] = {}
+                return state
+
+            # Normalize single-path mongo payload into the same shape as dynamic NoSQL results
+            # so validators/summarizer have a consistent contract.
+            mongo_llm_like = mongo_safe
+            if isinstance(mongo_safe, dict) and mongo_safe and mongo_safe.get("mode") != "mongo_llm":
+                vid = mongo_safe.get("voyage_id")
+                vnum = mongo_safe.get("voyage_number")
+                remarks = mongo_safe.get("remarks") or []
+                fixtures = mongo_safe.get("fixtures") or []
+                mongo_llm_like = {
+                    "mode": "mongo_llm",
+                    "ok": True,
+                    "collection": "voyages",
+                    "filter": {"voyageId": str(vid)} if vid else ({"voyageNumber": str(vnum)} if vnum else {}),
+                    "projection": {"_id": 0, "voyageId": 1, "voyageNumber": 1, "remarks": 1, "fixtures": 1},
+                    "limit": 1,
+                    "rows": [
+                        {
+                            "voyageId": str(vid) if vid is not None else None,
+                            "voyageNumber": str(vnum) if vnum is not None else None,
+                            "remarks": remarks,
+                            "fixtures": fixtures,
+                        }
+                    ] if (vid or vnum) else [],
+                }
+
+            merged = {
+                "finance": finance_safe,
+                "ops": ops_safe,
+                "mongo": mongo_llm_like,
+                "artifacts": {
+                    "intent_key": intent_key,
+                    "slots": slots,
+                },
+                "dynamic_sql_used": isinstance(finance_safe, dict) and finance_safe.get("mode") == "dynamic_sql",
+                "dynamic_sql_agents": ["finance", "ops"] if isinstance(finance_safe, dict) and finance_safe.get("mode") == "dynamic_sql" else [],
+            }
+
+            # Ensure single-path outputs also populate state["data"] so validators/debugging
+            # (e.g., scripts/C.py MONGO DEBUG) reflect what was actually fetched.
+            state["data"]["finance"] = finance_safe
+            state["data"]["ops"] = ops_safe
+            state["data"]["mongo"] = mongo_llm_like
+            state["data"]["artifacts"] = merged.get("artifacts") or {"intent_key": intent_key, "slots": slots}
+
+            # Guardrail: if the user asked for financial metrics on a single voyage but
+            # finance has no rows, avoid LLM-generated "best effort" summaries that can
+            # fabricate multi-voyage/multi-vessel tables.
+            user_input_lower = (user_input or "").lower()
+            asked_financials = any(
+                k in user_input_lower
+                for k in (
+                    "financial summary",
+                    "financials",
+                    "pnl",
+                    "profit",
+                    "revenue",
+                    "expense",
+                    "tce",
+                    "commission",
+                )
+            )
+            if asked_financials and not finance_ok:
+                vn = voyage_number or slots.get("voyage_numbers") or voyage_id or "this voyage"
+                # Helpful diagnostics: finance had rows for this voyage number, but none
+                # matched Mongo's canonical vessel after strict reconciliation.
+                if raw_finance_rows:
+                    vessel_labels = []
+                    for r in raw_finance_rows:
+                        if not isinstance(r, dict):
+                            continue
+                        imo = _norm_imo(r.get("vessel_imo"))
+                        vname = str(r.get("vessel_name") or "").strip()
+                        label = f"{vname} ({imo})" if (vname or imo) else ""
+                        if label and label not in vessel_labels:
+                            vessel_labels.append(label)
+                    preview = ", ".join(vessel_labels[:5]) if vessel_labels else "N/A"
+                    extra = (len(vessel_labels) - 5) if vessel_labels else 0
+                    suffix = f" (+{extra} more)" if extra > 0 else ""
+                    answer = (
+                        "### Summary\n"
+                        f"- I found finance rows for voyage number **{vn}**, but they map to different vessel identities than Mongo's canonical voyage record.\n"
+                        "- I did not combine them into a single-voyage financial summary because that would be misleading.\n\n"
+                        "### Finance vessel candidates\n"
+                        f"- {preview}{suffix}\n\n"
+                        "### Next step\n"
+                        "- Query by voyage_id (or specify vessel name/IMO) to get one unambiguous financial summary.\n"
+                    )
+                    state["merged"] = merged
+                    state["answer"] = answer
+                    state["slots"] = slots
+                    state["finance"] = finance_safe
+                    state["ops"] = ops_safe
+                    state["mongo"] = mongo_llm_like
+                    return state
+                remarks_count = 0
+                if isinstance(mongo_safe, dict) and isinstance(mongo_safe.get("remarks"), list):
+                    remarks_count = len(mongo_safe.get("remarks") or [])
+                answer = (
+                    "### Summary\n"
+                    f"- I could not find finance records in Postgres for voyage **{vn}**.\n"
+                    "- I will not infer financial KPIs from other voyages.\n\n"
+                    "### Available context\n"
+                    f"- Mongo voyage context is available ({remarks_count} remarks).\n\n"
+                    "### Next step\n"
+                    "- Verify this voyage exists in `finance_voyage_kpi` / `ops_voyage_summary` and retry.\n"
+                )
+                state["merged"] = merged
+                state["answer"] = answer
+                state["slots"] = slots
+                state["finance"] = finance_safe
+                state["ops"] = ops_safe
+                state["mongo"] = mongo_llm_like
+                return state
+
+            try:
+                if hasattr(self.llm, "generate_final_answer"):
+                    answer = self.llm.generate_final_answer(
+                        question=user_input,
+                        merged_data=merged,
+                    )
+                else:
+                    answer = self.llm.summarize_answer(
+                        question=user_input,
+                        plan=state.get("plan") or {"plan_type": "single", "intent_key": intent_key},
+                        merged=merged,
+                    )
+            except Exception as e:
+                _dprint(f"⚠️  LLM generation failed: {e}")
+                answer = f"Error generating summary: {e}"
+
+            # Populate state so it naturally bypasses the rest via routing
+            state["merged"] = merged
+            state["answer"] = answer
+            state["slots"] = slots
+            state["finance"] = finance_safe
+            state["ops"] = ops_safe
+            state["mongo"] = mongo_llm_like
+            
+            # Save session immediately
+            persisted_slots = self._build_persisted_slots(base=(session_context.get("slots") or {}), updates=slots)
+            self.redis.save_session(
+                state["session_id"],
+                {
+                    **session_context,
+                    "last_intent": intent_key,
+                    "memory_slots": self._extract_memory_slots(persisted_slots),
+                    "param_slots": self._extract_param_slots(persisted_slots),
+                    "slots": persisted_slots,
+                    "last_user_input": user_input,
+                },
+            )
+            return state
+
+        # =========================================================
+        # Vessel metadata: Mongo-only deterministic summary
+        # =========================================================
+        if intent_key == "vessel.metadata":
+            def _extract_passage_types(doc: Dict[str, Any]) -> list[str]:
+                passage_types: list[str] = []
+                cps = doc.get("consumption_profiles")
+                if isinstance(cps, list):
+                    seen_pt = set()
+                    for cp in cps:
+                        if not isinstance(cp, dict):
+                            continue
+                        pp = cp.get("passageProfile")
+                        if not isinstance(pp, list):
+                            continue
+                        for p in pp:
+                            if not isinstance(p, dict):
+                                continue
+                            pt = p.get("passageType")
+                            if pt is None:
+                                continue
+                            spt = str(pt).strip()
+                            if spt and spt not in seen_pt:
+                                seen_pt.add(spt)
+                                passage_types.append(spt)
+                return passage_types
+
+            def _extract_tags(doc: Dict[str, Any]) -> list[str]:
+                tags: list[str] = []
+                raw_tags = doc.get("tags")
+                if isinstance(raw_tags, list):
+                    for t in raw_tags:
+                        if isinstance(t, dict):
+                            v = t.get("value")
+                            if v is not None:
+                                sv = str(v).strip()
+                                if sv:
+                                    tags.append(sv)
+                return tags[:8]
+
+            def _extract_passage_consumption_rows(doc: Dict[str, Any]) -> list[Dict[str, Any]]:
+                rows: list[Dict[str, Any]] = []
+                cps = doc.get("consumption_profiles")
+                if not isinstance(cps, list):
+                    return rows
+                for cp in cps:
+                    if not isinstance(cp, dict):
+                        continue
+                    profile_name = cp.get("profileName")
+                    pp = cp.get("passageProfile")
+                    if not isinstance(pp, list):
+                        continue
+                    for p in pp:
+                        if not isinstance(p, dict):
+                            continue
+                        ptype = p.get("passageType")
+                        cons = p.get("consumption")
+                        if not isinstance(cons, list):
+                            continue
+                        for c in cons:
+                            if not isinstance(c, dict):
+                                continue
+                            rows.append(
+                                {
+                                    "profile_name": profile_name,
+                                    "passage_type": str(ptype).strip() if ptype is not None else None,
+                                    "speed": c.get("speed"),
+                                    "ifo": c.get("ifo"),
+                                    "mgo": c.get("mgo"),
+                                    "rpm": c.get("rpm"),
+                                    "is_default": bool(c.get("isDefault")) if c.get("isDefault") is not None else False,
+                                }
+                            )
+                return rows
+
+            def _extract_non_passage_consumption(doc: Dict[str, Any]) -> Dict[str, Any] | None:
+                cps = doc.get("consumption_profiles")
+                if not isinstance(cps, list):
+                    return None
+                for cp in cps:
+                    if not isinstance(cp, dict):
+                        continue
+                    npp = cp.get("nonPassageProfile")
+                    if not isinstance(npp, list):
+                        continue
+                    for np in npp:
+                        if not isinstance(np, dict):
+                            continue
+                        cons = np.get("consumption")
+                        if isinstance(cons, list) and cons and isinstance(cons[0], dict):
+                            return cons[0]
+                return None
+
+            records: list[Dict[str, Any]] = []
+            projection = cfg.get("mongo_projection")
+
+            # Path A: direct vessel anchor (name/imo)
+            if slots.get("vessel_name") or slots.get("imo"):
+                try:
+                    res = self.mongo_agent.run(
+                        intent_key=cfg.get("mongo_intent", "entity.vessel"),
+                        slots=slots,
+                        projection=projection,
+                        session_context=session_context,
+                    )
+                    mongo_safe = _json_safe(res)
+                except Exception as e:
+                    _dprint(f"⚠️  Mongo failed (vessel.metadata): {e}")
+                    mongo_safe = {}
+
+                doc = (mongo_safe or {}).get("document") if isinstance(mongo_safe, dict) else {}
+                if isinstance(doc, dict) and doc:
+                    records.append({
+                        "voyage_number": slots.get("voyage_number"),
+                        "vessel_name": doc.get("name") or slots.get("vessel_name"),
+                        "imo": doc.get("imo") or slots.get("imo"),
+                        "doc": doc,
+                    })
+            else:
+                # Path B: small voyage-number list (1..3) -> resolve vessel(s) via Mongo voyages
+                mongo_safe = {"mode": "mongo_metadata", "ok": True, "rows": []}
+                vnums = slots.get("voyage_numbers")
+                if not isinstance(vnums, list):
+                    vn = slots.get("voyage_number")
+                    vnums = [vn] if vn not in (None, "", [], {}) else []
+                unique_vnums: list[int] = []
+                for v in vnums:
+                    try:
+                        iv = int(v)
+                        if iv not in unique_vnums:
+                            unique_vnums.append(iv)
+                    except Exception:
+                        continue
+                unique_vnums = unique_vnums[:3]
+
+                for vnum in unique_vnums:
+                    try:
+                        vdoc = self.mongo_agent.adapter.get_voyage_by_number(
+                            vnum,
+                            projection={"_id": 0, "voyageNumber": 1, "voyageId": 1, "vesselName": 1, "vesselImo": 1},
+                        )
+                    except Exception:
+                        vdoc = None
+                    if not isinstance(vdoc, dict) or not vdoc:
+                        continue
+
+                    imo = vdoc.get("vesselImo")
+                    vessel_name = vdoc.get("vesselName")
+                    mdoc = None
+                    if imo not in (None, ""):
+                        try:
+                            mdoc = self.mongo_agent.adapter.fetch_vessel(str(imo), projection=projection)
+                        except Exception:
+                            mdoc = None
+                    if not isinstance(mdoc, dict):
+                        mdoc = {}
+                    if not mdoc:
+                        # Keep minimal voyage-resolved identity even if vessel metadata is missing.
+                        mdoc = {"imo": imo, "name": vessel_name}
+
+                    records.append({
+                        "voyage_number": vdoc.get("voyageNumber"),
+                        "vessel_name": mdoc.get("name") or vessel_name,
+                        "imo": mdoc.get("imo") or imo,
+                        "doc": mdoc,
+                    })
+                    mongo_safe["rows"].append(vdoc)
+
+            ql = (user_input or "").lower()
+            ask_identity = any(k in ql for k in ("identity", "imo", "vessel id", "account code", "who is vessel", "vessel details", "name"))
+            ask_commercial = any(
+                k in ql
+                for k in (
+                    "hire rate",
+                    "hirerate",
+                    "hire_rate",
+                    "hire-rate",
+                    "market type",
+                    "scrubber",
+                    "operating status",
+                    "is operating",
+                    "operational",
+                    "is vessel operating",
+                )
+            )
+            ask_passage_types = any(k in ql for k in ("passage type", "passage types"))
+            ask_passage_consumption = any(k in ql for k in ("consumption profile", "consumption profiles", "consumption", "speed", "ifo", "mgo", "rpm"))
+            ask_default_consumption = any(k in ql for k in ("default consumption", "default speed", "defaults", "isdefault", "default"))
+            ask_ballast = "ballast" in ql
+            ask_laden = "laden" in ql
+            ask_non_passage_consumption = any(k in ql for k in ("non passage", "non-passage", "idle", "load", "discharge", "heat", "clean", "inert"))
+            if ask_non_passage_consumption and not (ask_ballast or ask_laden):
+                ask_passage_consumption = False
+            ask_tags = any(k in ql for k in ("tags", "segment", "pool", "commercial tag", "sanction"))
+            ask_contract_history = any(k in ql for k in ("contract", "owner", "duration", "cp date", "delivery"))
+            ask_extracted_at = "extracted at" in ql
+            has_specific = any(
+                (
+                    ask_identity,
+                    ask_commercial,
+                    ask_passage_types,
+                    ask_passage_consumption,
+                    ask_default_consumption,
+                    ask_ballast,
+                    ask_laden,
+                    ask_non_passage_consumption,
+                    ask_tags,
+                    ask_contract_history,
+                    ask_extracted_at,
+                )
+            )
+
+            if not records:
+                answer = (
+                    "### Summary\n"
+                    "- No metadata available for the requested vessel/voyage.\n"
+                    "- Try with vessel name, IMO, or a specific voyage number.\n"
+                )
+            elif len(records) == 1:
+                rec = records[0]
+                doc = rec.get("doc") if isinstance(rec.get("doc"), dict) else {}
+                vessel_name = rec.get("vessel_name") or "this vessel"
+                imo = rec.get("imo")
+                hire_rate = doc.get("hireRate")
+                scrubber = doc.get("scrubber")
+                market_type = doc.get("marketType")
+                account_code = doc.get("accountCode")
+                is_operating = doc.get("isVesselOperating")
+                passage_types = _extract_passage_types(doc)
+                tags = _extract_tags(doc)
+                passage_rows = _extract_passage_consumption_rows(doc)
+                non_passage = _extract_non_passage_consumption(doc)
+                contract_list = (doc.get("contract_history") or {}).get("list")
+                contract_count = len(contract_list) if isinstance(contract_list, list) else None
+                extracted_at = doc.get("extracted_at")
+
+                answer_lines = ["### Summary"]
+                answer_lines.append(f"- **Vessel**: {vessel_name}" + (f" (IMO: {imo})" if imo else ""))
+                if has_specific:
+                    if ask_identity:
+                        answer_lines.append(f"- **Vessel ID**: {doc.get('vesselId')}" if doc.get("vesselId") not in (None, "") else "- **Vessel ID**: Not available")
+                        answer_lines.append(f"- **Account code**: {account_code}" if account_code not in (None, "") else "- **Account code**: Not available")
+                    if ask_commercial:
+                        if hire_rate is not None:
+                            try:
+                                answer_lines.append(f"- **Hire rate**: ${float(hire_rate):,.2f}")
+                            except Exception:
+                                answer_lines.append(f"- **Hire rate**: {hire_rate}")
+                        else:
+                            answer_lines.append("- **Hire rate**: Not available")
+                        if is_operating is not None:
+                            answer_lines.append(f"- **Operating**: {'Yes' if bool(is_operating) else 'No'}")
+                        else:
+                            answer_lines.append("- **Operating**: Not available")
+                        answer_lines.append(f"- **Scrubber**: {scrubber}" if scrubber not in (None, "") else "- **Scrubber**: Not available")
+                        answer_lines.append(f"- **Market type**: {market_type}" if market_type not in (None, "") else "- **Market type**: Not available")
+                    if ask_passage_types:
+                        answer_lines.append(f"- **Passage types**: {', '.join(passage_types)}" if passage_types else "- **Passage types**: Not available")
+                    if ask_passage_consumption or ask_default_consumption or ask_ballast or ask_laden:
+                        filtered_rows = list(passage_rows)
+                        if ask_default_consumption:
+                            filtered_rows = [r for r in filtered_rows if r.get("is_default")]
+                        if ask_ballast and not ask_laden:
+                            filtered_rows = [r for r in filtered_rows if str(r.get("passage_type") or "").lower() == "ballast"]
+                        if ask_laden and not ask_ballast:
+                            filtered_rows = [r for r in filtered_rows if str(r.get("passage_type") or "").lower() == "laden"]
+                        answer_lines.append("")
+                        answer_lines.append("### Passage consumption")
+                        if filtered_rows:
+                            for r in filtered_rows[:8]:
+                                ptype = r.get("passage_type") or "Unknown"
+                                speed = r.get("speed")
+                                ifo = r.get("ifo")
+                                mgo = r.get("mgo")
+                                dmark = " (default)" if r.get("is_default") else ""
+                                answer_lines.append(f"- **{ptype}**{dmark}: speed={speed}, IFO={ifo}, MGO={mgo}")
+                        else:
+                            answer_lines.append("- Not available")
+                    if ask_non_passage_consumption:
+                        answer_lines.append("")
+                        answer_lines.append("### Non-passage consumption")
+                        if isinstance(non_passage, dict) and non_passage:
+                            keys = (
+                                "ifoLoad", "ifoDischarge", "ifoIdle", "ifoHeat", "ifoClean", "ifoInert",
+                                "mgoLoad", "mgoDischarge", "mgoIdle", "mgoHeat", "mgoClean", "mgoInert",
+                            )
+                            for k in keys:
+                                if k in non_passage:
+                                    answer_lines.append(f"- **{k}**: {non_passage.get(k)}")
+                        else:
+                            answer_lines.append("- Not available")
+                    if ask_tags:
+                        answer_lines.append(f"- **Tags**: {', '.join(tags)}" if tags else "- **Tags**: Not available")
+                    if ask_contract_history:
+                        if isinstance(contract_list, list) and contract_list:
+                            answer_lines.append("")
+                            answer_lines.append("### Contract history")
+                            for c in contract_list[:5]:
+                                if not isinstance(c, dict):
+                                    continue
+                                cn = c.get("contractNumber")
+                                owner = c.get("owner")
+                                dur = c.get("duration")
+                                dtyp = c.get("durationType")
+                                cpd = c.get("cpDate")
+                                dd = c.get("deliveryDatetime")
+                                answer_lines.append(f"- Contract {cn} | Owner: {owner} | Duration: {dur} {dtyp} | CP Date: {cpd} | Delivery: {dd}")
+                        else:
+                            answer_lines.append("- **Contract history**: Not available")
+                    if ask_extracted_at:
+                        answer_lines.append(f"- **Extracted at**: {extracted_at}" if extracted_at not in (None, "") else "- **Extracted at**: Not available")
+                else:
+                    answer_lines.append(f"- **Passage types**: {', '.join(passage_types)}" if passage_types else "- **Passage types**: Not available")
+                    answer_lines.append("")
+                    answer_lines.append("### Metadata snapshot")
+                    if hire_rate is not None:
+                        try:
+                            answer_lines.append(f"- **Hire rate**: ${float(hire_rate):,.2f}")
+                        except Exception:
+                            answer_lines.append(f"- **Hire rate**: {hire_rate}")
+                    if scrubber not in (None, ""):
+                        answer_lines.append(f"- **Scrubber**: {scrubber}")
+                    if market_type not in (None, ""):
+                        answer_lines.append(f"- **Market type**: {market_type}")
+                    if account_code not in (None, ""):
+                        answer_lines.append(f"- **Account code**: {account_code}")
+                    if is_operating is not None:
+                        answer_lines.append(f"- **Operating**: {'Yes' if bool(is_operating) else 'No'}")
+                    if tags:
+                        answer_lines.append(f"- **Tags**: {', '.join(tags)}")
+                    if extracted_at not in (None, ""):
+                        answer_lines.append(f"- **Extracted at**: {extracted_at}")
+
+                answer = "\n".join(answer_lines)
+            else:
+                # Multi-voyage metadata response (query-specific, compact).
+                answer_lines = [
+                    "### Summary",
+                    f"- Found metadata for {len(records)} voyage-linked vessel records.",
+                    "",
+                    "### Results",
+                ]
+                for rec in records:
+                    doc = rec.get("doc") if isinstance(rec.get("doc"), dict) else {}
+                    vessel_name = rec.get("vessel_name") or "Unknown"
+                    imo = rec.get("imo")
+                    vnum = rec.get("voyage_number")
+                    prefix = f"- Voyage **{vnum}** - **{vessel_name}**" + (f" (IMO: {imo})" if imo else "")
+                    details: list[str] = []
+                    if ask_identity:
+                        if doc.get("vesselId") not in (None, ""):
+                            details.append(f"VesselId {doc.get('vesselId')}")
+                        if doc.get("accountCode") not in (None, ""):
+                            details.append(f"Account {doc.get('accountCode')}")
+                    if ask_commercial:
+                        hr = doc.get("hireRate")
+                        if hr is not None:
+                            try:
+                                details.append(f"Hire rate ${float(hr):,.2f}")
+                            except Exception:
+                                details.append(f"Hire rate {hr}")
+                        if doc.get("isVesselOperating") is not None:
+                            details.append(f"Operating {'Yes' if bool(doc.get('isVesselOperating')) else 'No'}")
+                        if doc.get("scrubber") not in (None, ""):
+                            details.append(f"Scrubber {doc.get('scrubber')}")
+                        if doc.get("marketType") not in (None, ""):
+                            details.append(f"Market {doc.get('marketType')}")
+                    if ask_passage_types:
+                        pts = _extract_passage_types(doc)
+                        details.append(f"Passage types {', '.join(pts)}" if pts else "Passage types Not available")
+                    if ask_passage_consumption or ask_default_consumption or ask_ballast or ask_laden:
+                        p_rows = _extract_passage_consumption_rows(doc)
+                        if ask_default_consumption:
+                            p_rows = [r for r in p_rows if r.get("is_default")]
+                        if ask_ballast and not ask_laden:
+                            p_rows = [r for r in p_rows if str(r.get("passage_type") or "").lower() == "ballast"]
+                        if ask_laden and not ask_ballast:
+                            p_rows = [r for r in p_rows if str(r.get("passage_type") or "").lower() == "laden"]
+                        if p_rows:
+                            r0 = p_rows[0]
+                            details.append(f"{r0.get('passage_type')} speed {r0.get('speed')} IFO {r0.get('ifo')} MGO {r0.get('mgo')}" + (" default" if r0.get("is_default") else ""))
+                    if ask_non_passage_consumption:
+                        np = _extract_non_passage_consumption(doc)
+                        if isinstance(np, dict) and np:
+                            details.append("Non-passage available")
+                        else:
+                            details.append("Non-passage Not available")
+                    if ask_tags:
+                        tgs = _extract_tags(doc)
+                        if tgs:
+                            details.append(f"Tags {', '.join(tgs[:4])}")
+                    if ask_contract_history:
+                        cl = (doc.get("contract_history") or {}).get("list")
+                        if isinstance(cl, list):
+                            details.append(f"Contracts {len(cl)}")
+                    if ask_extracted_at and doc.get("extracted_at") not in (None, ""):
+                        details.append(f"Extracted at {doc.get('extracted_at')}")
+                    if not details:
+                        # No specific asks or missing fields: keep a small default.
+                        hr = doc.get("hireRate")
+                        pts = _extract_passage_types(doc)
+                        if hr is not None:
+                            try:
+                                details.append(f"Hire rate ${float(hr):,.2f}")
+                            except Exception:
+                                details.append(f"Hire rate {hr}")
+                        if pts:
+                            details.append(f"Passage types {', '.join(pts)}")
+                    answer_lines.append(prefix + (" - " + "; ".join(details) if details else ""))
+                answer = "\n".join(answer_lines)
+
+            merged = {
+                "finance": {"mode": None, "rows": []},
+                "ops": {"mode": None, "rows": []},
+                "mongo": mongo_safe if isinstance(mongo_safe, dict) else {},
+                "artifacts": {"intent_key": intent_key, "slots": slots},
+                "dynamic_sql_used": False,
+                "dynamic_sql_agents": [],
+            }
+
+            state["merged"] = merged
+            state["answer"] = answer
+            state["slots"] = slots
+            state["mongo"] = mongo_safe
+            state["finance"] = {"mode": None, "rows": []}
+            state["ops"] = {"mode": None, "rows": []}
+            state["data"]["mongo"] = mongo_safe
+            state["data"]["finance"] = {"mode": None, "rows": []}
+            state["data"]["ops"] = {"mode": None, "rows": []}
+            state["data"]["artifacts"] = {"intent_key": intent_key, "slots": slots}
+            return state
+
+        # ---- Standard Execution for generic single intents ----
+
+        # Mongo
+        if cfg.get("needs", {}).get("mongo"):
+            try:
+                res = self.mongo_agent.run(
+                    intent_key=cfg.get("mongo_intent", "entity.auto"),
+                    slots=slots,
+                    projection=cfg.get("mongo_projection"),
+                    session_context=session_context,
+                )
+                state["mongo"] = _json_safe(res)
+
+                # Update session with anchor
+                if isinstance(state["mongo"], dict):
+                    anchor_type = state["mongo"].get("anchor_type")
+                    anchor_id = state["mongo"].get("anchor_id")
+                    
+                    if anchor_type and anchor_id:
+                        persisted_slots = self._build_persisted_slots(base=(session_context.get("slots") or {}), updates=slots)
+                        self.redis.save_session(
+                            state["session_id"],
+                            {
+                                **session_context,
+                                "anchor_type": anchor_type,
+                                "anchor_id": anchor_id,
+                                "memory_slots": self._extract_memory_slots(persisted_slots),
+                                "param_slots": self._extract_param_slots(persisted_slots),
+                                "slots": persisted_slots,
+                                "last_user_input": state["user_input"],
+                            },
+                        )
+                        state["session_ctx"] = self.redis.load_session(state["session_id"])
+
+                    # Extract voyage_id or imo from mongo result
+                    doc = (state["mongo"] or {}).get("document") or {}
+                    if "voyageId" in doc and "voyage_id" not in slots:
+                        slots["voyage_id"] = doc["voyageId"]
+                    if "imo" in doc and "imo" not in slots:
+                        slots["imo"] = doc["imo"]
+            except Exception as e:
+                _dprint(f"⚠️  Mongo failed: {e}")
+                state["mongo"] = None
+
+        # Finance
+        if cfg.get("needs", {}).get("finance"):
+            try:
+                res = self.finance_agent.run(
+                    intent_key=intent_key,
+                    slots=slots,
+                    session_context={**session_context, "user_input": state.get("user_input") or ""},
+                )
+                state["finance"] = _json_safe(res)
+            except Exception as e:
+                _dprint(f"⚠️  Finance failed: {e}")
+                state["finance"] = {
+                    "mode": "error",
+                    "rows": [],
+                    "fallback_reason": f"Finance agent error: {str(e)}"
+                }
+
+        # Ops
+        if cfg.get("needs", {}).get("ops"):
+            try:
+                res = self.ops_agent.run(
+                    intent_key=intent_key,
+                    slots=slots,
+                    session_context={**session_context, "user_input": state.get("user_input") or ""},
+                )
+                state["ops"] = _json_safe(res)
+            except Exception as e:
+                _dprint(f"⚠️  Ops failed: {e}")
+                state["ops"] = {
+                    "mode": "error",
+                    "rows": [],
+                    "fallback_reason": f"Ops agent error: {str(e)}"
+                }
+
+        # =========================================================
+        # Optional Dynamic NoSQL enrichment for ops port queries
+        # (adds remarks/grades/ports from Mongo when asked)
+        # =========================================================
+        if intent_key in ("ops.port_query", "ops.voyages_by_port"):
+            ui_l = (user_input or "").lower()
+            wants_mongo = any(k in ui_l for k in ("remark", "remarks", "grade", "grades", "cargo"))
+            if wants_mongo and hasattr(self.mongo_agent, "run_llm_find"):
+                try:
+                    voyage_ids: list[str] = []
+                    fin = state.get("finance")
+                    ops = state.get("ops")
+                    if isinstance(fin, dict):
+                        for r in (fin.get("rows") or [])[:20]:
+                            if isinstance(r, dict) and r.get("voyage_id"):
+                                voyage_ids.append(str(r["voyage_id"]))
+                    if not voyage_ids and isinstance(ops, dict):
+                        for r in (ops.get("rows") or [])[:20]:
+                            if isinstance(r, dict) and r.get("voyage_id"):
+                                voyage_ids.append(str(r["voyage_id"]))
+                    voyage_ids = list(dict.fromkeys([v for v in voyage_ids if v]))
+
+                    if voyage_ids:
+                        q = (
+                            "Fetch remarks + minimal context for these voyage_ids.\n"
+                            "Use collection=voyages.\n"
+                            "Filter MUST be: {\"voyageId\": {\"$in\": slots.voyage_ids}}.\n"
+                            "Projection MUST include: {\"_id\": 0, \"voyageId\": 1, \"voyageNumber\": 1, \"remarks\": 1, "
+                            "\"fixtures.grades\": 1, \"fixtures.fixtureGrades.gradeName\": 1, "
+                            "\"fixtures.fixturePorts.portName\": 1, \"fixtures.fixturePorts.activityType\": 1}.\n"
+                            "Return only the minimal required fields."
+                        )
+                        mongo_llm = self.mongo_agent.run_llm_find(question=q, slots={"voyage_ids": voyage_ids})
+                        state["mongo"] = _json_safe(mongo_llm)
+                        if "data" in state and isinstance(state["data"], dict):
+                            state["data"]["mongo"] = state["mongo"]
+                    elif slots.get("port_name"):
+                        # Fallback: query by port name directly if we have no IDs.
+                        q = (
+                            "Find voyages that called at the given port name (case-insensitive) and return minimal context.\n"
+                            "Use collection=voyages.\n"
+                            "Filter should use fixtures.fixturePorts.portName with $regex and $options:'i' using slots.port_name.\n"
+                            "Projection MUST include: {\"_id\": 0, \"voyageId\": 1, \"voyageNumber\": 1, \"remarks\": 1, "
+                            "\"fixtures.grades\": 1, \"fixtures.fixtureGrades.gradeName\": 1, "
+                            "\"fixtures.fixturePorts.portName\": 1, \"fixtures.fixturePorts.activityType\": 1}.\n"
+                            "Limit <= 50."
+                        )
+                        mongo_llm = self.mongo_agent.run_llm_find(question=q, slots={"port_name": slots.get("port_name")})
+                        state["mongo"] = _json_safe(mongo_llm)
+                        if "data" in state and isinstance(state["data"], dict):
+                            state["data"]["mongo"] = state["mongo"]
+                except Exception as e:
+                    _dprint(f"⚠️  Mongo enrichment failed: {e}")
+
+        state["slots"] = slots
+        return state
+
+    # =========================================================
+    # Composite Step Execution
+    # =========================================================
+
+    def n_execute_step(self, state: GraphState) -> GraphState:
+        """
+        Execute one composite step. Caps finance/ops rows and voyage_ids, deduplicates, scenario comparison handling.
+        """
+
+        # LangGraph may populate declared state keys with None. Ensure data is always a dict.
+        if not isinstance(state.get("data"), dict):
+            state["data"] = {
+                "finance": {"mode": None, "rows": []},
+                "ops": {"mode": None, "rows": []},
+                "mongo": {},
+                "artifacts": {},
+            }
+
+        plan = state.get("plan") or {}
+        steps = plan.get("steps") or []
+        idx = int(state.get("step_index") or 0)
+
+        artifacts = state.get("artifacts") or {}
+        # Merge state slots so port_name etc. are always available for finance/ops
+        slots = {**(state.get("slots") or {}), **(artifacts.get("slots") or {})}
+        sess = state.get("session_ctx") or {}
+
+        if idx >= len(steps):
+            return state
+
+        step = steps[idx]
+        agent = (step.get("agent") or "").lower()
+        op = step.get("operation") or ""
+
+        op = re.sub(r'([a-z])([A-Z])', r'\1_\2', op).lower()
+
+        _dprint(f"\n▶️  COMPOSITE STEP {idx + 1}/{len(steps)}: {agent}.{op}")
+
+        self._trace(
+            state,
+            {
+                "phase": "composite_step_start",
+                "step_index": idx + 1,
+                "step_count": len(steps),
+                "agent": agent,
+                "operation": op,
+                "inputs": step.get("inputs") or {},
+                "goal": self._step_goal_text(
+                    intent_key=str(state.get("intent_key") or ""),
+                    agent=agent,
+                    op=op,
+                    step_inputs=step.get("inputs") or {},
+                    slots=slots,
+                ),
+            },
+        )
+
+        # Ensure expected sections exist (avoid None/KeyError in error paths).
+        data = state.get("data")
+        if isinstance(data, dict):
+            data.setdefault("finance", {"mode": None, "rows": []})
+            data.setdefault("ops", {"mode": None, "rows": []})
+            data.setdefault("mongo", {})
+            data.setdefault("artifacts", {})
+            state["data"] = data
+
+        # =========================================================
+        # FINANCE STEP
+        # =========================================================
+        if agent == "finance" and op in ("dynamic_sql", "registry_sql"):
+            # Merge step inputs (e.g. limit from planner) into slots
+            step_inputs = step.get("inputs") or {}
+            for k, v in step_inputs.items():
+                if k not in ("question", "intent_key") and v is not None:
+                    slots = {**slots, k: v}
+            # Intent from state or plan (plan is authoritative after build_plan)
+            intent_key = state.get("intent_key") or (state.get("plan") or {}).get("intent_key") or "composite.query"
+            # Composite always uses dynamic SQL for finance; registry only when plan explicitly says registry_sql (e.g. single-query path)
+            use_registry = op == "registry_sql"
+            try:
+                if use_registry:
+                    result = self.finance_agent.run(
+                        intent_key=intent_key,
+                        slots=slots,
+                    )
+                else:
+                    result = self.finance_agent.run_dynamic(
+                        question=state["user_input"],
+                        intent_key=intent_key,
+                        slots=slots
+                    )
+
+                safe = _json_safe(result)
+                rows = safe.get("rows", []) or []
+
+                # Cap finance rows
+                rows = rows[:20]
+
+                safe["rows"] = rows
+
+                state["finance"] = safe
+                state["data"]["finance"] = safe
+
+                # Extract voyage_ids safely
+                voyage_ids = [
+                    r.get("voyage_id")
+                    for r in rows
+                    if isinstance(r, dict) and r.get("voyage_id")
+                ]
+
+                # Fallback for single-voyage composite queries:
+                # If finance SQL returned KPI rows without voyage_id (common LLM omission),
+                # reuse canonical voyage_id resolved by mongo.resolve_anchor so downstream
+                # ops/mongo merge can still produce a coherent single-voyage snapshot.
+                if not voyage_ids and rows:
+                    include_ids = artifacts.get("include_voyage_ids") or []
+                    if isinstance(include_ids, list):
+                        include_ids = [x for x in include_ids if x not in (None, "", [], {})]
+                    else:
+                        include_ids = []
+                    if not include_ids and slots.get("voyage_id") not in (None, "", [], {}):
+                        include_ids = [slots.get("voyage_id")]
+                    if len(include_ids) == 1:
+                        canonical_vid = include_ids[0]
+                        for r in rows:
+                            if isinstance(r, dict) and not r.get("voyage_id"):
+                                r["voyage_id"] = canonical_vid
+                                if slots.get("voyage_number") and not r.get("voyage_number"):
+                                    r["voyage_number"] = slots.get("voyage_number")
+                        voyage_ids = [canonical_vid]
+
+                if voyage_ids:
+                    # Deduplicate + hard cap
+                    unique_ids = list(dict.fromkeys(voyage_ids))
+
+                    # If mongo.resolve_anchor found a specific voyage_id to include,
+                    # ensure it is present in the list before downstream ops/mongo steps.
+                    include_ids = artifacts.get("include_voyage_ids") or []
+                    if isinstance(include_ids, list) and include_ids:
+                        unique_ids = list(dict.fromkeys([*include_ids, *unique_ids]))
+
+                    unique_ids = unique_ids[:20]
+
+                    artifacts["voyage_ids"] = unique_ids
+                    artifacts["finance_rows"] = rows
+                    slots["voyage_ids"] = unique_ids
+
+                    _dprint(f"   ✅ Extracted {len(unique_ids)} voyage_ids (capped)")
+                    self._trace(
+                        state,
+                        {
+                            "phase": "composite_step_result",
+                            "step_index": idx + 1,
+                            "agent": agent,
+                            "operation": op,
+                            "ok": True,
+                            "mode": safe.get("mode"),
+                            "rows": len(rows),
+                            "voyage_ids": len(unique_ids),
+                            "voyage_ids_sample": unique_ids[:5],
+                            "sql_present": bool(safe.get("sql")),
+                            "sql": safe.get("sql"),
+                            "summary": f"Finance: fetched {len(rows)} rows and extracted {len(unique_ids)} voyage_ids (Postgres).",
+                        },
+                    )
+                else:
+                    # No voyage_ids: vessel-level or aggregate (e.g. ranking.vessels). Still store finance_rows for merge.
+                    artifacts["finance_rows"] = rows
+                    artifacts["voyage_ids"] = []
+                    # Some finance aggregate intents return no voyage_ids (e.g., cargo profitability by grade).
+                    # For those, carry forward key dimension values so ops can provide context.
+                    if state.get("intent_key") in ("analysis.cargo_profitability", "analysis.cargoprofitability"):
+                        cargo_grades = [
+                            (r.get("cargo_grade") or r.get("grade") or "").strip()
+                            for r in rows
+                            if isinstance(r, dict) and isinstance((r.get("cargo_grade") or r.get("grade")), str)
+                        ]
+                        cargo_grades = [g for g in cargo_grades if g]
+                        cargo_grades = list(dict.fromkeys(cargo_grades))[:50]
+                        if cargo_grades:
+                            artifacts["cargo_grades"] = cargo_grades
+                            slots["cargo_grades"] = cargo_grades
+                    if state.get("intent_key") == "ranking.vessels" and rows:
+                        vessel_imos = []
+                        for r in rows:
+                            if not isinstance(r, dict):
+                                continue
+                            imo = r.get("vessel_imo")
+                            if imo is not None:
+                                vessel_imos.append(imo)
+                        if vessel_imos:
+                            artifacts["vessel_imos"] = vessel_imos[:50]
+
+                    self._trace(
+                        state,
+                        {
+                            "phase": "composite_step_result",
+                            "step_index": idx + 1,
+                            "agent": agent,
+                            "operation": op,
+                            "ok": True,
+                            "mode": safe.get("mode"),
+                            "rows": len(rows),
+                            "voyage_ids": 0,
+                            "sql_present": bool(safe.get("sql")),
+                            "sql": safe.get("sql"),
+                            "summary": f"Finance: fetched {len(rows)} rows (Postgres). No voyage_ids extracted.",
+                        },
+                    )
+
+            except Exception as e:
+                err_str = str(e)
+                # Retry with registry when dynamic SQL fails due to missing column (e.g. bunker_cost)
+                if "bunker_cost" in err_str and (intent_key == "analysis.high_revenue_low_pnl" or (state.get("plan") or {}).get("intent_key") == "analysis.high_revenue_low_pnl"):
+                    try:
+                        result = self.finance_agent.run(intent_key=intent_key, slots=slots)
+                        safe = _json_safe(result)
+                        rows = safe.get("rows", []) or []
+                        rows = rows[:20]
+                        safe["rows"] = rows
+                        state["finance"] = safe
+                        state["data"]["finance"] = safe
+                        voyage_ids = [r.get("voyage_id") for r in rows if isinstance(r, dict) and r.get("voyage_id")]
+                        voyage_ids = list(dict.fromkeys(voyage_ids))[:20]
+                        if voyage_ids:
+                            artifacts["voyage_ids"] = voyage_ids
+                            artifacts["finance_rows"] = rows
+                            slots["voyage_ids"] = voyage_ids
+                        self._trace(state, {"phase": "composite_step_result", "step_index": idx + 1, "agent": agent, "operation": op, "ok": True, "mode": safe.get("mode"), "rows": len(rows), "voyage_ids": len(voyage_ids), "voyage_ids_sample": voyage_ids[:5], "sql_present": bool(safe.get("sql")), "sql": safe.get("sql"), "summary": "Finance: retried with registry SQL (Postgres)."})
+                    except Exception as e2:
+                        _dprint(f"   ❌ finance (registry retry) failed: {e2}")
+                        state["data"]["finance"] = {"mode": "error", "rows": []}
+                        self._trace(state, {"phase": "composite_step_result", "step_index": idx + 1, "agent": agent, "operation": op, "ok": False, "error": err_str})
+                else:
+                    _dprint(f"   ❌ finance.dynamic_sql failed: {e}")
+                    state["data"]["finance"] = {"mode": "error", "rows": []}
+                    self._trace(
+                        state,
+                        {
+                            "phase": "composite_step_result",
+                            "step_index": idx + 1,
+                            "agent": agent,
+                            "operation": op,
+                            "ok": False,
+                            "error": err_str,
+                        },
+                    )
+
+        # =========================================================
+        # OPS STEP
+        # =========================================================
+        elif agent == "ops" and op == "dynamic_sql":
+
+            # Resolve step inputs (e.g. voyage_ids: "$finance.voyage_ids") so we never pass literal placeholders to the agent
+            step_inputs = step.get("inputs") or {}
+            for k, v in step_inputs.items():
+                if k in ("question", "intent_key"):
+                    continue
+                if v == "$finance.voyage_ids" or (isinstance(v, str) and v.strip() == "$finance.voyage_ids"):
+                    v = artifacts.get("voyage_ids") or []
+                if v is not None:
+                    slots = {**slots, k: v}
+
+            voyage_ids = artifacts.get("voyage_ids") or []
+            if not isinstance(voyage_ids, list):
+                voyage_ids = []
+            slots["voyage_ids"] = voyage_ids[:20]
+
+            intent_key_ops = state.get("intent_key") or (state.get("plan") or {}).get("intent_key") or "composite.query"
+            if intent_key_ops in ("analysis.cargo_profitability", "analysis.cargoprofitability") and (artifacts.get("cargo_grades") or []):
+                slots["cargo_grades"] = artifacts["cargo_grades"]
+            if intent_key_ops == "ranking.vessels" and not voyage_ids and (artifacts.get("vessel_imos") or []):
+                slots["vessel_imos"] = artifacts["vessel_imos"]
+
+            # Trace resolved inputs (plan "inputs" are placeholders; these are what we actually pass to the agent)
+            _resolved_vids = len(slots.get("voyage_ids") or []) if isinstance(slots.get("voyage_ids"), list) else 0
+            _resolved_grades = len(slots.get("cargo_grades") or []) if isinstance(slots.get("cargo_grades"), list) else 0
+            self._trace(
+                state,
+                {
+                    "phase": "composite_step_inputs_resolved",
+                    "step_index": idx + 1,
+                    "agent": agent,
+                    "resolved_voyage_ids_count": _resolved_vids,
+                    "resolved_cargo_grades_count": _resolved_grades,
+                    "intent_key_ops": intent_key_ops,
+                },
+            )
+
+            try:
+                result = self.ops_agent.run_dynamic(
+                    question=state["user_input"],
+                    intent_key=intent_key_ops,
+                    slots=slots
+                )
+
+                safe = _json_safe(result)
+                rows = safe.get("rows", []) or []
+
+                # Hard cap ops rows
+                rows = rows[:20]
+                safe["rows"] = rows
+
+                state["ops"] = safe
+                state["data"]["ops"] = safe
+
+                artifacts["ops_rows"] = rows
+
+                _dprint(f"   ✅ Got {len(rows)} ops rows (capped)")
+                self._trace(
+                    state,
+                    {
+                        "phase": "composite_step_result",
+                        "step_index": idx + 1,
+                        "agent": agent,
+                        "operation": op,
+                        "ok": True,
+                        "mode": safe.get("mode"),
+                        "rows": len(rows),
+                        "voyage_ids": len(slots.get("voyage_ids") or []) if isinstance(slots.get("voyage_ids"), list) else None,
+                        "voyage_ids_sample": (slots.get("voyage_ids") or [])[:5] if isinstance(slots.get("voyage_ids"), list) else None,
+                        "sql_present": bool(safe.get("sql")),
+                        "sql": safe.get("sql"),
+                        "summary": f"Ops: fetched {len(rows)} ops rows for voyage_ids (Postgres).",
+                    },
+                )
+
+            except Exception as e:
+                _dprint(f"   ❌ ops.dynamic_sql failed: {e}")
+                state["data"]["ops"] = {"mode": "error", "rows": []}
+                self._trace(
+                    state,
+                    {
+                        "phase": "composite_step_result",
+                        "step_index": idx + 1,
+                        "agent": agent,
+                        "operation": op,
+                        "ok": False,
+                        "error": str(e),
+                    },
+                )
+
+        # =========================================================
+        # MONGO STEP
+        # =========================================================
+        elif agent == "mongo" and op == "resolve_anchor":
+            q = (step.get("inputs") or {}).get("goal") or state.get("user_input") or ""
+            try:
+                mongo_resp = self.mongo_agent.run_llm_find(question=q, slots=slots)
+                safe = _json_safe(mongo_resp)
+                state["mongo"] = safe
+                state["data"]["mongo"] = safe
+
+                rows = safe.get("rows") if isinstance(safe, dict) else None
+                if isinstance(rows, list) and rows:
+                    first = rows[0] if isinstance(rows[0], dict) else {}
+                    if first.get("voyageId") and not slots.get("voyage_id"):
+                        slots["voyage_id"] = first["voyageId"]
+                    imo = first.get("imo") or first.get("vesselImo")
+                    if imo and not slots.get("imo"):
+                        slots["imo"] = imo
+                    if first.get("voyageNumber") and not slots.get("voyage_number"):
+                        slots["voyage_number"] = first["voyageNumber"]
+                    if first.get("vesselName") and not slots.get("vessel_name"):
+                        slots["vessel_name"] = first["vesselName"]
+
+                # Carry resolved voyage_id into artifacts so later steps include it
+                if slots.get("voyage_id"):
+                    inc = artifacts.get("include_voyage_ids")
+                    if not isinstance(inc, list):
+                        inc = []
+                    if slots["voyage_id"] not in inc:
+                        inc.append(slots["voyage_id"])
+                    artifacts["include_voyage_ids"] = inc
+                self._trace(
+                    state,
+                    {
+                        "phase": "composite_step_result",
+                        "step_index": idx + 1,
+                        "agent": agent,
+                        "operation": op,
+                        "ok": True,
+                        "mode": safe.get("mode") if isinstance(safe, dict) else None,
+                        "mongo_ok": safe.get("ok") if isinstance(safe, dict) else None,
+                        "collection": safe.get("collection") if isinstance(safe, dict) else None,
+                        "limit": safe.get("limit") if isinstance(safe, dict) else None,
+                        "mongo_query": (
+                            {
+                                "collection": safe.get("collection"),
+                                "filter": safe.get("filter"),
+                                "projection": safe.get("projection"),
+                                "sort": safe.get("sort"),
+                                "limit": safe.get("limit"),
+                                "pipeline": safe.get("pipeline"),
+                            }
+                            if isinstance(safe, dict)
+                            else None
+                        ),
+                        "rows": len(safe.get("rows") or []) if isinstance(safe, dict) else None,
+                        "summary": "Mongo: resolve anchors/entities for the query (MongoDB).",
+                    },
+                )
+            except Exception as e:
+                state["data"]["mongo"] = {"mode": "mongo_llm", "ok": False, "reason": str(e), "rows": []}
+                self._trace(
+                    state,
+                    {
+                        "phase": "composite_step_result",
+                        "step_index": idx + 1,
+                        "agent": agent,
+                        "operation": op,
+                        "ok": False,
+                        "error": str(e),
+                    },
+                )
+
+        elif agent == "mongo" and op == "fetch_remarks":
+
+            voyage_ids = artifacts.get("voyage_ids") or []
+            remarks_by: Dict[str, Any] = {}
+            cargo_by: Dict[str, Any] = {}
+            ports_by: Dict[str, Any] = {}
+            voyage_number_by: Dict[str, Any] = {}
+            commissions_by: Dict[str, Any] = {}
+
+            _dprint(f"   📝 Fetching remarks for {len(voyage_ids)} voyages...")
+
+            used_llm = False
+            if voyage_ids:
+                try:
+                    slots["voyage_ids"] = voyage_ids[:20]
+
+                    # For remarks fetch, keep the LLM spec focused ONLY on voyage_ids
+                    # to avoid over-filtering (e.g. by port_name) and to ensure voyageId
+                    # is always projected for deterministic mapping.
+                    slots_for_mongo = {"voyage_ids": slots["voyage_ids"]}
+                    user_q = (state.get("user_input") or "").lower()
+                    include_commissions = "commission" in user_q
+                    q = (step.get("inputs") or {}).get("goal") or (
+                        "Fetch remarks + minimal context for these voyage_ids.\n"
+                        "Use collection=voyages.\n"
+                        "Filter MUST be: {\"voyageId\": {\"$in\": slots.voyage_ids}}.\n"
+                        "Projection MUST include: {\"_id\": 0, \"voyageId\": 1, \"voyageNumber\": 1, \"remarks\": 1, "
+                        "\"fixtures.grades\": 1, \"fixtures.fixtureGrades.gradeName\": 1, "
+                        "\"fixtures.fixturePorts.portName\": 1, \"fixtures.fixturePorts.activityType\": 1"
+                        + (", \"fixtures.fixtureCommissions.commissionType\": 1, \"fixtures.fixtureCommissions.organizationName\": 1, \"fixtures.fixtureCommissions.rate\": 1" if include_commissions else "")
+                        + "}.\n"
+                        "Return only the minimal required fields."
+                    )
+
+                    mongo_resp = self.mongo_agent.run_llm_find(question=q, slots=slots_for_mongo)
+                    safe = _json_safe(mongo_resp)
+                    state["mongo"] = safe
+                    state["data"]["mongo"] = safe
+
+                    rows = safe.get("rows") if isinstance(safe, dict) else None
+                    if isinstance(rows, list) and rows:
+                        for r in rows:
+                            if not isinstance(r, dict):
+                                continue
+                            vid = r.get("voyageId") or r.get("voyage_id")
+                            if not vid:
+                                continue
+                            vid_s = str(vid)
+                            voyage_number_by[vid_s] = r.get("voyageNumber") or r.get("voyage_number")
+
+                            remarks = r.get("remarks") or r.get("remarkList") or r.get("remarks_json")
+                            # Normalize remarks into a list of short strings (Mongo often stores remarkList as objects).
+                            remarks_norm: list[str] = []
+                            if isinstance(remarks, str) and remarks.strip():
+                                remarks_norm = [remarks.strip()]
+                            elif isinstance(remarks, list):
+                                for it in remarks:
+                                    if isinstance(it, str) and it.strip():
+                                        remarks_norm.append(it.strip())
+                                    elif isinstance(it, dict):
+                                        txt = it.get("remark") or it.get("text") or it.get("message")
+                                        if isinstance(txt, str) and txt.strip():
+                                            remarks_norm.append(txt.strip())
+                            elif isinstance(remarks, dict):
+                                txt = remarks.get("remark") or remarks.get("text") or remarks.get("message")
+                                if isinstance(txt, str) and txt.strip():
+                                    remarks_norm = [txt.strip()]
+
+                            # De-dupe preserve order; keep at most 25 to control payload size.
+                            seen_rm = set()
+                            remarks_dedup = []
+                            for rm in remarks_norm:
+                                if rm not in seen_rm:
+                                    seen_rm.add(rm)
+                                    remarks_dedup.append(rm)
+                            remarks_by[vid_s] = remarks_dedup[:25] if remarks_dedup else None
+
+                            # Cargo grade (best-effort): prefer fixtures.grades string, else fixtureGrades.gradeName list
+                            grades: list[str] = []
+                            comms: list[dict] = []
+                            fixtures = r.get("fixtures")
+                            fixtures_list = None
+                            if isinstance(fixtures, list):
+                                fixtures_list = fixtures
+                            elif isinstance(fixtures, dict):
+                                fl = fixtures.get("fixtureList") or fixtures.get("fixtures") or fixtures.get("list")
+                                if isinstance(fl, list):
+                                    fixtures_list = fl
+
+                            if isinstance(fixtures_list, list):
+                                for fx in fixtures_list:
+                                    if not isinstance(fx, dict):
+                                        continue
+                                    g = fx.get("grades")
+                                    if isinstance(g, str) and g.strip():
+                                        grades.append(g.strip())
+                                    fgs = fx.get("fixtureGrades")
+                                    if isinstance(fgs, list):
+                                        for fg in fgs:
+                                            if isinstance(fg, dict):
+                                                gn = fg.get("gradeName")
+                                                if isinstance(gn, str) and gn.strip():
+                                                    grades.append(gn.strip())
+
+                                    # Bills of lading may contain grade names in some datasets
+                                    bols = fx.get("fixtureBillsOfLading") or fx.get("billsOfLading") or fx.get("bills")
+                                    if isinstance(bols, list):
+                                        for bol in bols:
+                                            if not isinstance(bol, dict):
+                                                continue
+                                            gn = bol.get("fixtureGradeName") or bol.get("gradeName") or bol.get("cargoGrade")
+                                            if isinstance(gn, str) and gn.strip():
+                                                grades.append(gn.strip())
+
+                                    # Commission details (best-effort)
+                                    fcs = fx.get("fixtureCommissions")
+                                    if isinstance(fcs, list):
+                                        for fc in fcs:
+                                            if not isinstance(fc, dict):
+                                                continue
+                                            ct = fc.get("commissionType")
+                                            on = fc.get("organizationName")
+                                            rate = fc.get("rate")
+                                            if ct or on or rate is not None:
+                                                comms.append({
+                                                    "commissionType": ct,
+                                                    "organizationName": on,
+                                                    "rate": rate,
+                                                })
+
+                            # de-dupe preserve order
+                            seen_g = set()
+                            grades_dedup = []
+                            for g in grades:
+                                if g not in seen_g:
+                                    seen_g.add(g)
+                                    grades_dedup.append(g)
+                            cargo_by[vid_s] = grades_dedup
+
+                            # de-dupe commissions by (type, org, rate)
+                            if comms:
+                                seen_c = set()
+                                comms_dedup = []
+                                for c in comms:
+                                    key = (c.get("commissionType"), c.get("organizationName"), c.get("rate"))
+                                    if key not in seen_c:
+                                        seen_c.add(key)
+                                        comms_dedup.append(c)
+                                commissions_by[vid_s] = comms_dedup[:20]
+
+                            # Key ports from fixturePorts
+                            ports: list[dict] = []
+                            if isinstance(fixtures_list, list):
+                                for fx in fixtures_list:
+                                    if not isinstance(fx, dict):
+                                        continue
+                                    fps = fx.get("fixturePorts")
+                                    if not isinstance(fps, list):
+                                        continue
+                                    for p in fps:
+                                        if not isinstance(p, dict):
+                                            continue
+                                        pn = p.get("portName")
+                                        at = p.get("activityType")
+                                        if isinstance(pn, str) and pn.strip():
+                                            ports.append({"portName": pn.strip(), "activityType": at})
+
+                            # de-dupe ports by (portName, activityType)
+                            seen_p = set()
+                            ports_dedup = []
+                            for p in ports:
+                                key = (p.get("portName"), p.get("activityType"))
+                                if key not in seen_p:
+                                    seen_p.add(key)
+                                    ports_dedup.append(p)
+                            ports_by[vid_s] = ports_dedup[:20]
+
+                        # Only treat LLM path as successful if we can map at least one voyageId.
+                        used_llm = bool(remarks_by)
+                except Exception:
+                    used_llm = False
+
+            if not used_llm:
+                # Fallback: existing anchor logic (safe, but multiple small calls)
+                for vid in voyage_ids[:20]:
+                    try:
+                        resp = self.mongo_agent.run(
+                            intent_key="voyage.entity",
+                            slots={"voyage_id": vid},
+                            projection={
+                                "_id": 0,
+                                "voyageId": 1,
+                                "remarks": 1,
+                                "remarkList": 1,
+                            },
+                            session_context=sess,
+                        )
+
+                        doc = resp.document or {}
+                        remarks = doc.get("remarks") or doc.get("remarkList")
+                        remarks_by[str(vid)] = remarks
+                    except Exception:
+                        remarks_by[str(vid)] = None
+
+            artifacts["remarks_by_voyage_id"] = remarks_by
+            artifacts["cargo_by_voyage_id"] = cargo_by
+            artifacts["ports_by_voyage_id"] = ports_by
+            artifacts["voyage_number_by_voyage_id"] = voyage_number_by
+            artifacts["commissions_by_voyage_id"] = commissions_by
+            _dprint(f"   ✅ Fetched remarks for {len(remarks_by)} voyages")
+            self._trace(
+                state,
+                {
+                    "phase": "composite_step_result",
+                    "step_index": idx + 1,
+                    "agent": agent,
+                    "operation": op,
+                    "ok": True,
+                    "mode": (state.get("mongo") or {}).get("mode") if isinstance(state.get("mongo"), dict) else None,
+                    "mongo_ok": (state.get("mongo") or {}).get("ok") if isinstance(state.get("mongo"), dict) else None,
+                    "mongo_query": (
+                        {
+                            "collection": (state.get("mongo") or {}).get("collection"),
+                            "filter": (state.get("mongo") or {}).get("filter"),
+                            "projection": (state.get("mongo") or {}).get("projection"),
+                            "sort": (state.get("mongo") or {}).get("sort"),
+                            "limit": (state.get("mongo") or {}).get("limit"),
+                            "pipeline": (state.get("mongo") or {}).get("pipeline"),
+                        }
+                        if used_llm and isinstance(state.get("mongo"), dict)
+                        else None
+                    ),
+                    "rows": len(((state.get("mongo") or {}).get("rows") or [])) if isinstance(state.get("mongo"), dict) else None,
+                    "voyage_ids": len(voyage_ids or []),
+                    "voyage_ids_sample": (voyage_ids or [])[:5],
+                    "remarks_by_voyage_id": len(remarks_by or {}),
+                    "summary": f"Mongo: fetched remarks + minimal context for {len(voyage_ids or [])} voyages (MongoDB).",
+                },
+            )
+
+        # =========================================================
+        # LLM MERGE STEP
+        # =========================================================
+        elif agent == "llm" and op == "merge":
+
+            merged_rows = []
+            finance_rows = artifacts.get("finance_rows") or []
+            ops_rows = artifacts.get("ops_rows") or []
+            remarks = artifacts.get("remarks_by_voyage_id") or {}
+            cargo_by = artifacts.get("cargo_by_voyage_id") or {}
+            ports_by = artifacts.get("ports_by_voyage_id") or {}
+            voyage_number_by = artifacts.get("voyage_number_by_voyage_id") or {}
+            commissions_by = artifacts.get("commissions_by_voyage_id") or {}
+            intent_key_merge = state.get("intent_key") or ""
+
+            # Index ops rows by voyage_id
+            ops_by_vid = {}
+            for r in ops_rows:
+                if isinstance(r, dict) and r.get("voyage_id"):
+                    ops_by_vid.setdefault(r["voyage_id"], []).append(r)
+
+            # ranking.vessels: finance returns vessel-level rows (vessel_imo, voyage_count, avg_pnl) without voyage_id
+            if intent_key_merge == "ranking.vessels" and finance_rows:
+                has_voyage_id = any(isinstance(fr, dict) and fr.get("voyage_id") for fr in finance_rows)
+                if not has_voyage_id:
+                    def _imo_key(imo):
+                        if imo is None:
+                            return ""
+                        try:
+                            return str(int(float(imo)))
+                        except (TypeError, ValueError):
+                            return str(imo).strip()
+
+                    ops_by_imo = {}
+                    for r in ops_rows:
+                        if isinstance(r, dict):
+                            imo = r.get("vessel_imo")
+                            if imo is not None:
+                                k = _imo_key(imo)
+                                if k:
+                                    ops_by_imo.setdefault(k, []).append(r)
+                    seen_imo = set()
+                    for fr in finance_rows:
+                        if not isinstance(fr, dict):
+                            continue
+                        imo = fr.get("vessel_imo") or fr.get("vessel_imo")
+                        if imo is None:
+                            continue
+                        imo_str = _imo_key(imo)
+                        if not imo_str or imo_str in seen_imo:
+                            continue
+                        seen_imo.add(imo_str)
+                        ops_for_imo = ops_by_imo.get(imo_str, [])
+                        cargo_grades = []
+                        for orow in ops_for_imo:
+                            g = orow.get("grades_json")
+                            if isinstance(g, (list, tuple)):
+                                for x in g:
+                                    if x is not None:
+                                        s = str(x).strip()
+                                        if s and s not in cargo_grades:
+                                            cargo_grades.append(s)
+                        def _n(v):
+                            if v is None or v == "": return None
+                            try: return float(v)
+                            except (TypeError, ValueError): return v
+                        merged_rows.append({
+                            "vessel_imo": imo_str,
+                            "vessel_name": fr.get("vessel_name"),
+                            "voyage_count": fr.get("voyage_count"),
+                            "avg_pnl": _n(fr.get("avg_pnl") or fr.get("total_pnl") or fr.get("pnl")),
+                            "total_pnl": _n(fr.get("total_pnl") or fr.get("pnl")),
+                            "pnl": _n(fr.get("avg_pnl") or fr.get("pnl") or fr.get("total_pnl")),
+                            "revenue": _n(fr.get("revenue") or fr.get("total_revenue")),
+                            "total_expense": _n(fr.get("total_expense")),
+                            "tce": _n(fr.get("tce") or fr.get("avg_tce")),
+                            "total_commission": _n(fr.get("total_commission")),
+                            "cargo_grades": cargo_grades[:15],
+                            "key_ports": [],
+                            "remarks": None,
+                        })
+                    artifacts["merged_rows"] = merged_rows
+                    try:
+                        cov = artifacts.get("coverage") if isinstance(artifacts.get("coverage"), dict) else {}
+                        if not isinstance(cov, dict):
+                            cov = {}
+                        cov["merged_rows_total"] = len(merged_rows)
+                        cov["pnl_available"] = sum(1 for r in merged_rows if isinstance(r, dict) and r.get("pnl") not in (None, ""))
+                        cov["cargo_grades_available"] = sum(1 for r in merged_rows if isinstance(r, dict) and r.get("cargo_grades"))
+                        artifacts["coverage"] = cov
+                    except Exception:
+                        pass
+                    _dprint(f"   ✅ Merged {len(merged_rows)} vessel-level rows (ranking.vessels)")
+                    self._trace(state, {"phase": "composite_step_result", "step_index": idx + 1, "agent": agent, "operation": op, "ok": True, "merged_rows": len(merged_rows), "summary": f"Merge: joined {len(merged_rows)} vessel-level rows for ranking.vessels."})
+                    artifacts["slots"] = slots
+                    state["artifacts"] = artifacts
+                    state["slots"] = slots
+                    state["step_index"] = idx + 1
+                    return state
+
+            # Deduplicated merge (by voyage_id)
+            seen = set()
+
+            for fr in finance_rows:
+                if not isinstance(fr, dict):
+                    continue
+
+                vid = fr.get("voyage_id")
+
+                if not vid or vid in seen:
+                    continue
+
+                seen.add(vid)
+
+                # Flatten core finance KPIs at the top-level of merged_rows for deterministic summarization.
+                # This avoids the LLM missing KPIs when `finance.rows` is compacted away.
+                # Normalize numeric keys (support alternate casing from DB) and coerce to float for JSON.
+                def _num(v):
+                    if v is None or v == "":
+                        return None
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        return v
+
+                pnl = _num(fr.get("pnl") or fr.get("PnL"))
+                revenue = _num(fr.get("revenue") or fr.get("Revenue"))
+                total_expense = _num(fr.get("total_expense") or fr.get("Total_expense") or fr.get("total expense"))
+                tce = _num(fr.get("tce") or fr.get("TCE"))
+                total_commission = _num(fr.get("total_commission") or fr.get("Total_commission") or fr.get("total commission"))
+                # Scenario comparison: use registry columns when present so table shows actual vs when-fixed and variance
+                if intent_key_merge == "analysis.scenario_comparison":
+                    pnl = _num(fr.get("pnl_actual") or pnl)
+                    tce = _num(fr.get("tce_actual") or tce)
+
+                ops_for_vid = ops_by_vid.get(vid, [])
+
+                # Fallback extraction (ops → merged fields) when Mongo enrichment isn't present.
+                # This is critical for composite intents that skip Mongo (e.g. analysis.cargo_profitability)
+                # and for cases where Mongo remarks/fixtures are empty.
+                cargo_grades = cargo_by.get(str(vid), [])
+                key_ports = ports_by.get(str(vid), [])
+                remark_val = remarks.get(str(vid)) if isinstance(remarks, dict) else None
+
+                if not cargo_grades and isinstance(ops_for_vid, list):
+                    gs: list[str] = []
+                    for orow in ops_for_vid:
+                        if not isinstance(orow, dict):
+                            continue
+                        g = orow.get("grades_json")
+                        if isinstance(g, list):
+                            for x in g:
+                                if x is None:
+                                    continue
+                                s = str(x).strip()
+                                if s:
+                                    gs.append(s)
+                    # de-dupe preserve order
+                    seen_g = set()
+                    cargo_grades = [x for x in gs if not (x in seen_g or seen_g.add(x))]
+
+                if not key_ports and isinstance(ops_for_vid, list):
+                    ps: list[dict] = []
+                    for orow in ops_for_vid:
+                        if not isinstance(orow, dict):
+                            continue
+                        p = orow.get("ports_json")
+                        if isinstance(p, list):
+                            for x in p:
+                                if isinstance(x, dict):
+                                    pn = x.get("portName") or x.get("port_name") or x.get("name")
+                                    at = x.get("activityType") or x.get("activity_type")
+                                    if pn:
+                                        ps.append({"portName": str(pn).strip(), "activityType": at})
+                                elif x is not None:
+                                    s = str(x).strip()
+                                    if s:
+                                        ps.append({"portName": s, "activityType": None})
+                    # de-dupe by (portName, activityType)
+                    seen_p = set()
+                    key_ports = []
+                    for p in ps:
+                        key = (p.get("portName"), p.get("activityType"))
+                        if key in seen_p:
+                            continue
+                        seen_p.add(key)
+                        key_ports.append(p)
+
+                if remark_val in (None, "", [], {}) and isinstance(ops_for_vid, list):
+                    rs: list[str] = []
+                    for orow in ops_for_vid:
+                        if not isinstance(orow, dict):
+                            continue
+                        rj = orow.get("remarks_json")
+                        if isinstance(rj, list):
+                            for x in rj:
+                                if x is None:
+                                    continue
+                                s = str(x).strip()
+                                if s:
+                                    rs.append(s)
+                    # keep small; sanitize later anyway
+                    if rs:
+                        # de-dupe preserve order
+                        seen_r = set()
+                        remark_val = [x for x in rs if not (x in seen_r or seen_r.add(x))]
+
+                row = {
+                    "voyage_id": vid,
+                    "voyage_number": voyage_number_by.get(str(vid)) or fr.get("voyage_number"),
+                    "pnl": pnl,
+                    "revenue": revenue,
+                    "total_expense": total_expense,
+                    "tce": tce,
+                    "total_commission": total_commission,
+                    "finance": fr,
+                    "ops": ops_for_vid,
+                    "cargo_grades": cargo_grades,
+                    "key_ports": key_ports,
+                    "remarks": remark_val,
+                    "commissions": commissions_by.get(str(vid), []),
+                }
+                if intent_key_merge == "analysis.scenario_comparison":
+                    row["pnl_actual"] = _num(fr.get("pnl_actual"))
+                    row["pnl_when_fixed"] = _num(fr.get("pnl_when_fixed"))
+                    row["pnl_variance"] = _num(fr.get("pnl_variance"))
+                    row["tce_actual"] = _num(fr.get("tce_actual"))
+                    row["tce_when_fixed"] = _num(fr.get("tce_when_fixed"))
+                    row["tce_variance"] = _num(fr.get("tce_variance"))
+                # Offhire ranking: expose offhire_days and delay_reason at top level so table can show them
+                if fr.get("offhire_days") is not None or intent_key_merge == "ops.offhire_ranking":
+                    row["offhire_days"] = _num(fr.get("offhire_days"))
+                    row["delay_reason"] = fr.get("delay_reason")
+                # Port calls: expose count when key_ports is a list so "most port calls" table can show it
+                if isinstance(key_ports, list):
+                    row["port_calls"] = len(key_ports)
+                merged_rows.append(row)
+
+            artifacts["merged_rows"] = merged_rows
+
+            # Data coverage hints to prevent false "Not available" claims in summarization.
+            try:
+                cov = artifacts.get("coverage") if isinstance(artifacts.get("coverage"), dict) else {}
+                if not isinstance(cov, dict):
+                    cov = {}
+                cov["merged_rows_total"] = len(merged_rows)
+                cov["pnl_available"] = sum(1 for r in merged_rows if isinstance(r, dict) and r.get("pnl") not in (None, ""))
+                cov["cargo_grades_available"] = sum(1 for r in merged_rows if isinstance(r, dict) and r.get("cargo_grades"))
+                cov["key_ports_available"] = sum(1 for r in merged_rows if isinstance(r, dict) and r.get("key_ports"))
+                cov["remarks_available"] = sum(1 for r in merged_rows if isinstance(r, dict) and r.get("remarks") not in (None, "", [], {}))
+                artifacts["coverage"] = cov
+            except Exception:
+                pass
+
+            _dprint(f"   ✅ Merged {len(merged_rows)} unique rows")
+            self._trace(
+                state,
+                {
+                    "phase": "composite_step_result",
+                    "step_index": idx + 1,
+                    "agent": agent,
+                    "operation": op,
+                    "ok": True,
+                    "merged_rows": len(merged_rows),
+                    "summary": f"Merge: joined finance + ops + mongo context into {len(merged_rows)} merged rows.",
+                },
+            )
+
+        # =========================================================
+        # FINAL STATE UPDATE
+        # =========================================================
+        artifacts["slots"] = slots
+        state["artifacts"] = artifacts
+        state["slots"] = slots
+        state["step_index"] = idx + 1
+
+        return state
+
+    # =========================================================
+    # Merge
+    # =========================================================
+
+    def n_merge(self, state: GraphState) -> GraphState:
+        """Merge results with improved null safety."""
+        # Initialize data if missing
+        if "data" not in state or state["data"] is None:
+            state["data"] = {
+                "finance": {"mode": None, "rows": []},
+                "ops": {"mode": None, "rows": []},
+                "mongo": {},
+                "artifacts": {}
+            }
+        
+        data = state["data"]
+        
+        # Ensure all sections exist
+        if "finance" not in data or data["finance"] is None:
+            data["finance"] = state.get("finance") or {"mode": None, "rows": []}
+        elif state.get("finance"):
+            data["finance"] = state["finance"]
+            
+        if "ops" not in data or data["ops"] is None:
+            data["ops"] = state.get("ops") or {"mode": None, "rows": []}
+        elif state.get("ops"):
+            data["ops"] = state["ops"]
+            
+        if "mongo" not in data or data["mongo"] is None:
+            data["mongo"] = state.get("mongo") or {}
+        elif state.get("mongo"):
+            data["mongo"] = state["mongo"]
+            
+        if "artifacts" not in data or data["artifacts"] is None:
+            data["artifacts"] = state.get("artifacts") or {}
+        elif state.get("artifacts"):
+            data["artifacts"] = state["artifacts"]
+
+        # Check for dynamic SQL usage
+        dynamic_agents = []
+        
+        finance_data = data.get("finance")
+        if isinstance(finance_data, dict) and finance_data.get("mode") == "dynamic_sql":
+            dynamic_agents.append("finance")
+
+        ops_data = data.get("ops")
+        if isinstance(ops_data, dict) and ops_data.get("mode") == "dynamic_sql":
+            dynamic_agents.append("ops")
+
+        # Build merged structure
+        state["merged"] = {
+            "mongo": data.get("mongo"),
+            "finance": data.get("finance"),
+            "ops": data.get("ops"),
+            "artifacts": data.get("artifacts"),
+            "plan": state.get("plan"),
+            "dynamic_sql_used": bool(dynamic_agents),
+            "dynamic_sql_agents": dynamic_agents,
+        }
+        
+        # Also update data reference
+        state["data"] = data
+
+        return state
+
+    # =========================================================
+    # Summarize with Token Optimization
+    # =========================================================
+
+    def n_summarize(self, state: GraphState) -> GraphState:
+        """
+        Generate final response with DATA SANITIZATION and TOKEN TRACKING.
+        
+        ✅ NEW: Sanitizes data before sending to LLM to prevent rate limits
+        ✅ NEW: Tracks token usage for debugging
+        """
+        intent_key = state.get("intent_key", "out_of_scope")
+        merged_full = state.get("merged") or {}
+        # For ranking.*, ensure merged_rows have explicit pnl/revenue/total_expense at top level (avoid summarizer saying "not available")
+        if str(intent_key).startswith("ranking."):
+            artifacts = merged_full.get("artifacts")
+            if isinstance(artifacts, dict) and isinstance(artifacts.get("merged_rows"), list):
+                # Build lookup from raw finance rows by voyage_id (in case merge step used different key casing)
+                finance_rows = (merged_full.get("finance") or {}).get("rows") or []
+                fin_by_vid = {}
+                for r in finance_rows:
+                    if isinstance(r, dict) and r.get("voyage_id"):
+                        fin_by_vid[str(r["voyage_id"])] = r
+                for mr in artifacts["merged_rows"]:
+                    if not isinstance(mr, dict):
+                        continue
+                    vid = mr.get("voyage_id")
+                    fin = mr.get("finance") if isinstance(mr.get("finance"), dict) else {}
+                    if not fin and vid is not None:
+                        fin = fin_by_vid.get(str(vid)) or {}
+                    if mr.get("pnl") is None and fin:
+                        mr["pnl"] = fin.get("pnl") or fin.get("PnL")
+                    if mr.get("revenue") is None and fin:
+                        mr["revenue"] = fin.get("revenue") or fin.get("Revenue")
+                    if mr.get("total_expense") is None and fin:
+                        mr["total_expense"] = fin.get("total_expense") or fin.get("Total_expense") or fin.get("total expense")
+        merged = compact_payload(merged_full)
+        
+        # Ensure merged has all required keys
+        if not isinstance(merged.get("finance"), dict):
+            merged["finance"] = {"mode": None, "rows": []}
+        if not isinstance(merged.get("ops"), dict):
+            merged["ops"] = {"mode": None, "rows": []}
+        if not isinstance(merged.get("artifacts"), dict):
+            merged["artifacts"] = {}
+        
+        # Track token usage before sanitization
+        original_tokens = self._estimate_tokens(merged)
+        self._trace(
+            state,
+            {
+                "phase": "token_usage",
+                "stage": "pre_sanitize",
+                "total_tokens_est": original_tokens,
+                "mongo_tokens_est": self._estimate_tokens(merged.get("mongo", {})),
+                "finance_tokens_est": self._estimate_tokens(merged.get("finance", {})),
+                "ops_tokens_est": self._estimate_tokens(merged.get("ops", {})),
+                "artifacts_tokens_est": self._estimate_tokens(merged.get("artifacts", {})),
+            },
+        )
+        if original_tokens > 1000:
+            _dprint(f"\n📊 TOKEN USAGE ANALYSIS:")
+            _dprint(f"   Original merged data: ~{original_tokens:,} tokens")
+            
+            # Break down by component
+            mongo_tokens = self._estimate_tokens(merged.get("mongo", {}))
+            finance_tokens = self._estimate_tokens(merged.get("finance", {}))
+            ops_tokens = self._estimate_tokens(merged.get("ops", {}))
+            artifacts_tokens = self._estimate_tokens(merged.get("artifacts", {}))
+            
+            _dprint(f"   ├─ Mongo: ~{mongo_tokens:,} tokens")
+            _dprint(f"   ├─ Finance: ~{finance_tokens:,} tokens")
+            _dprint(f"   ├─ Ops: ~{ops_tokens:,} tokens")
+            _dprint(f"   └─ Artifacts: ~{artifacts_tokens:,} tokens")
+        
+        # Sanitize data to reduce token usage (after compaction)
+        sanitized_merged = self._sanitize_for_llm(merged)
+        
+        # Show token savings
+        sanitized_tokens = self._estimate_tokens(sanitized_merged)
+        self._trace(
+            state,
+            {
+                "phase": "token_usage",
+                "stage": "post_sanitize",
+                "total_tokens_est": sanitized_tokens,
+                "saved_tokens_est": original_tokens - sanitized_tokens,
+                "saved_pct_est": (100 * (original_tokens - sanitized_tokens) / max(original_tokens, 1)),
+            },
+        )
+        if original_tokens > 1000:
+            savings = original_tokens - sanitized_tokens
+            savings_pct = 100 * savings / max(original_tokens, 1)
+            _dprint(f"\n   After sanitization: ~{sanitized_tokens:,} tokens")
+            _dprint(f"   💾 SAVED: ~{savings:,} tokens ({savings_pct:.1f}% reduction)")
+            
+            if sanitized_tokens < 5000:
+                _dprint(f"   ✅ Token usage is now within safe limits!")
+            elif sanitized_tokens < 10000:
+                _dprint(f"   ⚠️  Token usage is moderate - should be OK")
+            else:
+                _dprint(f"   🔴 Token usage is still high - may hit rate limits")
+        
+        # Check if we have any data
+        finance_data = sanitized_merged.get("finance", {})
+        ops_data = sanitized_merged.get("ops", {})
+        artifacts = sanitized_merged.get("artifacts", {})
+        
+        finance_rows = finance_data.get("rows", []) if isinstance(finance_data, dict) else []
+        ops_rows = ops_data.get("rows", []) if isinstance(ops_data, dict) else []
+        merged_rows = artifacts.get("merged_rows", []) if isinstance(artifacts, dict) else []
+        
+        has_data = bool(finance_rows or ops_rows or sanitized_merged.get("mongo") or merged_rows)
+        
+        try:
+            # Try to generate proper response with SANITIZED data
+            answer = self.llm.summarize_answer(
+                question=state["user_input"],
+                plan=state.get("plan") or {"plan_type": "single", "intent_key": intent_key},
+                merged=sanitized_merged,
+            )
+            
+            # Validate answer quality
+            if not answer or len(answer) < 20 or answer.startswith("Intent="):
+                raise ValueError("Generated answer is too short or malformed")
+                
+        except Exception as e:
+            # Improved fallback with data context
+            error_trace = traceback.format_exc()
+            _dprint(f"⚠️ WARNING: summarize_answer failed: {e}")
+            _dprint(f"Error trace: {error_trace}")
+            
+            if has_data:
+                answer = (
+                    f"I found {len(finance_rows)} finance records and {len(ops_rows)} ops records "
+                    f"for your query, but encountered an error generating the summary. "
+                    f"Intent: {intent_key}. Error: {str(e)}"
+                )
+            else:
+                answer = (
+                    f"No data available for this query (Intent: {intent_key}). "
+                    f"This could mean the requested information doesn't exist in the database."
+                )
+
+        state["answer"] = answer
+
+        # Persist a compact result-set memory for multi-row answers (for "among these" follow-ups).
+        try:
+            from datetime import date, datetime
+            from decimal import Decimal
+
+            def _json_primitive(v: Any) -> Any:
+                if v is None:
+                    return None
+                if isinstance(v, (str, int, float, bool)):
+                    return v
+                if isinstance(v, Decimal):
+                    try:
+                        return float(v)
+                    except Exception:
+                        return str(v)
+                if isinstance(v, (datetime, date)):
+                    try:
+                        return v.isoformat()
+                    except Exception:
+                        return str(v)
+                # Lists/dicts: keep small + stringify safely
+                if isinstance(v, list):
+                    return [_json_primitive(x) for x in v[:8]]
+                if isinstance(v, dict):
+                    out: Dict[str, Any] = {}
+                    for k, vv in list(v.items())[:25]:
+                        out[str(k)] = _json_primitive(vv)
+                    return out
+                return str(v)
+
+            def _compact_remarks(val: Any, *, max_len: int = 600) -> str | None:
+                if val in (None, "", [], {}):
+                    return None
+                try:
+                    if isinstance(val, str):
+                        s = val.strip()
+                    elif isinstance(val, list):
+                        parts = []
+                        for x in val[:4]:
+                            if x in (None, "", [], {}):
+                                continue
+                            parts.append(str(x).strip())
+                        s = " | ".join([p for p in parts if p])
+                    else:
+                        s = str(val).strip()
+                    if not s:
+                        return None
+                    if len(s) > max_len:
+                        return s[:max_len].rstrip() + "…"
+                    return s
+                except Exception:
+                    return None
+
+            sess = state.get("session_ctx") or {}
+            art = state.get("artifacts") or {}
+            mrs = art.get("merged_rows") if isinstance(art, dict) else None
+            if isinstance(mrs, list) and mrs:
+                compact_rows = []
+                for r in mrs[:20]:
+                    if not isinstance(r, dict):
+                        continue
+                    fr = r.get("finance") if isinstance(r.get("finance"), dict) else {}
+                    compact_rows.append({
+                        "voyage_id": _json_primitive(r.get("voyage_id")),
+                        "voyage_number": _json_primitive(r.get("voyage_number") or fr.get("voyage_number")),
+                        "pnl": _json_primitive(fr.get("pnl")),
+                        "revenue": _json_primitive(fr.get("revenue")),
+                        "total_expense": _json_primitive(fr.get("total_expense")),
+                        "tce": _json_primitive(fr.get("tce")),
+                        "total_commission": _json_primitive(fr.get("total_commission")),
+                        "remarks": _compact_remarks(r.get("remarks")),
+                    })
+                self.redis.save_session(
+                    state["session_id"],
+                    {
+                        **(sess or {}),
+                        "last_result_set": {
+                            "source_intent": state.get("intent_key"),
+                            "rows": compact_rows,
+                        },
+                    },
+                )
+            else:
+                # Fallback: if we don't have merged_rows (some single intents), store from finance rows.
+                merged = state.get("merged") or {}
+                fin = merged.get("finance") if isinstance(merged, dict) else None
+                fin_rows = (fin or {}).get("rows") if isinstance(fin, dict) else None
+                if isinstance(fin_rows, list) and len(fin_rows) >= 2:
+                    compact_rows = []
+                    for r in fin_rows[:20]:
+                        if not isinstance(r, dict):
+                            continue
+                        compact_rows.append({
+                            "voyage_id": _json_primitive(r.get("voyage_id")),
+                            "voyage_number": _json_primitive(r.get("voyage_number")),
+                            "pnl": _json_primitive(r.get("pnl")),
+                            "revenue": _json_primitive(r.get("revenue")),
+                            "total_expense": _json_primitive(r.get("total_expense")),
+                            "tce": _json_primitive(r.get("tce")),
+                            "total_commission": _json_primitive(r.get("total_commission")),
+                            "remarks": None,
+                        })
+                    self.redis.save_session(
+                        state["session_id"],
+                        {
+                            **(sess or {}),
+                            "last_result_set": {
+                                "source_intent": state.get("intent_key"),
+                                "rows": compact_rows,
+                            },
+                        },
+                    )
+        except Exception:
+            pass
+
+        # Save to session
+        sess = state.get("session_ctx") or {}
+        persisted_slots = self._build_persisted_slots(base=(sess.get("slots") or {}), updates=(state.get("slots") or {}))
+        last_voyage_ids = None
+        try:
+            art = state.get("artifacts") or {}
+            vids = art.get("voyage_ids") if isinstance(art, dict) else None
+            if isinstance(vids, list) and vids:
+                # de-dupe + cap
+                last_voyage_ids = list(dict.fromkeys([str(v) for v in vids if v]))[:20]
+        except Exception:
+            last_voyage_ids = None
+        self.redis.save_session(
+            state["session_id"],
+            {
+                **sess,
+                "last_intent": intent_key,
+                "memory_slots": self._extract_memory_slots(persisted_slots),
+                "param_slots": self._extract_param_slots(persisted_slots),
+                "slots": persisted_slots,
+                "last_user_input": state.get("user_input"),
+                "last_voyage_ids": last_voyage_ids,
+                "last_plan_type": state.get("plan_type") or (state.get("plan") or {}).get("plan_type"),
+            },
+        )
+
+        return state
+
+    # =========================================================
+    # Smart slot merging
+    # =========================================================
+
+    @staticmethod
+    def _merge_slots(intent_key: str, session_ctx: Dict[str, Any], current_slots: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Merge session and current slots based on intent. Use current slots only for independent queries.
+        """
+        independent_prefixes = ("ranking.", "analysis.", "ops.", "comparison.", "aggregation.", "temporal.")
+        independent_intents = {
+            # Entity queries (user specified exact entity)
+            "voyage.summary", "voyage.entity",
+            "vessel.summary", "vessel.entity",
+            "cargo.details", "port.details",
+            # Composite + fallback
+            "composite.query",
+            "out_of_scope",
+        }
+
+        # Independent intents should NEVER inherit/merge prior entity anchors.
+        if intent_key in independent_intents or (intent_key or "").startswith(independent_prefixes):
+            return dict(current_slots or {})
+        
+        # For follow-up questions only
+        # Only merge if current_slots is completely empty
+        if not current_slots or len(current_slots) == 0:
+            # True follow-up question like "What about the expenses?"
+            session_slots = {}
+            if isinstance(session_ctx, dict):
+                session_slots = session_ctx.get("memory_slots") or session_ctx.get("slots") or {}
+            return dict(session_slots or {})
+        
+        # Default: use only current slots (don't pollute!)
+        return dict(current_slots)
+
+    # =========================================================
+    # Session memory helpers (entity + user params)
+    # =========================================================
+
+    @staticmethod
+    def _extract_memory_slots(slots: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist only stable entity/scenario slots (never derived lists like voyage_ids)."""
+        if not isinstance(slots, dict):
+            return {}
+        keep = ("voyage_number", "voyage_numbers", "voyage_id", "vessel_name", "imo", "scenario", "port_name")
+        out = {k: slots.get(k) for k in keep if slots.get(k) not in (None, "", [], {})}
+        return out
+
+    @staticmethod
+    def _extract_param_slots(slots: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist only preference-like parameters (limit/date range/metrics)."""
+        if not isinstance(slots, dict):
+            return {}
+        keep = ("limit", "date_from", "date_to", "metric", "group_by", "threshold", "cargo_type", "cargo_grade")
+        out = {k: slots.get(k) for k in keep if slots.get(k) not in (None, "", [], {})}
+        return out
+
+    @staticmethod
+    def _build_persisted_slots(*, base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Merge slots for persistence, then drop unsafe/derived keys.
+        """
+        merged: Dict[str, Any] = {}
+        if isinstance(base, dict):
+            merged.update(base)
+        if isinstance(updates, dict):
+            merged.update(updates)
+
+        # Never persist these derived/ephemeral keys (causes slot pollution).
+        drop = {"voyage_ids", "finance_rows", "ops_rows", "merged_rows", "include_voyage_ids"}
+        for k in list(merged.keys()):
+            if k in drop:
+                merged.pop(k, None)
+
+        # Anchor exclusivity: keep only ONE active anchor family at a time unless user explicitly provided both.
+        # If updates establish a vessel anchor, drop voyage anchor from the old base.
+        if (updates.get("vessel_name") or updates.get("imo")) and not (updates.get("voyage_number") or updates.get("voyage_id") or updates.get("voyage_numbers")):
+            merged.pop("voyage_number", None)
+            merged.pop("voyage_numbers", None)
+            merged.pop("voyage_id", None)
+
+        # If updates establish a voyage anchor, drop vessel anchor from the old base.
+        if (updates.get("voyage_number") or updates.get("voyage_id") or updates.get("voyage_numbers")) and not (updates.get("vessel_name") or updates.get("imo")):
+            merged.pop("vessel_name", None)
+            merged.pop("imo", None)
+
+        # If updates establish a port anchor (port queries), drop both voyage/vessel anchors unless explicitly present in updates.
+        if updates.get("port_name") and not (
+            updates.get("voyage_number")
+            or updates.get("voyage_id")
+            or updates.get("voyage_numbers")
+            or updates.get("vessel_name")
+            or updates.get("imo")
+        ):
+            merged.pop("voyage_number", None)
+            merged.pop("voyage_numbers", None)
+            merged.pop("voyage_id", None)
+            merged.pop("vessel_name", None)
+            merged.pop("imo", None)
+
+        # Drop None/empty values
+        cleaned: Dict[str, Any] = {}
+        for k, v in merged.items():
+            if v in (None, "", [], {}):
+                continue
+            cleaned[k] = v
+        return cleaned
+
+    # =========================================================
+    # Token optimization helpers
+    # =========================================================
+
+    @staticmethod
+    def _estimate_tokens(obj: Any) -> int:
+        """
+        Rough token estimation for debugging.
+        Rule of thumb: 1 token ≈ 4 characters
+        
+        Args:
+            obj: Any object to estimate tokens for
+        
+        Returns:
+            Estimated token count
+        """
+        return len(str(obj)) // 4
+
+    @staticmethod
+    def _sanitize_for_llm(merged: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Reduce data size before sending to the LLM.
+        The runtime merged payload can contain large nested arrays (mongo.rows fixtures, ops ports_json/grades_json/remarks_json,
+        and artifacts.merged_rows which embeds finance+ops+remarks). This function caps/truncates those while preserving the
+        fields needed for summarization.
+        
+        Args:
+            merged: Full merged data from all agents
+        
+        Returns:
+            Sanitized merged data with reduced size
+        """
+        import copy
+        
+        sanitized = copy.deepcopy(merged)
+
+        def _cap_list(v: Any, n: int) -> Any:
+            return v[:n] if isinstance(v, list) else v
+
+        def _cap_str(v: Any, n: int) -> Any:
+            if isinstance(v, str) and len(v) > n:
+                return v[:n] + "...[truncated]"
+            return v
+
+        def _compact_dict(d: Any, *, allow_keys: set[str], max_str: int = 300) -> Any:
+            if not isinstance(d, dict):
+                return d
+            out: Dict[str, Any] = {}
+            for k in allow_keys:
+                if k in d:
+                    out[k] = _cap_str(d.get(k), max_str)
+            return out
+
+        def _sanitize_remarks(rem: Any) -> Any:
+            if isinstance(rem, list):
+                rem = rem[:5]
+                cleaned = []
+                for x in rem:
+                    if isinstance(x, dict):
+                        cleaned.append(
+                            {
+                                "remark": _cap_str(x.get("remark"), 300),
+                                "modifiedDate": x.get("modifiedDate"),
+                                "modifiedByFull": x.get("modifiedByFull"),
+                            }
+                        )
+                    else:
+                        cleaned.append(_cap_str(str(x), 300))
+                return cleaned
+            if isinstance(rem, str):
+                return _cap_str(rem, 300)
+            return rem
+        
+        # === Sanitize Mongo rows (LLM find payloads) ===
+        if isinstance(sanitized.get("mongo"), dict):
+            mongo = sanitized["mongo"]
+
+            # Cap $in filters to avoid huge debug payloads.
+            filt = mongo.get("filter")
+            if isinstance(filt, dict):
+                try:
+                    # common pattern: {"voyageId": {"$in": [..]}}
+                    for k, v in list(filt.items()):
+                        if isinstance(v, dict) and isinstance(v.get("$in"), list) and len(v["$in"]) > 30:
+                            v["$in"] = v["$in"][:30]
+                            v["_truncated"] = True
+                except Exception:
+                    pass
+
+            rows = mongo.get("rows")
+            if isinstance(rows, list) and rows:
+                cleaned_rows: list[dict] = []
+                for r in rows[:50]:
+                    if not isinstance(r, dict):
+                        continue
+
+                    # Keep only the bits we actually summarize against for voyages.
+                    keep_top = {"voyageId", "voyageNumber", "remarks", "fixtures", "vesselName", "imo"}
+                    rr: Dict[str, Any] = {k: r.get(k) for k in keep_top if k in r}
+
+                    rr["remarks"] = _sanitize_remarks(rr.get("remarks"))
+
+                    fixtures = rr.get("fixtures")
+                    if isinstance(fixtures, list):
+                        fx_clean: list[dict] = []
+                        for fx in fixtures[:3]:
+                            if not isinstance(fx, dict):
+                                continue
+                            fx_clean.append(
+                                {
+                                    "grades": _cap_list(fx.get("grades"), 10),
+                                    "fixtureGrades": _cap_list(
+                                        [
+                                            _compact_dict(g, allow_keys={"gradeName"}, max_str=80)
+                                            for g in (fx.get("fixtureGrades") or [])
+                                            if isinstance(g, dict)
+                                        ],
+                                        10,
+                                    ),
+                                    "fixturePorts": _cap_list(
+                                        [
+                                            _compact_dict(p, allow_keys={"portName", "activityType"}, max_str=80)
+                                            for p in (fx.get("fixturePorts") or [])
+                                            if isinstance(p, dict)
+                                        ],
+                                        12,
+                                    ),
+                                    "fixtureCommissions": _cap_list(
+                                        [
+                                            _compact_dict(
+                                                c,
+                                                allow_keys={"commissionType", "organizationName", "rate"},
+                                                max_str=120,
+                                            )
+                                            for c in (fx.get("fixtureCommissions") or [])
+                                            if isinstance(c, dict)
+                                        ],
+                                        10,
+                                    ),
+                                }
+                            )
+                        rr["fixtures"] = fx_clean
+
+                    cleaned_rows.append(rr)
+
+                mongo["rows"] = cleaned_rows
+        
+        # === Sanitize Finance Rows (limit to 50) ===
+        if isinstance(sanitized.get("finance"), dict):
+            rows = sanitized["finance"].get("rows", [])
+            if isinstance(rows, list) and len(rows) > 50:
+                original_count = len(rows)
+                sanitized["finance"]["rows"] = rows[:50]
+                sanitized["finance"]["_truncated"] = True
+                sanitized["finance"]["_total_rows"] = original_count
+                _dprint(f"   🔧 Truncated finance rows: {original_count} → 50")
+        
+        # === Sanitize Ops Rows (cap + shrink json arrays) ===
+        if isinstance(sanitized.get("ops"), dict):
+            rows = sanitized["ops"].get("rows", [])
+            if isinstance(rows, list) and len(rows) > 50:
+                original_count = len(rows)
+                sanitized["ops"]["rows"] = rows[:50]
+                sanitized["ops"]["_truncated"] = True
+                sanitized["ops"]["_total_rows"] = original_count
+                _dprint(f"   🔧 Truncated ops rows: {original_count} → 50")
+
+            rows2 = sanitized["ops"].get("rows", [])
+            if isinstance(rows2, list):
+                for r in rows2:
+                    if not isinstance(r, dict):
+                        continue
+                    # These JSON arrays are the biggest token drivers in ops.
+                    r["ports_json"] = _cap_list(r.get("ports_json"), 12)
+                    r["grades_json"] = _cap_list(r.get("grades_json"), 12)
+                    r["remarks_json"] = _cap_list(r.get("remarks_json"), 5)
+                    if isinstance(r.get("remarks_json"), list):
+                        r["remarks_json"] = [_cap_str(str(x), 200) for x in (r.get("remarks_json") or [])[:5]]
+        
+        # === Sanitize Artifacts ===
+        if isinstance(sanitized.get("artifacts"), dict):
+            artifacts = sanitized["artifacts"]
+            
+            # Truncate merged_rows
+            if "merged_rows" in artifacts and isinstance(artifacts["merged_rows"], list):
+                if len(artifacts["merged_rows"]) > 50:
+                    original_count = len(artifacts["merged_rows"])
+                    artifacts["merged_rows"] = artifacts["merged_rows"][:50]
+                    artifacts["_merged_rows_truncated"] = True
+                    artifacts["_merged_rows_total"] = original_count
+                    _dprint(f"   🔧 Truncated merged_rows: {original_count} → 50")
+
+                # Shrink per-row nested fields (remarks + embedded ops json arrays).
+                for mr in artifacts["merged_rows"]:
+                    if not isinstance(mr, dict):
+                        continue
+
+                    mr["cargo_grades"] = _cap_list(mr.get("cargo_grades"), 8)
+                    mr["key_ports"] = _cap_list(mr.get("key_ports"), 8)
+                    if isinstance(mr.get("key_ports"), list):
+                        mr["key_ports"] = [
+                            _compact_dict(p, allow_keys={"portName", "activityType"}, max_str=80)
+                            for p in (mr.get("key_ports") or [])
+                            if isinstance(p, dict)
+                        ][:8]
+
+                    mr["commissions"] = _cap_list(mr.get("commissions"), 10)
+                    if isinstance(mr.get("commissions"), list):
+                        mr["commissions"] = [
+                            _compact_dict(c, allow_keys={"commissionType", "organizationName", "rate"}, max_str=120)
+                            for c in (mr.get("commissions") or [])
+                            if isinstance(c, dict)
+                        ][:10]
+
+                    mr["remarks"] = _sanitize_remarks(mr.get("remarks"))
+
+                    # Embedded ops rows can include huge json arrays; cap and shorten.
+                    ops_emb = mr.get("ops")
+                    if isinstance(ops_emb, list):
+                        ops_clean = []
+                        for r in ops_emb[:2]:
+                            if not isinstance(r, dict):
+                                continue
+                            rc = dict(r)
+                            rc["ports_json"] = _cap_list(rc.get("ports_json"), 10)
+                            rc["grades_json"] = _cap_list(rc.get("grades_json"), 10)
+                            rc["remarks_json"] = _cap_list(rc.get("remarks_json"), 3)
+                            if isinstance(rc.get("remarks_json"), list):
+                                rc["remarks_json"] = [_cap_str(str(x), 200) for x in (rc.get("remarks_json") or [])[:3]]
+                            ops_clean.append(rc)
+                        mr["ops"] = ops_clean
+            
+            # Truncate individual remarks in remarks_by_voyage_id
+            if "remarks_by_voyage_id" in artifacts:
+                remarks_dict = artifacts["remarks_by_voyage_id"]
+                for vid, remark in list(remarks_dict.items()):
+                    if remark:
+                        remark_str = str(remark)
+                        if len(remark_str) > 1000:
+                            remarks_dict[vid] = remark_str[:1000] + "...[truncated]"
+            
+            # Remove or truncate other large intermediate data
+            for key in ["finance_rows", "ops_rows"]:
+                if key in artifacts:
+                    rows = artifacts[key]
+                    if isinstance(rows, list) and len(rows) > 50:
+                        artifacts[key] = rows[:50]
+
+            # Lightweight coverage hints for the LLM (helps avoid "Not available" when some rows have data).
+            try:
+                mrs = artifacts.get("merged_rows")
+                if isinstance(mrs, list) and mrs:
+                    cg = sum(1 for x in mrs if isinstance(x, dict) and (x.get("cargo_grades") or []))
+                    kp = sum(1 for x in mrs if isinstance(x, dict) and (x.get("key_ports") or []))
+                    rm = sum(1 for x in mrs if isinstance(x, dict) and (x.get("remarks") not in (None, "", [], {})))
+                    artifacts["coverage"] = {
+                        "merged_rows": len(mrs),
+                        "cargo_grades_available": cg,
+                        "key_ports_available": kp,
+                        "remarks_available": rm,
+                    }
+            except Exception:
+                pass
+        
+        return sanitized
+
+    # =========================================================
+    # Routing
+    # =========================================================
+
+    def r_after_validate(self, state: GraphState) -> str:
+        """After validation: clarify, plan, or skip to summarize. Uses resolved intent so aliases (e.g. ops.delayed_voyages) route to plan."""
+        resolved = resolve_intent(state.get("intent_key") or "out_of_scope")
+        if resolved not in INTENT_REGISTRY:
+            return "summarize"
+        if state.get("missing_keys"):
+            return "clarify"
+        return "plan"
+
+    def r_plan_path(self, state: GraphState) -> str:
+        """Route based on plan type: single or composite"""
+        pt = (state.get("plan_type") or "single").lower()
+        return "composite" if pt == "composite" else "single"
+
+    def r_has_more_steps(self, state: GraphState) -> str:
+        """Check if composite plan has more steps to execute"""
+        plan = state.get("plan") or {}
+        steps = plan.get("steps") or []
+        idx = int(state.get("step_index") or 0)
+        return "more" if idx < len(steps) else "done"
+
+    def r_after_run_single(self, state: GraphState) -> str:
+        """Route to end if answer already generated (e.g. voyage.summary), else merge"""
+        # If the single path created a clarification, end immediately (do NOT summarize/overwrite).
+        if state.get("clarification"):
+            return "done"
+        if state.get("answer"):
+            return "done"
+        return "merge"
+
+    # =========================================================
+    # Graph Builder
+    # =========================================================
+
+    def _build_graph(self):
+        """Build the execution graph"""
+        g = StateGraph(GraphState)
+
+        # Define all nodes
+        g.add_node("load_session", self.n_load_session)
+        g.add_node("extract", self.n_extract_intent)
+        g.add_node("validate", self.n_validate_slots)
+        g.add_node("clarify", self.n_make_clarification)
+        # NOTE: langgraph disallows node names that collide with state keys ("plan" is a state channel).
+        g.add_node("build_plan", self.n_plan)
+        g.add_node("run_single", self.n_run_single)
+        g.add_node("execute_step", self.n_execute_step)
+        g.add_node("merge", self.n_merge)
+        g.add_node("summarize", self.n_summarize)
+
+        # Set entry point
+        g.set_entry_point("load_session")
+        
+        # Build graph flow
+        g.add_edge("load_session", "extract")
+        g.add_edge("extract", "validate")
+        
+        # After validation
+        g.add_conditional_edges(
+            "validate",
+            self.r_after_validate,
+            {
+                "clarify": "clarify",
+                "plan": "build_plan",
+                "summarize": "summarize",
+            },
+        )
+        
+        g.add_edge("clarify", END)
+        
+        # After planning
+        g.add_conditional_edges(
+            "build_plan",
+            self.r_plan_path,
+            {
+                "single": "run_single",
+                "composite": "execute_step",
+            },
+        )
+        
+        # Composite execution loop
+        g.add_conditional_edges(
+            "execute_step",
+            self.r_has_more_steps,
+            {
+                "more": "execute_step",
+                "done": "merge",
+            },
+        )
+        
+        # Single execution
+        g.add_conditional_edges(
+            "run_single",
+            self.r_after_run_single,
+            {
+                "done": END,
+                "merge": "merge",
+            }
+        )
+        
+        # Final flow
+        g.add_edge("merge", "summarize")
+        g.add_edge("summarize", END)
+
+        return g.compile()
+
+    # =========================================================
+    # Public API
+    # =========================================================
+
+    def handle(self, *, session_id: str, user_input: str) -> Dict[str, Any]:
+        """Main entry point for query handling."""
+        out: GraphState = self.graph.invoke(
+            {"session_id": session_id, "user_input": user_input, "raw_user_input": user_input}
+        )
+
+        trace = []
+        artifacts = out.get("artifacts") or {}
+        if isinstance(artifacts, dict) and isinstance(artifacts.get("trace"), list):
+            trace = artifacts.get("trace") or []
+
+        if out.get("clarification"):
+            return {
+                "intent_key": out.get("intent_key"),
+                "slots": out.get("slots") or {},
+                "clarification": out.get("clarification"),
+                "data": {},
+                "trace": trace,
+            }
+
+        merged = out.get("merged") or {}
+
+        return {
+            "intent_key": out.get("intent_key"),
+            "slots": out.get("slots") or {},
+            "answer": out.get("answer") or "",
+            "data": merged,
+            "dynamic_sql_used": merged.get("dynamic_sql_used", False),
+            "dynamic_sql_agents": merged.get("dynamic_sql_agents", []),
+            "plan": merged.get("plan"),
+            "trace": trace,
+        }

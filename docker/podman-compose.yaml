@@ -1,0 +1,47 @@
+services:
+  mongodb:
+    image: mongo:7
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - kai-net
+    restart: unless-stopped
+
+  postgresdb:
+    image: postgres:16
+    container_name: postgresdb
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: pocdb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - kai-net
+    restart: unless-stopped
+
+  redisdb:
+    image: redis:7
+    container_name: redisdb
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - kai-net
+    restart: unless-stopped
+
+networks:
+  kai-net:
+    driver: bridge
+
+volumes:
+  mongo_data:
+  postgres_data:
+  redis_data:
