@@ -7,7 +7,7 @@ from psycopg2.extras import execute_batch
 # CONFIG
 # =====================================================
 
-DSN = "postgresql://admin:admin123@localhost:5432/stena_finance_ops"
+DSN = "postgresql://admin:admin123@localhost:5432/pocdb"
 
 # =====================================================
 # HELPERS

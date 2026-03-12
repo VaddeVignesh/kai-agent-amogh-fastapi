@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 import requests
  
 API_URL = os.getenv("KAI_API_URL", "http://127.0.0.1:8000/query")
+API_TIMEOUT_SEC = int(os.getenv("KAI_API_TIMEOUT_SEC", "300"))
  
 def call_api(query: str, session_id: str) -> Dict[str, Any]:
     payload = {
@@ -21,7 +22,7 @@ def call_api(query: str, session_id: str) -> Dict[str, Any]:
         "session_id": session_id
     }
  
-    r = requests.post(API_URL, json=payload, timeout=120)
+    r = requests.post(API_URL, json=payload, timeout=API_TIMEOUT_SEC)
     r.raise_for_status()
     return r.json()
  
@@ -550,28 +551,30 @@ def _render_trace(result: Dict[str,Any]) -> None:
 
         if starts:
             for idx, s in enumerate(starts):
-                r   = results.get((s.get("step_index"),s.get("agent"),s.get("operation"))) or {}
+                r = results.get((s.get("step_index"), s.get("agent"), s.get("operation"))) or {}
                 status = "OK" if r.get("ok") is True else ("Failed" if r.get("ok") is False else "Pending")
                 step_title = f"Step {s.get('step_index')}: {s.get('agent')}.{s.get('operation')} — {status}"
-                with st.expander(step_title, expanded=False):
-                    if s.get("goal"):
-                        st.caption(s["goal"])
-                    st.markdown("**Inputs**")
-                    st.json(s.get("inputs") or {})
-                    if r:
-                        st.markdown("**Results**")
-                        if r.get("summary"):
-                            st.info(r["summary"])
-                        st.json({k:v for k,v in r.items() if k not in ("phase","summary","sql","mongo_query")})
-                    if r and isinstance(r.get("sql"), str) and r["sql"].strip():
-                        st.markdown("**Generated SQL**")
-                        st.code(r["sql"], language="sql")
-                    if r and isinstance(r.get("mongo_query"), dict) and any(v is not None for v in (r.get("mongo_query") or {}).values()):
-                        st.markdown("**MongoDB Query**")
-                        st.json(r["mongo_query"])
+                st.markdown(f"#### {step_title}")
+                if s.get("goal"):
+                    st.caption(s["goal"])
+                st.markdown("**Inputs**")
+                st.json(s.get("inputs") or {})
+                if r:
+                    st.markdown("**Results**")
+                    if r.get("summary"):
+                        st.info(r["summary"])
+                    st.json({k: v for k, v in r.items() if k not in ("phase", "summary", "sql", "mongo_query")})
+                if r and isinstance(r.get("sql"), str) and r["sql"].strip():
+                    st.markdown("**Generated SQL**")
+                    st.code(r["sql"], language="sql")
+                if r and isinstance(r.get("mongo_query"), dict) and any(v is not None for v in (r.get("mongo_query") or {}).values()):
+                    st.markdown("**MongoDB Query**")
+                    st.json(r["mongo_query"])
+                if idx < len(starts) - 1:
+                    st.markdown("---")
 
-        with st.expander("Raw JSON (Debug)", expanded=False):
-            st.json(trace)
+        st.markdown("#### Raw JSON (Debug)")
+        st.json(trace)
  
 def _run_turn(*, router: Any, user_text: str) -> None:
     user_text = (user_text or "").strip()
