@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from app.registries.intent_registry import (
+    INTENT_REGISTRY,
     SUPPORTED_INTENTS,
     resolve_intent,
 )
@@ -31,28 +32,10 @@ class ExecutionPlan:
 
 
 # =========================================================
-# Planner (HYBRID RULE + INTENT)
+# Planner (REGISTRY-DRIVEN, NO HARDCODED INTENT LISTS)
 # =========================================================
 
 class Planner:
-
-    # Core intents that are ALWAYS composite
-    HARD_COMPOSITE_INTENTS = {
-        "ranking.voyages",
-        "ranking.voyages_by_pnl",
-        "ranking.voyages_by_revenue",
-        "ranking.voyages_by_commission",
-        "ranking.vessels",
-        "ranking.cargo",
-        "ranking.ports",
-        "analysis.segment_performance",
-        "analysis.high_revenue_low_pnl",
-        "analysis.revenue_vs_pnl",
-        "analysis.profitability",
-        "comparison.voyages",
-        "comparison.vessels",
-        "comparison.scenario",
-    }
 
     def __init__(self, llm_client):
         self.llm = llm_client
@@ -68,19 +51,45 @@ class Planner:
         session_context: Optional[Dict[str, Any]] = None,
         intent_key: Optional[str] = None,
         slots: Optional[Dict[str, Any]] = None,
+        force_composite: bool = False,
     ) -> ExecutionPlan:
         """
         Deterministic planner using already extracted intent + slots.
         No second LLM call. Prevents router/planner mismatch.
+
+        force_composite=True: skip all single-path checks and go straight to
+        composite + dynamic SQL. Used by graph_router when registry SQL returns
+        zero rows with no entity anchor (fleet-wide query misclassified as single).
         """
         text_lower = text.lower()
 
-        # Use router-provided intent + slots
         intent_key = resolve_intent(intent_key or "out_of_scope")
         slots = slots or {}
 
-        # Never run composite plans for out-of-scope. Avoids accidental SQL/Mongo calls
-        # when the extractor falls back to out_of_scope for a valid-looking question.
+        # ── force_composite override ──────────────────────────────────────────
+        # When zero-row escalation fires in n_run_single with no entity anchor,
+        # remap entity-level intents to their fleet-wide equivalents so the
+        # composite path generates the right SQL (e.g. vessel.summary → ranking.vessels).
+        _ENTITY_TO_FLEET = {
+            "vessel.summary": "ranking.vessels",
+            "vessel.entity":  "ranking.vessels",
+            "voyage.summary": "ranking.voyages",
+            "voyage.entity":  "ranking.voyages",
+        }
+        _has_entity_anchor = bool(
+            slots.get("voyage_number")
+            or slots.get("voyage_numbers")
+            or slots.get("voyage_id")
+            or slots.get("vessel_name")
+            or slots.get("imo")
+        )
+        if force_composite and not _has_entity_anchor:
+            intent_key = _ENTITY_TO_FLEET.get(intent_key, intent_key)
+
+        if force_composite:
+            return self._build_composite(intent_key, text, slots, confidence=0.90)
+
+        # Never run composite plans for out-of-scope.
         if intent_key == "out_of_scope":
             return ExecutionPlan(
                 plan_type="single",
@@ -93,10 +102,9 @@ class Planner:
         # -----------------------------------------------------
         # 1️⃣ ENTITY ANCHOR (ALWAYS SINGLE)
         # -----------------------------------------------------
-        
-        # SINGLE voyage only (also recover from out_of_scope when query is clearly an entity summary)
+
+        # SINGLE voyage only
         if slots.get("voyage_numbers") and len(slots["voyage_numbers"]) == 1:
-            # Avoid forcing single for ranking/compare/include intents (e.g., "top 5 including voyage 1901")
             rankingish = any(k in text_lower for k in ("top", "rank", "compare", "vs", "versus", "variance", "including", "include"))
             if not rankingish and ("voyage" in text_lower or (intent_key or "").startswith("voyage.")):
                 return ExecutionPlan(
@@ -107,7 +115,7 @@ class Planner:
                     steps=[],
                 )
 
-        # SINGLE vessel only (only when the intent is actually a vessel summary and not a trend/ranking ask)
+        # SINGLE vessel only
         if (
             slots.get("vessel_name")
             and (intent_key or "").startswith("vessel.")
@@ -122,7 +130,7 @@ class Planner:
                 steps=[],
             )
 
-        # SINGLE port query (keep as single; router can enrich with Mongo when needed)
+        # SINGLE port query
         if intent_key in ("ops.port_query", "ops.voyages_by_port") and slots.get("port_name"):
             rankingish = any(k in text_lower for k in ("top", "rank", "compare", "vs", "versus", "variance"))
             if not rankingish:
@@ -135,28 +143,13 @@ class Planner:
                 )
 
         # -----------------------------------------------------
-        # 2️⃣ INTENT-SPECIFIC ROUTING
+        # 2️⃣ REGISTRY-DRIVEN COMPOSITE ROUTING
         # -----------------------------------------------------
-        
-        composite_targets = {
-            "ranking.voyages",
-            "ranking.voyages_by_pnl",
-            "ranking.voyages_by_revenue",
-            "ranking.voyages_by_commission",
-            "analysis.scenario_comparison",
-            "analysis.cargo_profitability",
-            "analysis.by_module_type",
-            "ops.delayed_voyages",
-            # NOTE: ops.port_query is handled as single when port_name is present
-            # "ops.port_query",
-            "analysis.segment_performance",
-            "composite.query",
-        }
-
-        if intent_key in self.HARD_COMPOSITE_INTENTS or intent_key in composite_targets:
+        intent_cfg = INTENT_REGISTRY.get(intent_key, {})
+        if intent_cfg.get("route") == "composite":
             return self._build_composite(intent_key, text, slots, confidence=0.90)
 
-        # Rule-based overrides for composite intents based on query phrasing
+        # Text-based composite overrides
         if "offhire" in text_lower and ("pnl" in text_lower or "tce" in text_lower):
             return self._build_composite(intent_key, text, slots, confidence=0.95)
 
@@ -192,23 +185,15 @@ class Planner:
         confidence: float = 0.9,
     ) -> ExecutionPlan:
 
-        # Higher default for by_module_type so we get multiple module types and PnL spread
         default_limit = 50 if intent_key == "analysis.by_module_type" else 10
         limit = slots.get("limit", default_limit)
 
         steps: List[ExecutionStep] = []
 
-        no_mongo_intents = {
-            "analysis.scenario_comparison",
-            "analysis.by_module_type",
-            "analysis.cargo_profitability",
-            "ranking.vessels",
-        }
-        use_mongo = intent_key not in no_mongo_intents
+        intent_cfg = INTENT_REGISTRY.get(intent_key, {})
+        use_mongo = intent_cfg.get("needs", {}).get("mongo", True)
 
-        # STEP 0 — Mongo (optional): resolve specific anchor(s) before ranking
-        # This allows queries like "including voyage 1901" to deterministically
-        # resolve voyageId/imo first and carry it through later steps.
+        # STEP 0 — Mongo anchor resolution (only when mongo needed + entity hint present)
         text_lower = (text or "").lower()
         has_entity_hint = bool(
             slots.get("voyage_id")
@@ -223,13 +208,11 @@ class Planner:
                 ExecutionStep(
                     agent="mongo",
                     operation="resolveAnchor",
-                    inputs={
-                        "goal": text,
-                    },
+                    inputs={"goal": text},
                 )
             )
 
-        # STEP 1 — Finance (composite always uses dynamic SQL for finance; registry only for single-query)
+        # STEP 1 — Finance dynamic SQL
         steps.append(
             ExecutionStep(
                 agent="finance",
@@ -242,27 +225,23 @@ class Planner:
             )
         )
 
-        # STEP 2 — Ops (scenario comparison does not require ops)
+        # STEP 2 — Ops dynamic SQL (skip for scenario comparison)
         if intent_key != "analysis.scenario_comparison":
             steps.append(
                 ExecutionStep(
                     agent="ops",
                     operation="dynamicSQL",
-                    inputs={
-                        "voyage_ids": "$finance.voyage_ids"
-                    },
+                    inputs={"voyage_ids": "$finance.voyage_ids"},
                 )
             )
 
-        # STEP 3 — Mongo (skip for aggregate intents)
+        # STEP 3 — Mongo fetch remarks (skip for aggregate intents)
         if use_mongo:
             steps.append(
                 ExecutionStep(
                     agent="mongo",
                     operation="fetchRemarks",
-                    inputs={
-                        "voyage_ids": "$finance.voyage_ids"
-                    },
+                    inputs={"voyage_ids": "$finance.voyage_ids"},
                 )
             )
 

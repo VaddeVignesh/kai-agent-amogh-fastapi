@@ -11,6 +11,7 @@ import sys
 
 from app.orchestration.planner import Planner, ExecutionPlan
 from app.registries.intent_registry import INTENT_REGISTRY, SUPPORTED_INTENTS, resolve_intent
+from app.registries.sql_registry import SQL_REGISTRY
 from app.services.response_merger import compact_payload
 
 # =========================================================
@@ -297,6 +298,8 @@ class GraphRouter:
                 # Common underspecified references
                 "this voyage", "that voyage", "this vessel", "that vessel",
                 "this port", "that port",
+                # Generic meta words often hallucinated as entity names
+                "details", "detail", "summary", "information", "info",
             }
             return v in placeholders
         return False
@@ -308,6 +311,15 @@ class GraphRouter:
         for k in ("vessel_name", "port_name", "imo", "voyage_id"):
             if k in slots and GraphRouter._is_placeholder_entity_value(slots.get(k)):
                 slots.pop(k, None)
+        # Extra sanitization for malformed port extraction (e.g. "the most port calls").
+        if "port_name" in slots and isinstance(slots.get("port_name"), str):
+            p = (slots.get("port_name") or "").strip().lower()
+            if (
+                not p
+                or len(p) > 60
+                or any(tok in p for tok in ("port calls", "most port", "key ports", "all key ports", "rank by", "voyages"))
+            ):
+                slots.pop("port_name", None)
         # voyage_number sometimes arrives as a string via LLM. If it's placeholder-ish, drop it.
         if "voyage_number" in slots and GraphRouter._is_placeholder_entity_value(slots.get("voyage_number")):
             slots.pop("voyage_number", None)
@@ -374,6 +386,15 @@ class GraphRouter:
                     )
                 except Exception:
                     pass
+                # Keep in-memory state aligned with persisted session to prevent stale
+                # pending clarification data from being re-written later in this turn.
+                if isinstance(session_ctx, dict):
+                    session_ctx["pending_intent"] = None
+                    session_ctx["missing_keys"] = None
+                    session_ctx["clarification_options"] = {}
+                    session_ctx["pending_question"] = None
+                    session_ctx["pending_slots"] = {}
+                    state["session_ctx"] = session_ctx
 
                 intent_key = pending_intent
                 extracted_slots = {**pending_slots_base, **resolved_slots}
@@ -396,22 +417,18 @@ class GraphRouter:
                 # Use the same cleaning pipeline section (copied from below)
                 cleaned_slots = {}
                 user_input_lower = user_input.lower()
-                aggregate_intents = [
-                    "ranking.voyages", "ranking.vessels", "ranking.cargo",
-                    "ranking.ports", "ranking.routes",
-                    "analysis.high_revenue_low_pnl", "analysis.revenue_vs_pnl",
-                    "analysis.cargo_profitability", "analysis.segment_performance",
-                    "analysis.cost_breakdown", "analysis.profitability",
-                    "ops.delayed_voyages", "ops.cargo_movements", "ops.demurrage",
-                    "aggregation.count", "aggregation.average", "aggregation.total", "aggregation.trends",
-                    "temporal.period", "temporal.trend",
-                ]
+                # Registry-driven slot cleanup — no hardcoded intent list.
+                _icfg = INTENT_REGISTRY.get(intent_key, {})
+                _is_fleet_wide = _icfg.get("route") == "composite"
+                _allowed = set(
+                    (_icfg.get("required_slots") or [])
+                    + (_icfg.get("optional_slots") or [])
+                )
 
-                if intent_key in aggregate_intents:
-                    for key in ["limit", "date_from", "date_to", "port_name", "scenario",
-                               "metric", "group_by", "threshold", "cargo_type", "cargo_grade"]:
-                        if key in extracted_slots:
-                            cleaned_slots[key] = extracted_slots[key]
+                if _is_fleet_wide:
+                    for key, val in extracted_slots.items():
+                        if key in _allowed:
+                            cleaned_slots[key] = val
                 else:
                     for key, value in extracted_slots.items():
                         cleaned_slots[key] = value
@@ -481,6 +498,7 @@ class GraphRouter:
         ul = (user_input or "").strip().lower()
         words = [w for w in ul.split() if w]
         has_result_set = isinstance(session_ctx, dict) and isinstance(session_ctx.get("last_result_set"), dict)
+        turn_type = self._classify_turn_type(session_ctx=session_ctx, user_input=user_input)
         explicit_rs_ref = any(
             p in ul
             for p in (
@@ -513,7 +531,7 @@ class GraphRouter:
             )
         )
 
-        if has_result_set and explicit_rs_ref:
+        if has_result_set and explicit_rs_ref and turn_type == "followup":
             # Explicitly referencing the prior list/result set.
             state["intent_key"] = "followup.result_set"
             state["slots"] = {"action": "compare_extremes"}
@@ -533,7 +551,7 @@ class GraphRouter:
         is_short_followup = len(words) <= 12
         starts_followup_verb = ul.startswith(("explain", "why", "what went wrong", "went wrong"))
         mentions_remarks = ("remark" in ul) or ("remarks" in ul)
-        if has_result_set and mentions_remarks and is_short_followup and starts_followup_verb and not starts_like_new_request:
+        if has_result_set and mentions_remarks and is_short_followup and starts_followup_verb and not starts_like_new_request and turn_type == "followup":
             state["intent_key"] = "followup.result_set"
             state["slots"] = {"action": "explain_remarks"}
             artifacts = state.get("artifacts") or {}
@@ -550,9 +568,10 @@ class GraphRouter:
         # Extremes (highest/lowest) as a short follow-up prompt.
         if (
             has_result_set
-            and any(k in ul for k in ("highest", "lowest", "max", "min"))
+            and any(k in ul for k in ("highest", "lowest", "max", "min", "best", "worst"))
             and is_short_followup
-            and not starts_like_new_request
+            and (not starts_like_new_request or any(k in ul for k in ("out of it", "out of them", "among these", "among them")))
+            and turn_type == "followup"
         ):
             state["intent_key"] = "followup.result_set"
             state["slots"] = {"action": "compare_extremes"}
@@ -566,6 +585,25 @@ class GraphRouter:
                 {"phase": "intent_extraction", "intent_key": "followup.result_set", "slots": state["slots"], "source": "result_set_followup"},
             )
             return state
+
+        # Generic result-set operations (top/bottom/project/compare/filter) across any prior list result.
+        # Allow polite command phrasing ("can you list ...") even if turn classifier is conservative.
+        if has_result_set:
+            op_slots = self._parse_result_set_followup_action(user_input=user_input, session_ctx=session_ctx)
+            polite_followup = ul.startswith(("can u ", "can you ", "could you ", "please "))
+            if isinstance(op_slots, dict) and op_slots.get("action") and (turn_type == "followup" or polite_followup):
+                state["intent_key"] = "followup.result_set"
+                state["slots"] = op_slots
+                artifacts = state.get("artifacts") or {}
+                artifacts["intent_key"] = "followup.result_set"
+                artifacts["slots"] = state["slots"]
+                artifacts["user_input"] = user_input
+                state["artifacts"] = artifacts
+                self._trace(
+                    state,
+                    {"phase": "intent_extraction", "intent_key": "followup.result_set", "slots": state["slots"], "source": "result_set_followup_generic"},
+                )
+                return state
         
         ex = self.llm.extract_intent_slots(
             text=user_input,
@@ -666,12 +704,13 @@ class GraphRouter:
         # reuse the last known voyage/vessel from Redis session slots.
         # =========================================================
         followup_used = False
-        intent_key, extracted_slots, followup_used = self._apply_session_followup(
-            intent_key=intent_key,
-            extracted_slots=extracted_slots,
-            session_ctx=session_ctx,
-            user_input=user_input,
-        )
+        if turn_type == "followup":
+            intent_key, extracted_slots, followup_used = self._apply_session_followup(
+                intent_key=intent_key,
+                extracted_slots=extracted_slots,
+                session_ctx=session_ctx,
+                user_input=user_input,
+            )
 
         # =========================================================
         # Lightweight parameter memory (limit/date/scenario/etc.)
@@ -712,34 +751,23 @@ class GraphRouter:
         # Clean slots based on what's in the query
         cleaned_slots = {}
         user_input_lower = user_input.lower()
-        
-        # Aggregate/ranking intents should not have specific entity filters
-        aggregate_intents = [
-            # Rankings - ALL types
-            "ranking.voyages", "ranking.vessels", "ranking.cargo", 
-            "ranking.ports", "ranking.routes",
-            
-            # Analysis
-            "analysis.high_revenue_low_pnl", "analysis.revenue_vs_pnl",
-            "analysis.cargo_profitability", "analysis.segment_performance",
-            "analysis.cost_breakdown", "analysis.profitability",
-            
-            # Operations
-            "ops.delayed_voyages", "ops.cargo_movements", "ops.demurrage",
-            
-            # Aggregations
-            "aggregation.count", "aggregation.average", "aggregation.total", "aggregation.trends",
-            
-            # Temporal
-            "temporal.period", "temporal.trend",
-        ]
-        
-        if intent_key in aggregate_intents:
-            # Only keep limit, date ranges, and criteria slots (NOT specific entity IDs)
-            for key in ["limit", "date_from", "date_to", "port_name", "scenario", 
-                       "metric", "group_by", "threshold", "cargo_type", "cargo_grade"]:
-                if key in extracted_slots:
-                    cleaned_slots[key] = extracted_slots[key]
+
+        # Registry-driven slot cleanup — no hardcoded intent list.
+        # Reads route + allowed slots directly from INTENT_REGISTRY.
+        _icfg = INTENT_REGISTRY.get(intent_key, {})
+        _is_fleet_wide = _icfg.get("route") == "composite"
+        _allowed = set(
+            (_icfg.get("required_slots") or [])
+            + (_icfg.get("optional_slots") or [])
+        )
+
+        if _is_fleet_wide:
+            # Fleet-wide intents: keep only registry-declared slots.
+            # Prevents entity anchors (voyage_number, vessel_name, imo, etc.)
+            # from polluting fleet-wide queries when the LLM hallucinates them.
+            for key, val in extracted_slots.items():
+                if key in _allowed:
+                    cleaned_slots[key] = val
 
             # Exception: if user explicitly says include/including a specific voyage,
             # keep the voyage_number(s) so composite can resolve and force-include it.
@@ -1068,6 +1096,284 @@ class GraphRouter:
         return False
 
     @staticmethod
+    def _classify_turn_type(*, session_ctx: Dict[str, Any], user_input: str) -> str:
+        """
+        Classify the incoming message as:
+          - "new_question": independent query; do NOT inherit prior anchors.
+          - "followup": conversational continuation; safe to apply memory.
+
+        Clarification replies are handled earlier in n_extract_intent when pending_* exists.
+        """
+        ui = (user_input or "").strip()
+        ul = ui.lower()
+        words = [w for w in re.split(r"\s+", ul) if w]
+
+        if GraphRouter._is_chitchat(ui):
+            return "new_question"
+
+        # Explicit references to previous result sets are follow-ups.
+        explicit_rs_ref = any(
+            p in ul
+            for p in (
+                "among these",
+                "among them",
+                "from above",
+                "from the above",
+                "in that list",
+                "in the list",
+                "above list",
+                "the above",
+                "those voyages",
+                "these voyages",
+            )
+        )
+        if explicit_rs_ref:
+            return "followup"
+
+        # Detect explicit entity family mention in this turn.
+        mentions_vessel = bool(re.search(r"\b(vessel|ship|imo)\b", ul))
+        mentions_voyage = bool(re.search(r"\b(voyage|voyages)\b", ul))
+        mentions_port = bool(re.search(r"\b(port|ports)\b", ul))
+        explicit_family = (
+            "vessel" if mentions_vessel else
+            "voyage" if mentions_voyage else
+            "port" if mentions_port else
+            None
+        )
+
+        # Detect current session anchor family.
+        # Prefer last_intent family because memory slots may contain both voyage + vessel
+        # after an enriched summary turn.
+        sess_slots = {}
+        last_intent = ""
+        if isinstance(session_ctx, dict):
+            sess_slots = session_ctx.get("memory_slots") or session_ctx.get("slots") or {}
+            li = session_ctx.get("last_intent")
+            if isinstance(li, str):
+                last_intent = li.strip().lower()
+        has_result_set = isinstance(session_ctx, dict) and isinstance(session_ctx.get("last_result_set"), dict)
+        if not isinstance(sess_slots, dict):
+            sess_slots = {}
+
+        session_family = None
+        if last_intent.startswith("voyage."):
+            session_family = "voyage"
+        elif last_intent.startswith("vessel."):
+            session_family = "vessel"
+        elif last_intent.startswith("ops.port_") or last_intent.startswith("port."):
+            session_family = "port"
+        elif sess_slots.get("vessel_name") or sess_slots.get("imo"):
+            session_family = "vessel"
+        elif sess_slots.get("voyage_number") or sess_slots.get("voyage_numbers") or sess_slots.get("voyage_id"):
+            session_family = "voyage"
+        elif sess_slots.get("port_name"):
+            session_family = "port"
+
+        # Topic switch guardrail between voyage/vessel families.
+        # Port mentions can still be contextual follow-ups on a voyage/vessel thread.
+        if (
+            explicit_family in ("voyage", "vessel")
+            and session_family in ("voyage", "vessel")
+            and explicit_family != session_family
+        ):
+            return "new_question"
+
+        # Value-like turns are usually continuation replies ("2301", "2", "Rotterdam").
+        # Keep short text replies follow-up unless they clearly look like a fresh ask.
+        is_value_like = bool(
+            re.fullmatch(r"\d{1,5}", ui)
+            or (1 <= len(words) <= 3 and "?" not in ui and not any(w in ul for w in ("show", "list", "compare", "rank", "top", "tell", "what", "which")))
+        )
+        if is_value_like:
+            return "followup"
+
+        # Long imperative asks are usually fresh questions, even if they contain words
+        # like "include/explain" that can appear in follow-ups.
+        if len(words) > 8 and ul.startswith(("show ", "show me", "list ", "find ", "compare ", "for ", "which ", "what ")):
+            return "new_question"
+
+        followup_markers = (
+            "what about", "what else", "same", "also", "more", "details", "breakdown",
+            "explain", "why", "how", "include", "among",
+        )
+        has_coref = any(w in words for w in ("it", "this", "that", "these", "those", "them", "they"))
+        if any(m in ul for m in followup_markers) or has_coref:
+            return "followup"
+
+        # If we already have a result set, allow concise refinement operations as follow-ups.
+        if has_result_set and len(words) <= 10 and any(k in ul for k in ("top", "bottom", "highest", "lowest", "best", "worst", "only", "just")):
+            return "followup"
+
+        # Generic operation asks over an existing result set should remain follow-ups
+        # even when phrased as longer natural sentences.
+        if (
+            has_result_set
+            and any(k in ul for k in ("show", "list", "give", "compare", "only", "just", "filter", "sort"))
+            and any(k in ul for k in ("port", "ports", "grade", "grades", "remark", "remarks", "pnl", "tce", "revenue", "expense", "commission", "offhire", "delay", "voyage"))
+            and len(words) <= 18
+        ):
+            return "followup"
+
+        # Short contextual asks after an entity-scoped turn should be treated as follow-ups
+        # even when phrased as commands (e.g. "list all key ports", "show remarks").
+        if (
+            session_family in ("voyage", "vessel", "port")
+            and len(words) <= 7
+            and any(k in ul for k in ("port", "ports", "key ports", "remark", "remarks", "grade", "grades", "expense", "expenses", "revenue", "pnl", "tce", "commission", "offhire", "delay"))
+        ):
+            return "followup"
+
+        # Fresh ask markers -> new question.
+        starts_like_new_request = ul.startswith(
+            (
+                "show ", "show me", "list ", "rank ", "find ", "give ", "tell ",
+                "summarize", "compare ", "for ", "which ", "what ",
+            )
+        )
+        if starts_like_new_request or GraphRouter._looks_like_new_question(ui):
+            return "new_question"
+
+        # Default to follow-up only for short context-carrying turns; else new question.
+        return "followup" if len(words) <= 6 else "new_question"
+
+    @staticmethod
+    def _parse_result_set_followup_action(*, user_input: str, session_ctx: Dict[str, Any]) -> Dict[str, Any] | None:
+        """
+        Parse follow-up operations over the previous result set in a query-agnostic way.
+        Returns a normalized action payload or None.
+        """
+        ul = (user_input or "").strip().lower()
+        if not ul:
+            return None
+
+        rs = (session_ctx or {}).get("last_result_set") if isinstance(session_ctx, dict) else None
+        rows = (rs or {}).get("rows") if isinstance(rs, dict) else None
+        rows = rows if isinstance(rows, list) else []
+        rs_meta = (rs or {}).get("meta") if isinstance(rs, dict) and isinstance((rs or {}).get("meta"), dict) else {}
+
+        def _has_field(field: str) -> bool:
+            for r in rows[:20]:
+                if isinstance(r, dict) and r.get(field) not in (None, "", [], {}):
+                    return True
+            return False
+
+        # Per-row remarks projection ("remarks of each", "show/list/give remarks ...").
+        if (
+            "remark" in ul
+            and (
+                ul.startswith(("show remarks", "list remarks", "give remarks"))
+                or "remarks of each" in ul
+                or "remarks for each" in ul
+                or "remarks of every" in ul
+            )
+        ):
+            return {"action": "remarks_each"}
+
+        # Per-row key ports projection.
+        if "port" in ul and any(k in ul for k in ("all key ports", "key ports", "list ports", "list all ports", "show ports")):
+            return {"action": "list_ports"}
+
+        # Per-row cargo grades projection.
+        if (
+            ("cargo" in ul and ("grade" in ul or "grades" in ul or "gardes" in ul))
+            or "cargo grades" in ul
+            or "list all cargo grades" in ul
+        ):
+            if any(k in ul for k in ("list", "show", "give", "each", "every", "all")):
+                return {"action": "list_cargo_grades"}
+
+        # Metric-only comparison/projection from current set.
+        if "pnl" in ul and "tce" in ul and any(k in ul for k in ("compare", "only", "just", "show")):
+            return {"action": "compare_metrics", "metrics": ["pnl", "tce"]}
+
+        # Generic threshold filtering over current result set.
+        metric_alias = {
+            "pnl": "pnl",
+            "tce": "tce",
+            "revenue": "revenue",
+            "expense": "total_expense",
+            "cost": "total_expense",
+            "commission": "total_commission",
+            "offhire": "offhire_days",
+            "off hire": "offhire_days",
+            "offhire days": "offhire_days",
+        }
+        mth = re.search(
+            r"\b(pnl|tce|revenue|expense|cost|commission|off\s*hire|offhire(?:\s*days?)?)\b[^\n]*?(>=|<=|>|<|=)\s*(-?\d+(?:\.\d+)?)",
+            ul,
+        )
+        if mth:
+            raw_metric = re.sub(r"\s+", " ", str(mth.group(1) or "").strip())
+            metric = metric_alias.get(raw_metric, metric_alias.get(raw_metric.replace("  ", " "), raw_metric))
+            return {"action": "filter_by_metric_threshold", "metric": metric, "operator": mth.group(2), "value": float(mth.group(3))}
+        mth_words = re.search(
+            r"\b(pnl|tce|revenue|expense|cost|commission|off\s*hire|offhire(?:\s*days?)?)\b[^\n]*?\b(above|over|greater than|below|under|less than)\b\s*(-?\d+(?:\.\d+)?)",
+            ul,
+        )
+        if mth_words:
+            raw_metric = re.sub(r"\s+", " ", str(mth_words.group(1) or "").strip())
+            metric = metric_alias.get(raw_metric, metric_alias.get(raw_metric.replace("  ", " "), raw_metric))
+            op_word = str(mth_words.group(2) or "").strip()
+            operator = ">" if op_word in ("above", "over", "greater than") else "<"
+            return {"action": "filter_by_metric_threshold", "metric": metric, "operator": operator, "value": float(mth_words.group(3))}
+
+        # Top/bottom-N refinement.
+        n = None
+        m = re.search(r"\b(top|bottom)\s*(\d{1,2})\b", ul)
+        if m:
+            try:
+                n = int(m.group(2))
+            except Exception:
+                n = None
+        if n is None:
+            m2 = re.search(r"\b(\d{1,2})\b", ul)
+            if m2 and any(k in ul for k in ("top", "bottom", "lowest", "highest", "least", "most")):
+                try:
+                    n = int(m2.group(1))
+                except Exception:
+                    n = None
+        if n is None and any(k in ul for k in ("top", "bottom", "lowest", "highest", "least", "most")):
+            n = 5
+
+        if n is not None:
+            # Infer metric in a generic way from user wording + available fields.
+            metric = None
+            metric_hints = (
+                ("offhire_days", ("offhire", "off hire")),
+                ("port_calls", ("port calls", "most called", "least called", "called voyages")),
+                ("total_commission", ("commission",)),
+                ("revenue", ("revenue",)),
+                ("total_expense", ("expense", "cost")),
+                ("tce", ("tce",)),
+                ("pnl", ("pnl", "profit", "loss")),
+            )
+            for field, keys in metric_hints:
+                if any(k in ul for k in keys):
+                    metric = field
+                    break
+            if metric is None:
+                preferred = str(rs_meta.get("primary_metric") or "").strip().lower()
+                if preferred and _has_field(preferred):
+                    metric = preferred
+                elif _has_field("offhire_days"):
+                    metric = "offhire_days"
+                elif _has_field("port_calls"):
+                    metric = "port_calls"
+                elif _has_field("pnl"):
+                    metric = "pnl"
+                elif _has_field("revenue"):
+                    metric = "revenue"
+                elif _has_field("total_commission"):
+                    metric = "total_commission"
+                else:
+                    metric = "pnl"
+
+            action = "bottom_n" if any(k in ul for k in ("bottom", "lowest", "least", "worst")) else "top_n"
+            return {"action": action, "n": max(1, min(int(n), 20)), "metric": metric}
+
+        return None
+
+    @staticmethod
     def _apply_session_followup(
         *,
         intent_key: str,
@@ -1296,14 +1602,31 @@ class GraphRouter:
         ul = ui.lower()
         slots = dict(extracted_slots or {})
 
+        def _looks_like_port_candidate(cand: str) -> bool:
+            c = (cand or "").strip().strip("\"'").lower()
+            if not c or len(c) > 40:
+                return False
+            # Reject metric/aggregation phrases commonly mis-read as ports.
+            bad_tokens = (
+                "most", "least", "highest", "lowest",
+                "port call", "port calls", "key ports",
+                "voyage", "voyages", "rank", "pnl", "revenue", "expense", "commission",
+            )
+            if any(t in c for t in bad_tokens):
+                return False
+            return True
+
         # If port already present, use it.
         port = slots.get("port_name")
+        if isinstance(port, str) and not _looks_like_port_candidate(port):
+            slots.pop("port_name", None)
+            port = None
         if not port:
             # Heuristic extraction for: "For port Rotterdam, ..."
             m = re.search(r"\bfor\s+port\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*)\b", ui, flags=re.IGNORECASE)
             if m:
                 cand = (m.group(1) or "").strip().rstrip(",")
-                if cand and len(cand) <= 40:
+                if _looks_like_port_candidate(cand):
                     port = cand
                     slots["port_name"] = cand
         if not port and (" with " in ul or " at " in ul or " visited " in ul or " calls " in ul or " called " in ul):
@@ -1313,7 +1636,7 @@ class GraphRouter:
                 cand = (m.group(1) or "").strip()
                 # Trim common trailing words.
                 cand = re.sub(r"\s+(in|on|for|and)$", "", cand, flags=re.IGNORECASE).strip()
-                if cand and len(cand) <= 40:
+                if _looks_like_port_candidate(cand):
                     port = cand
                     slots["port_name"] = cand
 
@@ -1667,6 +1990,22 @@ class GraphRouter:
 
         _dprint(f"\n▶️  SINGLE EXECUTION: {intent_key}")
 
+        def _registry_sql_from_result(res: Any) -> str | None:
+            if not isinstance(res, dict):
+                return None
+            if str(res.get("mode") or "").strip().lower() != "registry_sql":
+                return None
+            qk = res.get("query_key")
+            if not isinstance(qk, str) or not qk.strip():
+                return None
+            spec = SQL_REGISTRY.get(qk)
+            if not spec:
+                return None
+            try:
+                return str(spec.sql).strip()
+            except Exception:
+                return None
+
         # =========================================================
         # Result-set follow-ups (deterministic, uses Redis memory)
         # =========================================================
@@ -1688,8 +2027,261 @@ class GraphRouter:
                 except Exception:
                     return None
 
+            def _extract_ports(val: Any) -> list[str]:
+                if val in (None, "", [], {}):
+                    return []
+                if isinstance(val, list):
+                    out = []
+                    for p in val[:30]:
+                        if p in (None, "", [], {}):
+                            continue
+                        if isinstance(p, dict):
+                            s = str(
+                                p.get("port_name")
+                                or p.get("port")
+                                or p.get("name")
+                                or p.get("portName")
+                                or ""
+                            ).strip()
+                        else:
+                            s = str(p).strip()
+                        if s:
+                            out.append(s)
+                    return out
+                s = str(val).strip()
+                if not s:
+                    return []
+                parts = [x.strip() for x in re.split(r"\s*[|,;]\s*", s) if x.strip()]
+                cleaned = []
+                for p in parts[:30]:
+                    pl = p.lower()
+                    if "grade_name" in pl and "none" in pl:
+                        continue
+                    cleaned.append(p)
+                return cleaned
+
+            def _extract_grades(val: Any) -> list[str]:
+                if val in (None, "", [], {}):
+                    return []
+                if isinstance(val, list):
+                    out = []
+                    for g in val[:30]:
+                        if g in (None, "", [], {}):
+                            continue
+                        if isinstance(g, dict):
+                            s = str(
+                                g.get("grade")
+                                or g.get("cargo_grade")
+                                or g.get("grade_name")
+                                or g.get("name")
+                                or ""
+                            ).strip()
+                        else:
+                            s = str(g).strip()
+                            sl = s.lower()
+                            if "grade_name" in sl and "none" in sl:
+                                s = ""
+                        if s:
+                            out.append(s)
+                    return out
+                s = str(val).strip()
+                if not s:
+                    return []
+                parts = [x.strip() for x in re.split(r"\s*[|,;]\s*", s) if x.strip()]
+                return parts[:30]
+
+            def _persist_result_set(new_rows: list[dict], *, primary_metric: str | None = None) -> None:
+                try:
+                    prev_meta = (rs or {}).get("meta") if isinstance(rs, dict) and isinstance((rs or {}).get("meta"), dict) else {}
+                    meta = dict(prev_meta)
+                    if primary_metric:
+                        meta["primary_metric"] = primary_metric
+                    self.redis.save_session(
+                        state["session_id"],
+                        {
+                            **(session_context or {}),
+                            "last_result_set": {
+                                "source_intent": (rs or {}).get("source_intent") if isinstance(rs, dict) else None,
+                                "rows": new_rows[:50],
+                                "meta": meta,
+                            },
+                        },
+                    )
+                except Exception:
+                    pass
+
+            # Generic refinements: top/bottom N by a metric
+            if action in ("top_n", "bottom_n"):
+                metric = str(slots.get("metric") or "pnl")
+                try:
+                    n = int(slots.get("n") or 5)
+                except Exception:
+                    n = 5
+                n = max(1, min(n, 20))
+
+                scored = []
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    vnum = r.get("voyage_number")
+                    if vnum in (None, ""):
+                        continue
+                    val = _num(r.get(metric))
+                    # Derive port_calls if needed.
+                    if val is None and metric == "port_calls":
+                        ports = _extract_ports(r.get("key_ports"))
+                        val = float(len(ports)) if ports else None
+                    if val is None:
+                        continue
+                    scored.append((val, r))
+
+                if not scored:
+                    state["answer"] = f"I couldn’t rank the previous result set by **{metric}**. Please ask the base query again with that metric."
+                    return state
+
+                scored = sorted(scored, key=lambda t: t[0], reverse=(action == "top_n"))
+                picked = [r for _, r in scored[:n]]
+                _persist_result_set(picked, primary_metric=metric)
+
+                lines = [f"### {'Top' if action == 'top_n' else 'Bottom'} {len(picked)} by {metric} (from previous results)"]
+                for i, r in enumerate(picked, start=1):
+                    v = _num(r.get(metric))
+                    if v is None and metric == "port_calls":
+                        v = float(len(_extract_ports(r.get("key_ports"))))
+                    label = r.get("voyage_number") or r.get("entity_id") or "N/A"
+                    lines.append(f"- {i}. **{label}**: {v:,.2f}" if isinstance(v, float) else f"- {i}. **{label}**")
+                state["answer"] = "\n".join(lines)
+                return state
+
+            # Per-row remarks projection from current result set.
+            if action == "remarks_each":
+                if not rows:
+                    state["answer"] = "I don’t have a previous result set to read remarks from. Please run the base list query again."
+                    return state
+                lines = ["### Remarks for each voyage (from previous results)"]
+                for r in rows[:20]:
+                    if not isinstance(r, dict):
+                        continue
+                    vnum = r.get("voyage_number") or "N/A"
+                    rem = r.get("remarks")
+                    txt = str(rem).strip() if rem not in (None, "", [], {}) else "No remarks recorded."
+                    lines.append(f"- **Voyage {vnum}**: {txt}")
+                state["answer"] = "\n".join(lines)
+                return state
+
+            # Per-row ports projection from current result set.
+            if action == "list_ports":
+                if not rows:
+                    state["answer"] = "I don’t have a previous result set to list ports from. Please run the base query again."
+                    return state
+                lines = ["### Key ports for current result set"]
+                for r in rows[:20]:
+                    if not isinstance(r, dict):
+                        continue
+                    vnum = r.get("voyage_number") or "N/A"
+                    ports = _extract_ports(r.get("key_ports"))
+                    if not ports:
+                        lines.append(f"- **Voyage {vnum}**: No key ports available.")
+                    else:
+                        preview = ", ".join(ports[:12])
+                        suffix = " (+more)" if len(ports) > 12 else ""
+                        lines.append(f"- **Voyage {vnum}**: {preview}{suffix}")
+                state["answer"] = "\n".join(lines)
+                return state
+
+            if action == "list_cargo_grades":
+                if not rows:
+                    state["answer"] = "I don’t have a previous result set to list cargo grades from. Please run the base query again."
+                    return state
+                lines = ["### Cargo grades for current result set"]
+                for r in rows[:20]:
+                    if not isinstance(r, dict):
+                        continue
+                    vnum = r.get("voyage_number") or "N/A"
+                    grades = _extract_grades(r.get("cargo_grades"))
+                    if not grades:
+                        lines.append(f"- **Voyage {vnum}**: No cargo grades available.")
+                    else:
+                        preview = ", ".join(grades[:12])
+                        suffix = " (+more)" if len(grades) > 12 else ""
+                        lines.append(f"- **Voyage {vnum}**: {preview}{suffix}")
+                state["answer"] = "\n".join(lines)
+                return state
+
+            # Generic metrics comparison for current selected set.
+            if action == "compare_metrics":
+                metrics = slots.get("metrics") if isinstance(slots.get("metrics"), list) else []
+                metrics = [str(m).strip() for m in metrics if str(m).strip()]
+                if not metrics:
+                    metrics = ["pnl", "tce"]
+                if not rows:
+                    state["answer"] = "I don’t have a previous result set to compare. Please run the base list query again."
+                    return state
+                lines = [f"### Comparison from previous results ({', '.join(metrics)})"]
+                for r in rows[:20]:
+                    if not isinstance(r, dict):
+                        continue
+                    vnum = r.get("voyage_number") or "N/A"
+                    vals = []
+                    for m in metrics:
+                        v = _num(r.get(m))
+                        vals.append(f"{m}={v:,.2f}" if isinstance(v, float) else f"{m}=N/A")
+                    lines.append(f"- **Voyage {vnum}**: " + " | ".join(vals))
+                state["answer"] = "\n".join(lines)
+                return state
+
+            if action == "filter_by_metric_threshold":
+                if not rows:
+                    state["answer"] = "I don’t have a previous result set to filter. Please run the base query again."
+                    return state
+                metric = str(slots.get("metric") or "pnl").strip().lower()
+                operator = str(slots.get("operator") or ">").strip()
+                try:
+                    threshold = float(slots.get("value"))
+                except Exception:
+                    threshold = None
+                if threshold is None:
+                    state["answer"] = "I couldn’t read the threshold value. Please specify a numeric threshold."
+                    return state
+
+                def _passes(val: float) -> bool:
+                    if operator == ">":
+                        return val > threshold
+                    if operator == "<":
+                        return val < threshold
+                    if operator == ">=":
+                        return val >= threshold
+                    if operator == "<=":
+                        return val <= threshold
+                    return abs(val - threshold) < 1e-9
+
+                filtered: list[dict] = []
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    v = _num(r.get(metric))
+                    if v is None:
+                        continue
+                    if _passes(v):
+                        filtered.append(r)
+
+                if not filtered:
+                    state["answer"] = f"No rows matched **{metric} {operator} {threshold:g}** in the previous result set."
+                    return state
+
+                _persist_result_set(filtered, primary_metric=metric)
+                lines = [f"### Filtered results ({metric} {operator} {threshold:g}) from previous results"]
+                for r in filtered[:20]:
+                    vnum = r.get("voyage_number") or r.get("entity_id") or "N/A"
+                    v = _num(r.get(metric))
+                    lines.append(f"- **{vnum}**: {metric}={v:,.2f}" if isinstance(v, float) else f"- **{vnum}**")
+                if len(filtered) > 20:
+                    lines.append(f"- ... and {len(filtered) - 20} more rows")
+                state["answer"] = "\n".join(lines)
+                return state
+
             # If user asks for extremes (highest/lowest) among the last list.
-            if action == "compare_extremes" or any(k in ul for k in ("highest", "lowest", "max", "min")):
+            if action == "compare_extremes" or any(k in ul for k in ("highest", "lowest", "max", "min", "best", "worst")):
                 metric = "pnl"
                 if "revenue" in ul:
                     metric = "revenue"
@@ -1808,6 +2400,18 @@ class GraphRouter:
                 voyage_id = slots.get("voyage_id")
 
             # 2️⃣ Finance
+            self._trace(
+                state,
+                {
+                    "phase": "composite_step_start",
+                    "step_index": 1,
+                    "step_count": 2,
+                    "agent": "finance",
+                    "operation": "registry_sql",
+                    "inputs": {"intent_key": intent_key},
+                    "goal": "Run finance registry SQL in single plan mode.",
+                },
+            )
             try:
                 finance_data = self.finance_agent.run(
                     intent_key=intent_key,
@@ -1824,6 +2428,31 @@ class GraphRouter:
             except Exception as e:
                 _dprint(f"⚠️  Finance failed: {e}")
                 finance_data = {"mode": "error", "rows": []}
+            try:
+                fin_rows = finance_data.get("rows") if isinstance(finance_data, dict) else []
+                fin_rows = fin_rows if isinstance(fin_rows, list) else []
+                fin_vids = [r.get("voyage_id") for r in fin_rows if isinstance(r, dict) and r.get("voyage_id")]
+                fin_vids = list(dict.fromkeys(fin_vids))
+                fin_sql = _registry_sql_from_result(finance_data)
+                self._trace(
+                    state,
+                    {
+                        "phase": "composite_step_result",
+                        "step_index": 1,
+                        "agent": "finance",
+                        "operation": "registry_sql",
+                        "ok": True,
+                        "mode": finance_data.get("mode") if isinstance(finance_data, dict) else None,
+                        "rows": len(fin_rows),
+                        "voyage_ids": len(fin_vids),
+                        "extracted_voyage_ids": fin_vids,
+                        "sql_present": bool(fin_sql),
+                        "sql": fin_sql,
+                        "summary": f"Finance(single): fetched {len(fin_rows)} rows using registry SQL.",
+                    },
+                )
+            except Exception:
+                pass
 
             # 3️⃣ Ops
             ops_data = None
@@ -1835,6 +2464,18 @@ class GraphRouter:
             if postgres_down:
                 ops_data = {"mode": "error", "rows": [], "fallback_reason": finance_fr}
             else:
+                self._trace(
+                    state,
+                    {
+                        "phase": "composite_step_start",
+                        "step_index": 2,
+                        "step_count": 2,
+                        "agent": "ops",
+                        "operation": "registry_sql",
+                        "inputs": {"intent_key": intent_key},
+                        "goal": "Run ops registry SQL in single plan mode.",
+                    },
+                )
                 try:
                     ops_data = self.ops_agent.run(
                         intent_key=intent_key,
@@ -1851,6 +2492,31 @@ class GraphRouter:
                 except Exception as e:
                     _dprint(f"⚠️  Ops failed: {e}")
                     ops_data = {"mode": "error", "rows": []}
+            try:
+                ops_rows = ops_data.get("rows") if isinstance(ops_data, dict) else []
+                ops_rows = ops_rows if isinstance(ops_rows, list) else []
+                ops_vids = [r.get("voyage_id") for r in ops_rows if isinstance(r, dict) and r.get("voyage_id")]
+                ops_vids = list(dict.fromkeys(ops_vids))
+                ops_sql = _registry_sql_from_result(ops_data)
+                self._trace(
+                    state,
+                    {
+                        "phase": "composite_step_result",
+                        "step_index": 2,
+                        "agent": "ops",
+                        "operation": "registry_sql",
+                        "ok": True,
+                        "mode": ops_data.get("mode") if isinstance(ops_data, dict) else None,
+                        "rows": len(ops_rows),
+                        "voyage_ids": len(ops_vids),
+                        "extracted_voyage_ids": ops_vids,
+                        "sql_present": bool(ops_sql),
+                        "sql": ops_sql,
+                        "summary": f"Ops(single): fetched {len(ops_rows)} rows using registry SQL.",
+                    },
+                )
+            except Exception:
+                pass
 
             finance_safe = _json_safe(finance_data)
             ops_safe = _json_safe(ops_data)
@@ -2556,6 +3222,18 @@ class GraphRouter:
 
         # Finance
         if cfg.get("needs", {}).get("finance"):
+            self._trace(
+                state,
+                {
+                    "phase": "composite_step_start",
+                    "step_index": 1,
+                    "step_count": 2 if cfg.get("needs", {}).get("ops") else 1,
+                    "agent": "finance",
+                    "operation": "registry_sql",
+                    "inputs": {"intent_key": intent_key},
+                    "goal": "Run finance registry SQL in single plan mode.",
+                },
+            )
             try:
                 res = self.finance_agent.run(
                     intent_key=intent_key,
@@ -2570,9 +3248,43 @@ class GraphRouter:
                     "rows": [],
                     "fallback_reason": f"Finance agent error: {str(e)}"
                 }
+            try:
+                fin_safe = _json_safe(state.get("finance"))
+                fin_rows = fin_safe.get("rows") if isinstance(fin_safe, dict) else []
+                fin_rows = fin_rows if isinstance(fin_rows, list) else []
+                fin_sql = _registry_sql_from_result(fin_safe)
+                self._trace(
+                    state,
+                    {
+                        "phase": "composite_step_result",
+                        "step_index": 1,
+                        "agent": "finance",
+                        "operation": "registry_sql",
+                        "ok": True,
+                        "mode": fin_safe.get("mode") if isinstance(fin_safe, dict) else None,
+                        "rows": len(fin_rows),
+                        "sql_present": bool(fin_sql),
+                        "sql": fin_sql,
+                        "summary": f"Finance(single): fetched {len(fin_rows)} rows using registry SQL.",
+                    },
+                )
+            except Exception:
+                pass
 
         # Ops
         if cfg.get("needs", {}).get("ops"):
+            self._trace(
+                state,
+                {
+                    "phase": "composite_step_start",
+                    "step_index": 2 if cfg.get("needs", {}).get("finance") else 1,
+                    "step_count": 2 if cfg.get("needs", {}).get("finance") else 1,
+                    "agent": "ops",
+                    "operation": "registry_sql",
+                    "inputs": {"intent_key": intent_key},
+                    "goal": "Run ops registry SQL in single plan mode.",
+                },
+            )
             try:
                 res = self.ops_agent.run(
                     intent_key=intent_key,
@@ -2587,6 +3299,28 @@ class GraphRouter:
                     "rows": [],
                     "fallback_reason": f"Ops agent error: {str(e)}"
                 }
+            try:
+                ops_safe = _json_safe(state.get("ops"))
+                ops_rows = ops_safe.get("rows") if isinstance(ops_safe, dict) else []
+                ops_rows = ops_rows if isinstance(ops_rows, list) else []
+                ops_sql = _registry_sql_from_result(ops_safe)
+                self._trace(
+                    state,
+                    {
+                        "phase": "composite_step_result",
+                        "step_index": 2 if cfg.get("needs", {}).get("finance") else 1,
+                        "agent": "ops",
+                        "operation": "registry_sql",
+                        "ok": True,
+                        "mode": ops_safe.get("mode") if isinstance(ops_safe, dict) else None,
+                        "rows": len(ops_rows),
+                        "sql_present": bool(ops_sql),
+                        "sql": ops_sql,
+                        "summary": f"Ops(single): fetched {len(ops_rows)} rows using registry SQL.",
+                    },
+                )
+            except Exception:
+                pass
 
         # =========================================================
         # Optional Dynamic NoSQL enrichment for ops port queries
@@ -2643,6 +3377,72 @@ class GraphRouter:
                     _dprint(f"⚠️  Mongo enrichment failed: {e}")
 
         state["slots"] = slots
+
+        # =========================================================
+        # Registry-driven zero-row escalation.
+        # If single path returned no rows and no entity anchor exists
+        # in slots, the query was fleet-wide but mis-classified as single.
+        # Rebuild as composite and signal r_after_run_single to re-route.
+        # No hardcoded intent names — driven entirely by registry route.
+        # =========================================================
+        _has_entity_anchor = bool(
+            slots.get("voyage_number") or slots.get("voyage_numbers")
+            or slots.get("voyage_id") or slots.get("vessel_name") or slots.get("imo")
+        )
+        _fin_rows: list = []
+        _ops_rows: list = []
+        try:
+            _f = state.get("finance") or {}
+            if isinstance(_f, dict):
+                _fin_rows = _f.get("rows") or []
+        except Exception:
+            pass
+        try:
+            _o = state.get("ops") or {}
+            if isinstance(_o, dict):
+                _ops_rows = _o.get("rows") or []
+        except Exception:
+            pass
+
+        _no_results = (not _fin_rows) and (not _ops_rows)
+        _intent_cfg_sr = INTENT_REGISTRY.get(intent_key, {})
+
+        if _no_results and not _has_entity_anchor and _intent_cfg_sr.get("route") == "single":
+            _dprint(f"   ⚡ ZERO-ROW ESCALATION: {intent_key} single → composite retry")
+            _escalated = self.planner.build_plan(
+                text=user_input,
+                session_context=session_context,
+                intent_key=intent_key,
+                slots=slots,
+                force_composite=True,
+            )
+            state["plan"] = {
+                "plan_type": _escalated.plan_type,
+                "intent_key": _escalated.intent_key,
+                "required_slots": _escalated.required_slots or [],
+                "confidence": _escalated.confidence,
+                "steps": [asdict(s) for s in (_escalated.steps or [])],
+            }
+            state["plan_type"] = "composite"
+            state["intent_key"] = _escalated.intent_key
+            state["step_index"] = 0
+            if not isinstance(state.get("data"), dict):
+                state["data"] = {
+                    "finance": {"mode": None, "rows": []},
+                    "ops": {"mode": None, "rows": []},
+                    "mongo": {},
+                    "artifacts": {},
+                }
+            self._trace(
+                state,
+                {
+                    "phase": "zero_row_escalation",
+                    "original_intent": intent_key,
+                    "escalated_intent": _escalated.intent_key,
+                    "reason": "single path returned zero rows with no entity anchor",
+                },
+            )
+
         return state
 
     # =========================================================
@@ -2804,7 +3604,7 @@ class GraphRouter:
                             "mode": safe.get("mode"),
                             "rows": len(rows),
                             "voyage_ids": len(unique_ids),
-                            "voyage_ids_sample": unique_ids[:5],
+                            "extracted_voyage_ids": unique_ids,
                             "sql_present": bool(safe.get("sql")),
                             "sql": safe.get("sql"),
                             "summary": f"Finance: fetched {len(rows)} rows and extracted {len(unique_ids)} voyage_ids (Postgres).",
@@ -2873,7 +3673,7 @@ class GraphRouter:
                             artifacts["voyage_ids"] = voyage_ids
                             artifacts["finance_rows"] = rows
                             slots["voyage_ids"] = voyage_ids
-                        self._trace(state, {"phase": "composite_step_result", "step_index": idx + 1, "agent": agent, "operation": op, "ok": True, "mode": safe.get("mode"), "rows": len(rows), "voyage_ids": len(voyage_ids), "voyage_ids_sample": voyage_ids[:5], "sql_present": bool(safe.get("sql")), "sql": safe.get("sql"), "summary": "Finance: retried with registry SQL (Postgres)."})
+                        self._trace(state, {"phase": "composite_step_result", "step_index": idx + 1, "agent": agent, "operation": op, "ok": True, "mode": safe.get("mode"), "rows": len(rows), "voyage_ids": len(voyage_ids), "extracted_voyage_ids": voyage_ids, "sql_present": bool(safe.get("sql")), "sql": safe.get("sql"), "summary": "Finance: retried with registry SQL (Postgres)."})
                     except Exception as e2:
                         _dprint(f"   ❌ finance (registry retry) failed: {e2}")
                         state["data"]["finance"] = {"mode": "error", "rows": []}
@@ -2965,7 +3765,7 @@ class GraphRouter:
                         "mode": safe.get("mode"),
                         "rows": len(rows),
                         "voyage_ids": len(slots.get("voyage_ids") or []) if isinstance(slots.get("voyage_ids"), list) else None,
-                        "voyage_ids_sample": (slots.get("voyage_ids") or [])[:5] if isinstance(slots.get("voyage_ids"), list) else None,
+                        "extracted_voyage_ids": (slots.get("voyage_ids") or []) if isinstance(slots.get("voyage_ids"), list) else None,
                         "sql_present": bool(safe.get("sql")),
                         "sql": safe.get("sql"),
                         "summary": f"Ops: fetched {len(rows)} ops rows for voyage_ids (Postgres).",
@@ -3295,7 +4095,7 @@ class GraphRouter:
                     ),
                     "rows": len(((state.get("mongo") or {}).get("rows") or [])) if isinstance(state.get("mongo"), dict) else None,
                     "voyage_ids": len(voyage_ids or []),
-                    "voyage_ids_sample": (voyage_ids or [])[:5],
+                    "extracted_voyage_ids": (voyage_ids or []),
                     "remarks_by_voyage_id": len(remarks_by or {}),
                     "summary": f"Mongo: fetched remarks + minimal context for {len(voyage_ids or [])} voyages (MongoDB).",
                 },
@@ -3532,8 +4332,15 @@ class GraphRouter:
                     row["tce_variance"] = _num(fr.get("tce_variance"))
                 # Offhire ranking: expose offhire_days and delay_reason at top level so table can show them
                 if fr.get("offhire_days") is not None or intent_key_merge == "ops.offhire_ranking":
-                    row["offhire_days"] = _num(fr.get("offhire_days"))
-                    row["delay_reason"] = fr.get("delay_reason")
+                    offhire_val = fr.get("offhire_days")
+                    delay_val = fr.get("delay_reason")
+                    if (offhire_val in (None, "")) and isinstance(ops_for_vid, list) and ops_for_vid:
+                        first_ops = ops_for_vid[0] if isinstance(ops_for_vid[0], dict) else {}
+                        if isinstance(first_ops, dict):
+                            offhire_val = first_ops.get("offhire_days")
+                            delay_val = delay_val or first_ops.get("delay_reason")
+                    row["offhire_days"] = _num(offhire_val)
+                    row["delay_reason"] = delay_val
                 # Port calls: expose count when key_ports is a list so "most port calls" table can show it
                 if isinstance(key_ports, list):
                     row["port_calls"] = len(key_ports)
@@ -3843,6 +4650,24 @@ class GraphRouter:
                 except Exception:
                     return None
 
+            def _infer_result_set_meta(rows_in: list[dict], *, source_intent: str | None) -> Dict[str, Any]:
+                metrics = ("offhire_days", "port_calls", "pnl", "revenue", "total_expense", "tce", "total_commission")
+                available = []
+                for m in metrics:
+                    ok = False
+                    for rr in rows_in[:50]:
+                        if isinstance(rr, dict) and rr.get(m) not in (None, "", [], {}):
+                            ok = True
+                            break
+                    if ok:
+                        available.append(m)
+                primary = available[0] if available else None
+                return {
+                    "source_intent": source_intent,
+                    "available_metrics": available,
+                    "primary_metric": primary,
+                }
+
             sess = state.get("session_ctx") or {}
             art = state.get("artifacts") or {}
             mrs = art.get("merged_rows") if isinstance(art, dict) else None
@@ -3855,21 +4680,30 @@ class GraphRouter:
                     compact_rows.append({
                         "voyage_id": _json_primitive(r.get("voyage_id")),
                         "voyage_number": _json_primitive(r.get("voyage_number") or fr.get("voyage_number")),
+                        "vessel_name": _json_primitive(r.get("vessel_name")),
+                        "vessel_imo": _json_primitive(r.get("vessel_imo")),
                         "pnl": _json_primitive(fr.get("pnl")),
                         "revenue": _json_primitive(fr.get("revenue")),
                         "total_expense": _json_primitive(fr.get("total_expense")),
                         "tce": _json_primitive(fr.get("tce")),
                         "total_commission": _json_primitive(fr.get("total_commission")),
+                        "offhire_days": _json_primitive(r.get("offhire_days")),
+                        "delay_reason": _json_primitive(r.get("delay_reason")),
+                        "key_ports": _json_primitive(r.get("key_ports")),
+                        "cargo_grades": _json_primitive(r.get("cargo_grades")),
+                        "port_calls": _json_primitive(r.get("port_calls")),
                         "remarks": _compact_remarks(r.get("remarks")),
                     })
+                latest_result_set = {
+                    "source_intent": state.get("intent_key"),
+                    "rows": compact_rows,
+                    "meta": _infer_result_set_meta(compact_rows, source_intent=state.get("intent_key")),
+                }
                 self.redis.save_session(
                     state["session_id"],
                     {
                         **(sess or {}),
-                        "last_result_set": {
-                            "source_intent": state.get("intent_key"),
-                            "rows": compact_rows,
-                        },
+                        "last_result_set": latest_result_set,
                     },
                 )
             else:
@@ -3877,7 +4711,7 @@ class GraphRouter:
                 merged = state.get("merged") or {}
                 fin = merged.get("finance") if isinstance(merged, dict) else None
                 fin_rows = (fin or {}).get("rows") if isinstance(fin, dict) else None
-                if isinstance(fin_rows, list) and len(fin_rows) >= 2:
+                if isinstance(fin_rows, list) and len(fin_rows) >= 1:
                     compact_rows = []
                     for r in fin_rows[:20]:
                         if not isinstance(r, dict):
@@ -3885,28 +4719,94 @@ class GraphRouter:
                         compact_rows.append({
                             "voyage_id": _json_primitive(r.get("voyage_id")),
                             "voyage_number": _json_primitive(r.get("voyage_number")),
+                            "vessel_name": _json_primitive(r.get("vessel_name")),
+                            "vessel_imo": _json_primitive(r.get("vessel_imo") or r.get("imo")),
                             "pnl": _json_primitive(r.get("pnl")),
                             "revenue": _json_primitive(r.get("revenue")),
                             "total_expense": _json_primitive(r.get("total_expense")),
                             "tce": _json_primitive(r.get("tce")),
                             "total_commission": _json_primitive(r.get("total_commission")),
+                            "offhire_days": _json_primitive(r.get("offhire_days")),
+                            "delay_reason": _json_primitive(r.get("delay_reason")),
+                            "key_ports": _json_primitive(r.get("key_ports")),
+                            "cargo_grades": _json_primitive(r.get("cargo_grades")),
+                            "port_calls": _json_primitive(r.get("port_calls")),
                             "remarks": None,
                         })
+                    latest_result_set = {
+                        "source_intent": state.get("intent_key"),
+                        "rows": compact_rows,
+                        "meta": _infer_result_set_meta(compact_rows, source_intent=state.get("intent_key")),
+                    }
                     self.redis.save_session(
                         state["session_id"],
                         {
                             **(sess or {}),
-                            "last_result_set": {
-                                "source_intent": state.get("intent_key"),
-                                "rows": compact_rows,
-                            },
+                            "last_result_set": latest_result_set,
                         },
                     )
+                else:
+                    # Fallback for ops-only/composite responses where finance rows may be empty.
+                    ops = merged.get("ops") if isinstance(merged, dict) else None
+                    ops_rows = (ops or {}).get("rows") if isinstance(ops, dict) else None
+                    if isinstance(ops_rows, list) and len(ops_rows) >= 1:
+                        compact_rows = []
+                        for r in ops_rows[:20]:
+                            if not isinstance(r, dict):
+                                continue
+                            compact_rows.append({
+                                "voyage_id": _json_primitive(r.get("voyage_id")),
+                                "voyage_number": _json_primitive(r.get("voyage_number")),
+                                "vessel_name": _json_primitive(r.get("vessel_name")),
+                                "vessel_imo": _json_primitive(r.get("vessel_imo") or r.get("imo")),
+                                "pnl": _json_primitive(r.get("pnl")),
+                                "revenue": _json_primitive(r.get("revenue")),
+                                "total_expense": _json_primitive(r.get("total_expense")),
+                                "tce": _json_primitive(r.get("tce")),
+                                "total_commission": _json_primitive(r.get("total_commission")),
+                                "offhire_days": _json_primitive(r.get("offhire_days")),
+                                "delay_reason": _json_primitive(r.get("delay_reason") or r.get("delay_reasons")),
+                                "key_ports": _json_primitive(r.get("key_ports") or r.get("ports") or r.get("ports_json")),
+                                "cargo_grades": _json_primitive(r.get("cargo_grades") or r.get("grades_json")),
+                                "port_calls": _json_primitive(r.get("port_calls")),
+                                "remarks": _compact_remarks(r.get("remarks") or r.get("remarks_json")),
+                            })
+                        latest_result_set = {
+                            "source_intent": state.get("intent_key"),
+                            "rows": compact_rows,
+                            "meta": _infer_result_set_meta(compact_rows, source_intent=state.get("intent_key")),
+                        }
+                        self.redis.save_session(
+                            state["session_id"],
+                            {
+                                **(sess or {}),
+                                "last_result_set": latest_result_set,
+                            },
+                        )
+                    else:
+                        latest_result_set = {"source_intent": state.get("intent_key"), "rows": [], "meta": {}}
+                        self.redis.save_session(
+                            state["session_id"],
+                            {
+                                **(sess or {}),
+                                "last_result_set": latest_result_set,
+                            },
+                        )
         except Exception:
             pass
 
         # Save to session
         sess = state.get("session_ctx") or {}
+        # Never carry stale pending clarification flags across a completed turn.
+        # Clarification state is set only in n_make_clarification when needed.
+        if isinstance(sess, dict):
+            sess.pop("pending_intent", None)
+            sess.pop("missing_keys", None)
+            sess.pop("clarification_options", None)
+            sess.pop("pending_question", None)
+            sess.pop("pending_slots", None)
+            if latest_result_set is not None:
+                sess["last_result_set"] = latest_result_set
         persisted_slots = self._build_persisted_slots(base=(sess.get("slots") or {}), updates=(state.get("slots") or {}))
         last_voyage_ids = None
         try:
@@ -4334,6 +5234,9 @@ class GraphRouter:
         return "more" if idx < len(steps) else "done"
 
     def r_after_run_single(self, state: GraphState) -> str:
+        # Zero-row escalation: plan_type was flipped to "composite" by n_run_single.
+        if (state.get("plan_type") or "") == "composite":
+            return "escalate"
         """Route to end if answer already generated (e.g. voyage.summary), else merge"""
         # If the single path created a clarification, end immediately (do NOT summarize/overwrite).
         if state.get("clarification"):
@@ -4409,6 +5312,7 @@ class GraphRouter:
             {
                 "done": END,
                 "merge": "merge",
+                "escalate": "execute_step",  # zero-row escalation → composite path
             }
         )
         

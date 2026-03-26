@@ -1,17 +1,14 @@
 # app/llm/llm_client.py
 
 """
-LLM Client v7 — Hardened + Deterministic Routing
-Feb 18, 2026
+LLM Client v8 — Registry-Driven Intent Classification
+March 2026
 
-Major Fixes:
-- Deterministic intent routing BEFORE LLM call
-- Removed voyage_ids extraction completely
-- Strong regex for vessel_name
-- Deterministic loss-making mapping
-- Strong slot sanitization
-- Safer JSON parsing
-- No hallucinated fallback text
+Changes from v7:
+- extract_intent_slots: Intent list now includes rich descriptions from
+  INTENT_REGISTRY so the LLM can distinguish entity-anchored vs fleet-wide intents.
+- _sanitize_slots: Added semantic vessel_name guard — rejects query-phrase
+  fragments captured as vessel names (data-driven, not hardcoded patterns).
 """
 
 from __future__ import annotations
@@ -117,6 +114,23 @@ class LLMClient:
         if "top" in t and "voyage" in t:
             return "ranking.voyages"
 
+        # 8) Fleet-wide port ranking — catch ALL variants before LLM sees them
+        _port_fleet_signals = (
+            "most visit", "most common", "most frequent",
+            "commonly visit", "frequently visit",
+            "busiest port", "popular port",
+            "which port", "top port",
+        )
+        if "port" in t and any(k in t for k in _port_fleet_signals):
+            return "ranking.ports"
+        # Broader catch: any combo of (most/common/frequent/busiest) + (visit*) + port
+        if "port" in t and "most" in t and any(k in t for k in ("visit", "common", "frequent", "busy")):
+            return "ranking.ports"
+
+        # 9) Voyage count per vessel (how many voyages does each/per vessel)
+        if "voyage" in t and any(k in t for k in ("each vessel", "per vessel", "how many voyage", "number of voyage", "vessel have", "vessels have")):
+            return "aggregation.count"
+
         return None
 
     # =========================================================
@@ -134,10 +148,10 @@ class LLMClient:
         # Normalize common apostrophe variants (incl. mojibake) to improve regex reliability.
         text_norm = (text or "")
         text_norm = (
-            text_norm.replace("’", "'")
-            .replace("‘", "'")
-            .replace("â€™", "'")
-            .replace("â€˜", "'")
+            text_norm.replace("\u2019", "'")
+            .replace("\u2018", "'")
+            .replace("\u00e2\u20ac\u2122", "'")
+            .replace("\u00e2\u20ac\u02dc", "'")
         )
 
         # 1️⃣ Deterministic override
@@ -157,12 +171,6 @@ class LLMClient:
             slots["imo"] = imo_match.group(1).strip()
 
         # Vessel extraction (safer)
-        #
-        # Common failure modes we must avoid:
-        # - "How has vessel Stena Superior been performing recently?"  -> capture "Stena Superior" (NOT trailing words)
-        # - "Stena Superior’s last 3 voyages"                          -> capture "Stena Superior" (handle ’s / 's)
-        #
-        # Use a bounded, lookahead-terminated match after the word "vessel"/"ship".
         vessel_match = re.search(
             r"(?:vessel|ship)\s+"
             r"("
@@ -178,17 +186,12 @@ class LLMClient:
 
         if vessel_match:
             cand = vessel_match.group(1).strip()
-            cand = re.sub(r"(?:’s|'s)\s*$", "", cand).strip()
+            cand = re.sub(r"(?:'s|'s)\s*$", "", cand).strip()
             slots["vessel_name"] = cand
         else:
-            # Beginner phrasing often omits the word "vessel", e.g.
-            # "How has Stena Superior been performing recently?"
-            # "Give me a quick overview of Stena Superior: last/best/worst voyage"
             phr_patterns = [
                 r"(?:how\s+has|how\s+is)\s+([A-Za-z0-9][A-Za-z0-9\- ]{2,60}?)\s+been\b",
-                # Possessive form: "Stena Superior’s last 3 voyages" / "Stena Superior's last 3 voyages"
-                r"\bof\s+([A-Za-z0-9][A-Za-z0-9\- ]{2,60}?)(?:’s|'s)\b",
-                # "Is Stena Superior doing well/poorly ..."
+                r"\bof\s+([A-Za-z0-9][A-Za-z0-9\- ]{2,60}?)(?:'s|'s)\b",
                 r"\bis\s+(?:vessel\s+)?([A-Za-z0-9][A-Za-z0-9\- ]{2,60}?)(?=\s+(?:doing|performing|good|bad)\b)",
                 r"(?:quick\s+overview\s+of|overview\s+of)\s+([A-Za-z0-9][A-Za-z0-9\- ]{2,60}?)(?:[:?]|$)",
                 r"(?:tell\s+me\s+about|give\s+me\s+details\s+about)\s+([A-Za-z0-9][A-Za-z0-9\- ]{2,60}?)(?:[?.!]|$)",
@@ -196,8 +199,8 @@ class LLMClient:
             for pat in phr_patterns:
                 m = re.search(pat, text_norm, re.IGNORECASE)
                 if m:
-                    cand = m.group(1).strip().strip("\"'“”")
-                    cand = re.sub(r"(?:’s|'s)\s*$", "", cand).strip()
+                    cand = m.group(1).strip().strip("\"'\u201c\u201d")
+                    cand = re.sub(r"(?:'s|'s)\s*$", "", cand).strip()
                     if 2 <= len(cand) <= 60:
                         slots["vessel_name"] = cand
                         break
@@ -328,22 +331,47 @@ class LLMClient:
                 "slots": self._sanitize_slots(slots),
             }
 
-        # 4️⃣ Otherwise call LLM
-        intents_formatted = "\n".join([f"- {i}" for i in supported_intents])
+        # =========================================================
+        # 4️⃣ LLM CALL — Build description-rich intent list from INTENT_REGISTRY
+        # =========================================================
+        # CHANGE 1: Import registry and inject descriptions into the prompt so
+        # the LLM can distinguish entity-anchored vs fleet-wide aggregate intents.
+        # No hardcoding — descriptions come purely from the registry.
+        # =========================================================
+        from app.registries.intent_registry import INTENT_REGISTRY
+
+        intent_lines = []
+        for i in supported_intents:
+            cfg = INTENT_REGISTRY.get(i, {})
+            desc = cfg.get("description", "")
+            required = cfg.get("required_slots", [])
+            route = cfg.get("route", "single")
+            line = f"- {i}: {desc}"
+            if required:
+                line += f" | requires slots: {required}"
+            if route == "composite":
+                line += " | FLEET-WIDE: no specific entity slot needed or expected"
+            intent_lines.append(line)
+
+        intents_formatted = "\n".join(intent_lines)
 
         system = f"""
 You are a maritime finance intent classifier.
-Return ONLY valid JSON.
+Return ONLY valid JSON with keys: intent_key, slots.
 
-SUPPORTED INTENTS:
+SUPPORTED INTENTS (read descriptions carefully before classifying):
 {intents_formatted}
 
-Rules:
-- Extract voyage_numbers (int list)
-- Extract vessel_name
-- Extract limit
-- NEVER invent fields
+CLASSIFICATION RULES:
+- If the user names a SPECIFIC vessel by name or IMO → use vessel.summary or vessel.metadata
+- If the user names a SPECIFIC voyage by number → use voyage.summary
+- If the user asks about the ENTIRE fleet with no specific entity → use ranking.*, aggregation.*, or analysis.* intents
+- Intents marked FLEET-WIDE must NEVER have vessel_name or voyage_number in slots — those fields should be absent
+- NEVER extract vessel_name from query phrases like "highest PnL", "most voyages", "best performing", "earned the most" — those are metrics, not vessel names
 - NEVER output voyage_ids
+- voyage_numbers must be int list
+- limit must be int (default 10 if user says "top N" without specifying N)
+- If no intent clearly fits → out_of_scope (use sparingly — always prefer the closest matching intent over out_of_scope)
 """
 
         result = self._call_with_retry(
@@ -424,7 +452,43 @@ Rules:
             ).strip()
             name = re.sub(r"\s{2,}", " ", name).strip()
             if 2 <= len(name) <= 60:
-                clean["vessel_name"] = name
+                # =========================================================
+                # CHANGE 2: Registry-driven semantic guard for vessel_name.
+                # Rejects names that are clearly metric/query phrases, not
+                # real vessel names. Driven by INTENT_REGISTRY allowed_slots —
+                # if the active intent doesn't expect vessel_name, this acts as
+                # a last-resort safety net. No hardcoded phrase lists.
+                # =========================================================
+                name_lower = name.lower()
+                # Pull all slot keys that ranking/aggregation/fleet-wide intents
+                # declare as their metrics — anything matching those patterns
+                # in a vessel_name value means it was mis-extracted.
+                from app.registries.intent_registry import INTENT_REGISTRY
+                fleet_intents_with_metric = [
+                    cfg for cfg in INTENT_REGISTRY.values()
+                    if cfg.get("route") == "composite"
+                    and "metric" in cfg.get("optional_slots", [])
+                ]
+                # Build a set of common metric-related terms from all optional_slot
+                # keys across fleet-wide intents (e.g. "metric", "group_by", "filter")
+                fleet_slot_keys = set()
+                for cfg in fleet_intents_with_metric:
+                    fleet_slot_keys.update(cfg.get("optional_slots", []))
+
+                # If the vessel_name value contains words that are metric slot
+                # keys or common aggregation phrasing, reject it.
+                # This is data-driven: as you add more optional_slot keys to
+                # fleet-wide intents in the registry, they're automatically covered.
+                aggregation_terms = fleet_slot_keys | {
+                    "most", "highest", "lowest", "best", "worst",
+                    "average", "total", "count", "number of",
+                    "frequent", "common", "active", "profitable",
+                    "earning", "earned", "performing", "ranked",
+                }
+                if any(term in name_lower for term in aggregation_terms):
+                    pass  # drop — this is a metric phrase, not a vessel name
+                else:
+                    clean["vessel_name"] = name
 
         # imo
         if "imo" in slots:
@@ -521,12 +585,10 @@ Rules:
             intent_key = str(plan.get("intent_key") or "").strip()
 
         # Graceful handling for out-of-scope / chit-chat queries.
-        # Avoid emitting empty finance/ops tables that look like hallucination.
         if intent_key == "out_of_scope":
             q = (question or "").strip()
             q_lower = q.lower()
 
-            # Friendly greeting / onboarding (no DB needed).
             greeting_exact = {
                 "hi", "hello", "hey", "hiya", "yo",
                 "good morning", "good afternoon", "good evening",
@@ -535,7 +597,7 @@ Rules:
             if q_lower in greeting_exact or any(q_lower.startswith(p) for p in ("hi ", "hello ", "hey ")):
                 return (
                     "### Hello\n"
-                    "- I’m **Digital Sales Agent**, your maritime finance + operations analytics assistant.\n"
+                    "- I'm **Digital Sales Agent**, your maritime finance + operations analytics assistant.\n"
                     "- I can help you analyze **voyages, vessels, ports, cargo grades, delays/offhire, remarks**, and related **financial KPIs** (PnL, revenue, expense, TCE, commissions).\n\n"
                     "### Try asking\n"
                     "- \"For voyage 1901, summarize financials, key ports, cargo grades, and remarks\"\n"
@@ -545,21 +607,15 @@ Rules:
                 )
 
             identity_phrases = (
-                "who are you",
-                "who r you",
-                "who are u",
-                "who r u",
-                "what are you",
-                "what are u",
-                "what can you do",
-                "what can u do",
-                "what do you do",
-                "what do u do",
+                "who are you", "who r you", "who are u", "who r u",
+                "what are you", "what are u",
+                "what can you do", "what can u do",
+                "what do you do", "what do u do",
             )
             if any(p in q_lower for p in identity_phrases):
                 return (
                     "### About Digital Sales Agent\n"
-                    "- I’m **Digital Sales Agent**, a maritime analytics assistant focused on **voyage finance + operations**.\n"
+                    "- I'm **Digital Sales Agent**, a maritime analytics assistant focused on **voyage finance + operations**.\n"
                     "- I can answer questions about **PnL, revenue, expenses, TCE, commissions**, plus **ports/routes, cargo grades, delays/offhire, and voyage remarks**.\n\n"
                     "### Try asking\n"
                     "- \"For voyage 1901, summarize financials, key ports, cargo grades, and remarks\"\n"
@@ -570,7 +626,7 @@ Rules:
             if any(k in q_lower for k in ["weather", "temperature", "rain", "forecast", "climate"]):
                 return (
                     "### Summary\n"
-                    "- I can’t provide live weather/forecast data from this system.\n"
+                    "- I can't provide live weather/forecast data from this system.\n"
                     "- If you want, tell me the **location and date/time**, and I can help you interpret weather impacts on voyages (delays, routing) using your operational/remark data.\n\n"
                     "### What I can help with here\n"
                     "- Voyage / vessel performance (P&L, costs, TCE, commission)\n"
@@ -615,7 +671,7 @@ HARD RULES:
 - Keep lists short and scannable. Never dump huge raw lists.
 - Never repeat the same '###' heading more than once.
 - You will receive style flags in data.style. Follow them strictly.
-- Do NOT omit rows or metrics for brevity. Include all available data for every voyage/row in the result set. Do not add notes like "other voyages/vessels available in original data but not included here for brevity"—show full metrics for every row (e.g. if there are 3 voyages, show Revenue/PnL/Total commission etc. for all 3).
+- Do NOT omit rows or metrics for brevity. Include all available data for every voyage/row in the result set.
 
 DATA PRIORITY:
 - If data.artifacts.merged_rows exists, it is the PRIMARY joined dataset (one item per voyage).
@@ -623,12 +679,11 @@ DATA PRIORITY:
 - In merged_rows, KPIs may appear at the TOP LEVEL (pnl, revenue, total_expense, tce, total_commission) even if finance.rows is empty.
 - In merged_rows, ops enrichment may appear as cargo_grades, key_ports, and remarks (even if ops.rows is empty).
 - When grades/ports/remarks exist in the JSON, include them. Do NOT claim they are unavailable.
-- If data.artifacts.coverage is present, use it to avoid false "Not available" claims (e.g., if cargo_grades_available>0 then cargo grades are available for at least some voyages).
-- For ranking.* intents: each item in merged_rows HAS pnl, revenue, total_expense (and often tce, total_commission) at the top level. You MUST include PnL and Revenue (and Total expense when present) as columns in the Results table. Do NOT say "financial metrics are not available" when merged_rows exist and contain these fields.
+- If data.artifacts.coverage is present, use it to avoid false "Not available" claims.
+- For ranking.* intents: each item in merged_rows HAS pnl, revenue, total_expense at the top level. You MUST include PnL and Revenue (and Total expense when present) as columns in the Results table.
 
 STYLE / STRUCTURE (always follow):
 - Start with a 2–4 bullet **Summary** of the key result.
-- Do NOT create table rows for metrics that are not present in the JSON. Prefer omitting them over showing "Not available" repeatedly.
 - Use '-' for bullet points (not '*').
 - Use sections with '###' headings only.
 - Prefer tables for numeric KPIs; include currency formatting for USD amounts.
@@ -673,10 +728,10 @@ IMPORTANT: Tailor the emphasis to the user's wording.
 - <bullet 2>
 
 2) ranking.* (multiple voyages):
-- CRITICAL: merged_rows for ranking ALWAYS contain pnl, revenue, total_expense at the top level. Include PnL and Revenue (and Total expense, TCE, Total commission when present) as columns in the Results table. Do NOT state that financial metrics are not available.
-- Include ALL rows in the result set: do not show financials for only the first voyage and omit the rest "for brevity". Show Revenue, Total expense, PnL, TCE, Total commission (and any other requested metrics) for every voyage in the table.
-- When merged_rows contain offhire_days: include **Offhire days** as a column (and **Delay reason** when present) so the ranking by offhire is visible.
-- When the question asks for "most port calls" or merged_rows contain port_calls: include **Port calls** as a column so the ranking by port calls is visible.
+- CRITICAL: merged_rows for ranking ALWAYS contain pnl, revenue, total_expense at the top level. Include PnL and Revenue (and Total expense, TCE, Total commission when present) as columns in the Results table.
+- Include ALL rows in the result set.
+- When merged_rows contain offhire_days: include **Offhire days** as a column.
+- When the question asks for "most port calls" or merged_rows contain port_calls: include **Port calls** as a column.
 ### Summary
 - **Ranking**: what is being ranked and limit
 - **Top result**: voyage_number + key metric value (e.g. PnL)
@@ -684,7 +739,7 @@ IMPORTANT: Tailor the emphasis to the user's wording.
 ### Results
 | Voyage # | PnL | Revenue | Total expense | Total commission | Key ports | Cargo grades | Remarks |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-(Only include columns that exist in the JSON and are relevant to the question. For ranking by profitability, PnL and Revenue MUST be included. For offhire ranking, include Offhire days. For "most port calls", include Port calls.)
+(Only include columns that exist in the JSON and are relevant to the question.)
 
 2b) ranking.vessels (vessels with voyage count + profitability + cargo grades):
 - When merged_rows contain vessel_imo, vessel_name, voyage_count, avg_pnl, cargo_grades (no voyage_id), show a **vessel-level** table.
@@ -697,22 +752,21 @@ IMPORTANT: Tailor the emphasis to the user's wording.
 | --- | --- | --- | --- | --- |
 - List the most common cargo grades per vessel from the cargo_grades array in each row.
 
-3) analysis.* (aggregates):
+3) analysis.* and aggregation.* (fleet-wide aggregates):
 ### Summary
 - **What was grouped by** and **what metric**
 
 ### Results
-Use a compact table. If a metric is missing for a group, show "Not available" and (optionally) include counts like "available/total" when present in JSON.
+Use a compact table. If a metric is missing for a group, show "Not available".
 
 FAILSAFE:
 - ONLY if the provided JSON is completely empty (no rows anywhere) then output exactly: "Not available in dataset."
 
 4) vessel.summary (single vessel / overview):
-- Write a short narrative briefing (2–5 sentences) describing what we know about the vessel's voyage performance (range/volatility, best/worst, recency).
-- If the question asks about "recently", include a **Recent voyages** table with the latest 3 voyages by end date (if end date exists).
+- Write a short narrative briefing (2–5 sentences) describing what we know about the vessel's voyage performance.
+- If the question asks about "recently", include a **Recent voyages** table with the latest 3 voyages by end date.
 - If the question asks "good or bad" or "best/worst", include **Best voyage** and **Worst voyage** (by PnL) as a compact 2–3 row table.
-- Then (optionally) include one compact table combining recent + best + worst. Avoid dumping all voyages.
-- If ports/grades/remarks are present in ops rows (ports_json/grades_json/remarks_json), include these sections:
+- If ports/grades/remarks are present in ops rows, include:
   - ### Frequent ports: up to 8 ports (add "(+N more)" if needed)
   - ### Common cargo grades: up to 8 grades (add "(+N more)" if needed)
   - ### Recent remarks: up to 3 short bullets; ignore empty/null remarks
@@ -728,7 +782,7 @@ FAILSAFE:
                     "intent_key": intent_key,
                     "data": {**(merged_safe if isinstance(merged_safe, dict) else {}), "style": style},
                     "merged_rows": merged_rows,
-                    **({"instruction": ranking_hint} if ranking_hint else {}),
+                    **({("instruction"): ranking_hint} if ranking_hint else {}),
                 }
             ),
             operation="answer_generation",
@@ -764,44 +818,34 @@ FAILSAFE:
         style: Dict[str, Any],
         draft: str,
     ) -> str:
-        """
-        Second-pass "editor" rewrite for question-driven narrative quality.
-        Uses ONLY the provided JSON + the draft answer (no new facts).
-        """
         text = (draft or "").strip()
         if not text:
             return ""
 
-        # Gate: polish where narrative quality matters most (keeps latency/cost down).
-        should_polish = False
-        if intent_key in ("voyage.summary", "vessel.summary"):
-            should_polish = True
-        if style.get("narrative_summary") is True:
-            should_polish = True
+        # Always polish — every response must be question-driven, not template-driven
+        should_polish = True
 
-        if not should_polish:
-            return text
-
-        system = """
-You are an expert editor for a maritime analytics chatbot.
-Rewrite the DRAFT answer into a final answer that is question-driven and natural (ChatGPT-style),
-while staying 100% faithful to the provided JSON data.
-
-HARD RULES:
-- Use ONLY the provided JSON data. Do NOT invent or assume anything.
-- You MAY rephrase, reorder, and summarize, but you MUST NOT introduce new numbers, ports, grades, dates, or remarks.
-- If the draft contains something that is not supported by JSON, remove it.
-- Do not repeat sections. Never repeat the same '###' heading more than once.
-- Keep it clean and readable. Avoid overly generic filler.
-
-OUTPUT STYLE:
-- Use '###' headings only.
-- Use '-' bullets (not '*').
-- Prefer narrative explanation FIRST when the question asks "what happened", "summarize", "explain", "root cause".
-- Include tables ONLY if the question explicitly asks for a "financial summary" / metrics or comparisons; otherwise keep tables minimal.
-- If you include a table, include ALL rows (every voyage/vessel in the result set); do not omit rows for brevity. Include all requested metrics for each row.
-- Cap long lists (ports/grades/remarks) and add '(+N more)' when needed.
-"""
+        system = (
+            "You are a senior maritime analyst writing professional answers for a shipping analytics platform.\n"
+            "\n"
+            "YOUR ONLY JOB: Read the user question carefully and answer EXACTLY what was asked — nothing more, nothing less.\n"
+            "Do NOT produce a generic template. Do NOT add sections the user did not ask for.\n"
+            "\n"
+            "UNIVERSAL RULES:\n"
+            "- Structure your answer around the user question, not around a fixed template.\n"
+            "- If they asked for a summary → write 2-4 narrative sentences first, then support with data.\n"
+            "- If they asked for a ranking → lead with the ranked table, add 1-2 sentence insight after.\n"
+            "- If they asked for remarks or delays → quote the actual remarks and explain what they mean.\n"
+            "- If they asked for ports → list them with context (load/discharge), not a raw comma dump.\n"
+            "- If they asked a yes/no or count question → answer it directly in the first sentence.\n"
+            "- Blend narrative and tables — do not dump raw data without context.\n"
+            "- Use ONLY the provided JSON. Never invent numbers, ports, remarks, or vessel names.\n"
+            "- If a value is missing in JSON, say Not available — never assume or default to 0.\n"
+            "- Keep the response concise but complete. No filler. No repetition.\n"
+            "- REMARKS RULE: Never quote full contract text or long raw remarks verbatim. Summarize each remark in 1 short sentence max. Cap at 3 remarks.\n"
+            "- TABLE RULE: Never put a conclusion sentence as a row inside a markdown table. Conclusions go BELOW the table as plain text.\n"
+            "- VESSEL RULE: Always show vessel name clearly, not a raw database ID or UUID.\n"
+        )
 
         user = {
             "question": question,
@@ -833,6 +877,15 @@ OUTPUT STYLE:
             "what went wrong",
             "root cause",
             "brief me",
+            "give me",
+            "executive summary",
+            "explain",
+            "explaining",
+            "walk me through",
+            "overview of",
+            "what are the",
+            "what were",
+            "generate",
         )
         narrative_summary = any(t in ql for t in narrative_triggers)
 
@@ -879,7 +932,7 @@ OUTPUT STYLE:
 
         # Drop repeated sections entirely (another common glitch)
         out: List[str] = []
-        seen_headings: set[str] = set()
+        seen_headings: set = set()
         i = 0
         while i < len(dedup):
             line = dedup[i]
@@ -896,11 +949,65 @@ OUTPUT STYLE:
 
         s = "\n".join(out).strip()
 
-        # Ensure voyage.summary "what happened" queries don't look identical to KPI-first queries.
         if intent_key == "voyage.summary" and style.get("narrative_summary") is True:
             s = self._ensure_voyage_narrative_summary(s, merged_safe=merged_safe)
         if intent_key == "voyage.summary":
             s = self._ensure_voyage_identity_line(s, merged_safe=merged_safe)
+
+
+        # Eject sentence-rows from markdown tables (LLM glitch: puts conclusions inside table)
+        def _is_sentence_cell(cell: str) -> bool:
+            c = cell.strip()
+            return len(c) > 40 and (' ' in c) and not c.replace('.','').replace(',','').replace('$','').replace('-','').replace('%','').replace('(','').replace(')','').replace(' ','').isalnum() == False and any(w in c.lower() for w in ['this ', 'the ', 'had ', 'has ', 'was ', 'were ', 'with ', 'among ', 'highest', 'lowest', 'most ', 'voyage '])
+        table_lines = s.splitlines()
+        result_lines = []
+        ejected = []
+        in_table = False
+        for tl in table_lines:
+            stripped = tl.strip()
+            if stripped.startswith('|') and stripped.endswith('|'):
+                in_table = True
+                parts = [p.strip() for p in stripped.strip('|').split('|')]
+                if parts and _is_sentence_cell(parts[0]) and all(not p.strip() for p in parts[1:]):
+                    ejected.append('> ' + parts[0].strip())
+                    continue
+            else:
+                if in_table and ejected:
+                    result_lines.extend(ejected)
+                    result_lines.append('')
+                    ejected = []
+                in_table = False
+            result_lines.append(tl)
+        if ejected:
+            result_lines.extend(ejected)
+        s = '\n'.join(result_lines).strip()
+
+
+        # ── Eject conclusion sentences out of table rows ──
+        _result, _ejected = [], []
+        for _tl in s.splitlines():
+            _stripped = _tl.strip()
+            if _stripped.startswith('|') and _stripped.endswith('|'):
+                _cells = [_c.strip() for _c in _stripped.strip('|').split('|')]
+                _first = _cells[0] if _cells else ''
+                _rest_empty = all(not _c for _c in _cells[1:])
+                _looks_sentence = len(_first) > 25 and ' ' in _first and not _first.startswith('$') and not re.match(r'^[\d,\.\-\$\%\|]+$', _first)
+                if _looks_sentence and _rest_empty:
+                    _ejected.append(_first)
+                    continue
+            else:
+                if _ejected:
+                    _result.append('')
+                    for _e in _ejected:
+                        _result.append('_' + _e + '_')
+                    _result.append('')
+                    _ejected = []
+            _result.append(_tl)
+        if _ejected:
+            _result.append('')
+            for _e in _ejected:
+                _result.append('_' + _e + '_')
+        s = '\n'.join(_result).strip()
 
         return s.strip()
 
@@ -915,7 +1022,6 @@ OUTPUT STYLE:
         while j < len(lines) and not lines[j].strip():
             j += 1
 
-        # If the Summary starts immediately with KPI/template bullets, inject a short narrative bullet.
         if j < len(lines) and lines[j].lstrip().startswith("- **"):
             hint = self._build_voyage_narrative_hint(merged_safe)
             if hint:
@@ -971,8 +1077,7 @@ OUTPUT STYLE:
             s = s[:-2]
         return s
 
-    def _extract_voyage_identity(self, merged_safe: Dict[str, Any]) -> tuple[str, str]:
-        # Prefer finance row, then ops row, then mongo row.
+    def _extract_voyage_identity(self, merged_safe: Dict[str, Any]) -> tuple:
         fin = merged_safe.get("finance")
         if isinstance(fin, dict) and isinstance(fin.get("rows"), list) and fin.get("rows"):
             r0 = fin["rows"][0]
@@ -1055,7 +1160,6 @@ OUTPUT STYLE:
         max_retries: int = 3,
         return_string: bool = False,
     ):
-
         for _ in range(max_retries):
             try:
                 raw = self._groq_chat(system=system, user=user)
@@ -1064,8 +1168,6 @@ OUTPUT STYLE:
                     return raw
 
                 cleaned = raw.strip()
-
-                # Remove code fences
                 cleaned = re.sub(r"^```.*?\n", "", cleaned)
                 cleaned = cleaned.replace("```", "")
 
@@ -1081,10 +1183,6 @@ OUTPUT STYLE:
     # =========================================================
 
     def _safe_json_load(self, raw: str, fallback: Any):
-        """
-        Parse JSON from a model response safely.
-        Removes code fences and returns fallback on any error.
-        """
         try:
             cleaned = (raw or "").strip()
             cleaned = re.sub(r"^```.*?\n", "", cleaned)
@@ -1098,7 +1196,6 @@ OUTPUT STYLE:
             return merged
 
         import copy
-
         out = copy.deepcopy(merged)
 
         def cap_rows(section_key: str):
@@ -1110,7 +1207,6 @@ OUTPUT STYLE:
         cap_rows("ops")
         cap_rows("mongo")
 
-        # Cap nested payloads to avoid token blowups
         def _cap_list(v, n: int):
             return v[:n] if isinstance(v, list) else v
 
@@ -1119,7 +1215,6 @@ OUTPUT STYLE:
                 return v[:n] + "…"
             return v
 
-        # Ops rows can contain large json arrays
         ops = out.get("ops")
         if isinstance(ops, dict) and isinstance(ops.get("rows"), list):
             for r in ops["rows"]:
@@ -1139,20 +1234,19 @@ OUTPUT STYLE:
                 mr["cargo_grades"] = _cap_list(mr.get("cargo_grades"), 10)
                 mr["commissions"] = _cap_list(mr.get("commissions"), 10)
 
-                # Remarks can be huge; keep first few and shorten long text
                 rem = mr.get("remarks")
                 if isinstance(rem, list):
-                    rem = rem[:5]
+                    rem = rem[:3]
                     cleaned = []
                     for x in rem:
                         if isinstance(x, dict):
                             cleaned.append({
-                                "remark": _cap_str(x.get("remark"), 300),
+                                "remark": _cap_str(x.get("remark"), 80),
                                 "modifiedDate": x.get("modifiedDate"),
                                 "modifiedByFull": x.get("modifiedByFull"),
                             })
                         else:
-                            cleaned.append(_cap_str(str(x), 300))
+                            cleaned.append(_cap_str(str(x), 80))
                     mr["remarks"] = cleaned
                 elif isinstance(rem, str):
                     mr["remarks"] = _cap_str(rem, 300)
