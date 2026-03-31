@@ -5,6 +5,7 @@ ANY/list params, IN→ANY rewrite, JSONB, ORDER BY cleanup, LIMIT enforcement.
 
 from __future__ import annotations
 import ast
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -14,6 +15,8 @@ from app.sql.sql_allowlist import (
     DEFAULT_ALLOWLIST,
     is_table_allowed,
 )
+
+DEFAULT_ENFORCED_LIMIT = int(os.getenv("SQL_GUARD_DEFAULT_LIMIT", "50"))
 
 # =========================================================
 # RESULT MODEL
@@ -225,7 +228,16 @@ def validate_and_prepare_sql(
             if tname not in cte_names:
                 tables.add(tname)
 
+        JSONB_FUNCTIONS = {
+            "jsonb_array_elements_text",
+            "jsonb_array_elements",
+            "jsonb_each",
+            "jsonb_each_text",
+            "jsonb_object_keys",
+        }
         for t in tables:
+            if t in JSONB_FUNCTIONS:
+                continue
             if not is_table_allowed(t, allowlist):
                 return ValidationResult(
                     ok=False,
@@ -273,7 +285,12 @@ def validate_and_prepare_sql(
                 if not parts:
                     continue  # prevents crash
 
-                col_name = parts[-1].split(".")[-1].lower()
+                # Check source column, not alias
+                # e.g. 'port_text AS port_name' → check 'port_text', not 'port_name'
+                if len(parts) >= 3 and parts[-2].lower() == "as":
+                    col_name = parts[0].split(".")[-1].lower()
+                else:
+                    col_name = parts[-1].split(".")[-1].lower()
 
                 if col_name in _INVALID_COLUMNS:
                     return ValidationResult(
@@ -287,8 +304,14 @@ def validate_and_prepare_sql(
         # Block forbidden patterns
         # ---------------------------------------------
 
+        # A single trailing semicolon is harmless; remove it before pattern checks
+        # to avoid false positives from broad ";.*$" rules.
+        sql_for_pattern_check = sql.rstrip()
+        if sql_for_pattern_check.endswith(";"):
+            sql_for_pattern_check = sql_for_pattern_check[:-1]
+
         for pattern in allowlist.forbidden_patterns:
-            if re.search(pattern, sql, flags=re.IGNORECASE):
+            if re.search(pattern, sql_for_pattern_check, flags=re.IGNORECASE):
                 return ValidationResult(
                     ok=False,
                     sql=sql,
@@ -302,7 +325,7 @@ def validate_and_prepare_sql(
 
         if enforce_limit:
             if not re.search(r"\blimit\s+(\d+|%\(\w+\)s|\$\d+)", sql.lower()):
-                sql = sql.rstrip().rstrip(";") + "\nLIMIT 50"
+                sql = sql.rstrip().rstrip(";") + f"\nLIMIT {DEFAULT_ENFORCED_LIMIT}"
 
         # ---------------------------------------------
         # Remove unused params

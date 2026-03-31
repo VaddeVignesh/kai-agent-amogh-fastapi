@@ -1,0 +1,220 @@
+{
+  "meta": {
+    "name": "kai-demo-validation-pack",
+    "version": "1.0",
+    "target_score": 80,
+    "dataset_tag": "demo_baseline_2026-03-27",
+    "notes": "3 simple + 3 medium + 9 complex benchmark queries for factual/relevance validation."
+  },
+  "queries": [
+    {
+      "id": "Q01",
+      "set": "voyage_ops_finance",
+      "difficulty": "simple",
+      "intent_family": "voyage.summary",
+      "require_dynamic_sql": false,
+      "query": "For voyage 2306, give financial snapshot (revenue, total expense, PnL proxy), cargo grade, fixture ports, and key remarks.",
+      "gold_answer_sample": "Voyage 2306 (Stena Imperial) shows revenue around 839,948.97, expense around 2,121.13, with Naphtha and ports Bilbao/Antwerp plus remarks about waiting for charterers' orders and extra bunker usage.",
+      "required_terms": ["2306"],
+      "any_of_terms": ["stena imperial", "bilbao", "antwerp", "naphtha", "waiting for charterers orders"],
+      "forbidden_terms": ["outside the supported dataset", "out_of_scope"],
+      "numeric_targets": [
+        { "label": "revenue", "value": 839948.97, "tolerance_pct": 0.03 },
+        { "label": "total_expense", "value": 2121.13, "tolerance_pct": 0.08 }
+      ]
+    },
+    {
+      "id": "Q02",
+      "set": "vessel_metadata",
+      "difficulty": "simple",
+      "intent_family": "ranking.vessels",
+      "require_dynamic_sql": false,
+      "query": "Among Elka Delphi, Torm Thor, Dee4 Juniper, Nord Himalaya, and Pacific Moonstone, rank by hire rate and identify highest and lowest.",
+      "gold_answer_sample": "Nord Himalaya should be highest hire rate and Torm Thor should be lowest.",
+      "required_terms": ["nord himalaya", "torm thor"],
+      "any_of_terms": ["hire rate", "highest", "lowest", "rank"],
+      "forbidden_terms": ["outside the supported dataset", "out_of_scope"],
+      "numeric_targets": [
+        { "label": "highest_hire", "value": 33000.0, "tolerance_pct": 0.01 },
+        { "label": "lowest_hire", "value": 14888.0, "tolerance_pct": 0.01 }
+      ]
+    },
+    {
+      "id": "Q03",
+      "set": "vessel_metadata",
+      "difficulty": "simple",
+      "intent_family": "vessel.metadata",
+      "require_dynamic_sql": false,
+      "query": "For Elka Delphi, list default ballast and laden speed/IFO, plus current contract owner and duration.",
+      "gold_answer_sample": "Elka Delphi default ballast: 13 kn / 22.5 IFO; laden: 13 kn / 25 IFO; owner European Pro for 6 months.",
+      "required_terms": ["elka delphi"],
+      "any_of_terms": ["ballast", "laden", "22.5", "25", "european pro", "6"],
+      "forbidden_terms": ["outside the supported dataset", "out_of_scope"],
+      "numeric_targets": [
+        { "label": "ballast_speed", "value": 13.0, "tolerance_pct": 0.01 },
+        { "label": "laden_speed", "value": 13.0, "tolerance_pct": 0.01 }
+      ]
+    },
+    {
+      "id": "Q04",
+      "set": "vessel_metadata",
+      "difficulty": "medium",
+      "intent_family": "vessel.metadata",
+      "require_dynamic_sql": false,
+      "query": "For Torm Thor, check scrubber consistency across fields and tags. Report if there is contradiction.",
+      "gold_answer_sample": "Top-level scrubber is 'No' but tag says 'Scrubber', so this should be reported as inconsistency.",
+      "required_terms": ["torm thor"],
+      "any_of_terms": ["scrubber", "inconsisten", "mismatch", "contradiction"],
+      "forbidden_terms": ["outside the supported dataset", "out_of_scope"],
+      "numeric_targets": []
+    },
+    {
+      "id": "Q05",
+      "set": "vessel_metadata",
+      "difficulty": "medium",
+      "intent_family": "analysis.scenario_comparison",
+      "require_dynamic_sql": false,
+      "query": "Compare Elka Delphi vs Nord Himalaya default laden fuel intensity (IFO per knot) and say which is more efficient.",
+      "gold_answer_sample": "Nord Himalaya should be more efficient on laden IFO-per-knot than Elka Delphi.",
+      "required_terms": ["elka delphi", "nord himalaya"],
+      "any_of_terms": ["efficient", "ifo per", "laden", "fuel intensity"],
+      "forbidden_terms": ["outside the supported dataset", "out_of_scope"],
+      "numeric_targets": [
+        { "label": "elka_laden_intensity", "value": 1.923, "tolerance_pct": 0.05 },
+        { "label": "nord_laden_intensity", "value": 1.854, "tolerance_pct": 0.05 }
+      ]
+    },
+    {
+      "id": "Q06",
+      "set": "voyage_ops_finance",
+      "difficulty": "medium",
+      "intent_family": "voyage.summary",
+      "require_dynamic_sql": false,
+      "query": "For voyage 2306, provide an incident-style summary: likely causes, demurrage impact, and commercial adjustments from remarks.",
+      "gold_answer_sample": "Should mention waiting orders, extra bunker use, demurrage amount and net adjustment signals.",
+      "required_terms": ["2306"],
+      "any_of_terms": ["demurrage", "waiting", "bunker", "adjustment", "remarks"],
+      "forbidden_terms": ["outside the supported dataset", "out_of_scope"],
+      "numeric_targets": [
+        { "label": "demurrage", "value": 185191.67, "tolerance_pct": 0.03 }
+      ]
+    },
+    {
+      "id": "Q07",
+      "set": "single_composite_mix",
+      "difficulty": "complex",
+      "intent_family": "voyage.summary",
+      "require_dynamic_sql": false,
+      "query": "For voyage 1901 on Stena Conquest, give me the financial summary (revenue, expenses, PnL, TCE), main ports and cargo grades, and any remarks on record.",
+      "gold_answer_sample": "Should include both finance + ops fields for voyage 1901 and avoid ambiguity if multiple vessel mapping exists.",
+      "required_terms": ["1901"],
+      "any_of_terms": ["revenue", "expense", "pnl", "tce", "ports", "cargo", "remarks"],
+      "forbidden_terms": ["outside the supported dataset", "out_of_scope", "no previous result set"],
+      "numeric_targets": []
+    },
+    {
+      "id": "Q08",
+      "set": "ranking_analytics",
+      "difficulty": "complex",
+      "intent_family": "ranking.voyages",
+      "require_dynamic_sql": true,
+      "query": "Show me the top 5 most profitable voyages with PnL, revenue, margin %, vessel name, cargo grade, and key ports.",
+      "gold_answer_sample": "Should return a ranked top-5 style result with finance and ops context.",
+      "required_terms": ["top", "5"],
+      "any_of_terms": ["pnl", "revenue", "margin", "vessel", "cargo", "port"],
+      "forbidden_terms": ["outside the supported dataset", "out_of_scope", "not available in dataset"],
+      "numeric_targets": []
+    },
+    {
+      "id": "Q09",
+      "set": "ranking_analytics",
+      "difficulty": "complex",
+      "intent_family": "analysis.segment_performance",
+      "require_dynamic_sql": true,
+      "query": "Which voyages had high revenue but low or negative PnL? Show revenue, total expense, PnL, and expense-to-revenue ratio. Include remarks where recorded.",
+      "gold_answer_sample": "Should identify mismatch cases with ratio insight and remarks coverage.",
+      "required_terms": ["revenue", "pnl"],
+      "any_of_terms": ["negative", "ratio", "expense", "remarks"],
+      "forbidden_terms": ["outside the supported dataset", "out_of_scope", "no previous result set"],
+      "numeric_targets": []
+    },
+    {
+      "id": "Q10",
+      "set": "ranking_analytics",
+      "difficulty": "complex",
+      "intent_family": "vessel.summary",
+      "require_dynamic_sql": true,
+      "query": "For vessel Stena Conquest, show voyage-by-voyage PnL trend and its top 5 most visited ports.",
+      "gold_answer_sample": "Should include vessel-specific voyage trend plus port frequency summary.",
+      "required_terms": ["stena conquest"],
+      "any_of_terms": ["trend", "voyage", "pnl", "ports", "top 5"],
+      "forbidden_terms": ["outside the supported dataset", "out_of_scope", "no previous result set"],
+      "numeric_targets": []
+    },
+    {
+      "id": "Q11",
+      "set": "scenario_compare",
+      "difficulty": "complex",
+      "intent_family": "analysis.scenario_comparison",
+      "require_dynamic_sql": true,
+      "query": "Compare actual vs when-fixed results for voyages 1901, 1902, and 2301. Show PnL variance and TCE variance.",
+      "gold_answer_sample": "Should compare both scenarios for all three voyages with variance fields.",
+      "required_terms": ["1901", "1902", "2301"],
+      "any_of_terms": ["actual", "when-fixed", "variance", "pnl", "tce"],
+      "forbidden_terms": ["outside the supported dataset", "out_of_scope", "no previous result set"],
+      "numeric_targets": []
+    },
+    {
+      "id": "Q12",
+      "set": "ranking_analytics",
+      "difficulty": "complex",
+      "intent_family": "analysis.cargo_profitability",
+      "require_dynamic_sql": true,
+      "query": "Which cargo grades have the highest average PnL? For each grade show average PnL, average revenue, voyage count, and most common ports.",
+      "gold_answer_sample": "Should rank grades by avg PnL and include ports and counts without duplicate grade casing artifacts.",
+      "required_terms": ["cargo", "grade"],
+      "any_of_terms": ["average pnl", "average revenue", "voyage count", "ports"],
+      "forbidden_terms": ["outside the supported dataset", "out_of_scope", "{\"grade_name\": null"],
+      "numeric_targets": []
+    },
+    {
+      "id": "Q13",
+      "set": "ranking_analytics",
+      "difficulty": "complex",
+      "intent_family": "ranking.voyages",
+      "require_dynamic_sql": true,
+      "query": "Show the top 3 voyages by total commission with PnL, revenue, vessel name, and key ports.",
+      "gold_answer_sample": "Should return top commission voyages with finance + vessel + ports context.",
+      "required_terms": ["top", "3"],
+      "any_of_terms": ["commission", "pnl", "revenue", "vessel", "ports"],
+      "forbidden_terms": ["outside the supported dataset", "out_of_scope", "no previous result set"],
+      "numeric_targets": []
+    },
+    {
+      "id": "Q14",
+      "set": "aggregate_business",
+      "difficulty": "complex",
+      "intent_family": "aggregation.average",
+      "require_dynamic_sql": true,
+      "query": "For each module type (TC Voyage, Spot, etc), show average PnL, average revenue, voyage count, and most common cargo grade.",
+      "gold_answer_sample": "Should aggregate by module type with avg financials and dominant cargo grade.",
+      "required_terms": ["module", "type"],
+      "any_of_terms": ["average", "pnl", "revenue", "voyage count", "cargo grade"],
+      "forbidden_terms": ["outside the supported dataset", "out_of_scope"],
+      "numeric_targets": []
+    },
+    {
+      "id": "Q15",
+      "set": "aggregate_business",
+      "difficulty": "complex",
+      "intent_family": "finance.loss_due_to_delay",
+      "require_dynamic_sql": true,
+      "query": "For voyages flagged as delayed with negative PnL, show offhire days, total expense, PnL, vessel name, and remarks where recorded.",
+      "gold_answer_sample": "Should filter delayed + negative PnL and include offhire/remarks context.",
+      "required_terms": ["delayed", "negative", "pnl"],
+      "any_of_terms": ["offhire", "expense", "vessel", "remarks"],
+      "forbidden_terms": ["outside the supported dataset", "out_of_scope", "no previous result set"],
+      "numeric_targets": []
+    }
+  ]
+}

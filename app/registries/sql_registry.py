@@ -54,7 +54,7 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
                 %(vessel_imo)s IS NULL
                 OR REPLACE(f.vessel_imo::TEXT, '.0', '') = %(vessel_imo)s::TEXT
               )
-            LIMIT 10;
+            LIMIT COALESCE(%(limit)s, 10);
         """,
     ),
 
@@ -321,7 +321,7 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
                 f.pnl,
                 f.revenue,
                 f.tce,
-                jsonb_array_elements_text(o.grades_json) AS cargo_grade
+                lower(trim(jsonb_array_elements_text(o.grades_json))) AS cargo_grade
               FROM finance_voyage_kpi f
               JOIN ops_voyage_summary o
                 ON (
@@ -343,7 +343,12 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
               AVG(tce) AS avg_tce,
               AVG(revenue) AS avg_revenue
             FROM cargo_grades
-            WHERE cargo_grade IS NOT NULL AND cargo_grade != ''
+            WHERE cargo_grade IS NOT NULL
+              AND cargo_grade != ''
+              AND cargo_grade != 'none'
+              AND cargo_grade != 'null'
+              AND cargo_grade != 'n/a'
+              AND cargo_grade != 'na'
             GROUP BY cargo_grade
             HAVING COUNT(*) >= 3
             ORDER BY AVG(pnl) DESC NULLS LAST
@@ -504,24 +509,40 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
         sql="""
             WITH voyage_nums AS (
                 SELECT unnest(%(voyage_numbers)s::integer[]) AS vnum
+            ),
+            per_pair AS (
+                SELECT
+                  f.voyage_number,
+                  REPLACE(f.vessel_imo::TEXT, '.0', '') AS vessel_imo_key,
+                  MAX(f.voyage_id) AS voyage_id,
+                  MAX(CASE WHEN f.scenario = COALESCE(%(scenario_actual)s, 'ACTUAL') THEN f.pnl END) AS pnl_actual_by_pair,
+                  MAX(CASE WHEN f.scenario = 'WHEN_FIXED' THEN f.pnl END) AS pnl_when_fixed_by_pair,
+                  MAX(CASE WHEN f.scenario = COALESCE(%(scenario_actual)s, 'ACTUAL') THEN f.tce END) AS tce_actual_by_pair,
+                  MAX(CASE WHEN f.scenario = 'WHEN_FIXED' THEN f.tce END) AS tce_when_fixed_by_pair,
+                  MAX(CASE WHEN f.scenario = COALESCE(%(scenario_actual)s, 'ACTUAL') THEN f.revenue END) AS revenue_actual_by_pair,
+                  MAX(f.voyage_end_date) AS voyage_end_date
+                FROM finance_voyage_kpi f
+                INNER JOIN voyage_nums vn ON f.voyage_number = vn.vnum
+                WHERE f.scenario IN (
+                  COALESCE(%(scenario_actual)s, 'ACTUAL'),
+                  COALESCE(%(scenario_when_fixed)s, 'WHEN_FIXED')
+                )
+                GROUP BY f.voyage_number, REPLACE(f.vessel_imo::TEXT, '.0', '')
             )
             SELECT
-              f.voyage_id,
-              f.voyage_number,
-              f.vessel_imo,
-              MAX(CASE WHEN f.scenario = 'ACTUAL' THEN f.pnl END) AS pnl_actual,
-              MAX(CASE WHEN f.scenario = 'WHEN_FIXED' THEN f.pnl END) AS pnl_when_fixed,
-              (MAX(CASE WHEN f.scenario = 'WHEN_FIXED' THEN f.pnl END) - MAX(CASE WHEN f.scenario = 'ACTUAL' THEN f.pnl END)) AS pnl_variance,
-              MAX(CASE WHEN f.scenario = 'ACTUAL' THEN f.tce END) AS tce_actual,
-              MAX(CASE WHEN f.scenario = 'WHEN_FIXED' THEN f.tce END) AS tce_when_fixed,
-              (MAX(CASE WHEN f.scenario = 'WHEN_FIXED' THEN f.tce END) - MAX(CASE WHEN f.scenario = 'ACTUAL' THEN f.tce END)) AS tce_variance,
-              MAX(CASE WHEN f.scenario = 'ACTUAL' THEN f.revenue END) AS revenue_actual,
-              MAX(f.voyage_end_date) AS voyage_end_date
-            FROM finance_voyage_kpi f
-            INNER JOIN voyage_nums vn ON f.voyage_number = vn.vnum
-            WHERE f.scenario IN ('ACTUAL', 'WHEN_FIXED')
-            GROUP BY f.voyage_id, f.voyage_number, f.vessel_imo
-            ORDER BY f.voyage_number;
+              MAX(voyage_id) AS voyage_id,
+              voyage_number,
+              SUM(COALESCE(pnl_actual_by_pair, 0)) AS pnl_actual,
+              SUM(COALESCE(pnl_when_fixed_by_pair, 0)) AS pnl_when_fixed,
+              (SUM(COALESCE(pnl_when_fixed_by_pair, 0)) - SUM(COALESCE(pnl_actual_by_pair, 0))) AS pnl_variance,
+              AVG(tce_actual_by_pair) AS tce_actual,
+              AVG(tce_when_fixed_by_pair) AS tce_when_fixed,
+              (AVG(tce_when_fixed_by_pair) - AVG(tce_actual_by_pair)) AS tce_variance,
+              SUM(COALESCE(revenue_actual_by_pair, 0)) AS revenue_actual,
+              MAX(voyage_end_date) AS voyage_end_date
+            FROM per_pair
+            GROUP BY voyage_number
+            ORDER BY voyage_number;
         """,
     ),
 }

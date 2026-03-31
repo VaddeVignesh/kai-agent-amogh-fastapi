@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 import requests
  
 API_URL = os.getenv("KAI_API_URL", "http://127.0.0.1:8000/query")
+API_BASE_URL = os.getenv("KAI_API_BASE_URL", API_URL.rsplit("/", 1)[0])
+SESSION_CLEAR_URL = f"{API_BASE_URL}/session/clear"
 API_TIMEOUT_SEC = int(os.getenv("KAI_API_TIMEOUT_SEC", "300"))
  
 def call_api(query: str, session_id: str) -> Dict[str, Any]:
@@ -25,6 +27,61 @@ def call_api(query: str, session_id: str) -> Dict[str, Any]:
     r = requests.post(API_URL, json=payload, timeout=API_TIMEOUT_SEC)
     r.raise_for_status()
     return r.json()
+
+
+def clear_session_cache(session_id: str) -> Dict[str, Any]:
+    payload = {
+        "session_id": session_id,
+        "include_idem": True,
+        "include_lock": True,
+    }
+    r = requests.post(SESSION_CLEAR_URL, json=payload, timeout=API_TIMEOUT_SEC)
+    r.raise_for_status()
+    return r.json()
+
+
+def _format_sql_for_trace(sql: str) -> str:
+    """
+    Improve readability for one-line dynamic SQL in Execution Trace.
+    Keeps already multi-line SQL unchanged.
+    """
+    text = str(sql or "").strip()
+    if not text:
+        return text
+    if "\n" in text:
+        return text
+
+    # Normalize repeated whitespace first.
+    text = re.sub(r"\s+", " ", text)
+
+    # Insert line breaks before main SQL clauses.
+    clause_patterns = [
+        r"\bWITH\b",
+        r"\bSELECT\b",
+        r"\bFROM\b",
+        r"\bWHERE\b",
+        r"\bGROUP BY\b",
+        r"\bORDER BY\b",
+        r"\bHAVING\b",
+        r"\bLIMIT\b",
+        r"\bUNION ALL\b",
+        r"\bUNION\b",
+        r"\bLEFT JOIN\b",
+        r"\bRIGHT JOIN\b",
+        r"\bINNER JOIN\b",
+        r"\bFULL JOIN\b",
+        r"\bJOIN\b",
+        r"\bON\b",
+    ]
+    for pattern in clause_patterns:
+        text = re.sub(pattern, lambda m: f"\n{m.group(0)}", text, flags=re.IGNORECASE)
+
+    # Make long column lists easier to scan.
+    text = re.sub(r",\s*", ",\n    ", text)
+
+    # Cleanup accidental extra blank lines.
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
  
 APP_TITLE    = "Digital Sales Agent"
 APP_SUBTITLE = "Maritime finance + operations analytics chatbot"
@@ -510,6 +567,26 @@ def _sidebar_settings() -> UiSettings:
     st.sidebar.markdown("---")
     if st.sidebar.button("Clear backend cache", use_container_width=True):
         st.cache_resource.clear(); st.rerun()
+    if st.sidebar.button("Clear session cache (Redis)", use_container_width=True):
+        sid = str(st.session_state.get("session_id") or "")
+        if not sid:
+            st.sidebar.warning("No active session id found.")
+        else:
+            try:
+                resp = clear_session_cache(sid)
+                if resp.get("ok"):
+                    st.session_state.update(
+                        {
+                            "session_id": sid,
+                            "messages": [],
+                            "last_result": None,
+                        }
+                    )
+                    st.rerun()
+                else:
+                    st.sidebar.error(f"Session clear failed: {resp.get('reason') or 'unknown error'}")
+            except Exception as e:
+                st.sidebar.error(f"Session clear failed: {e}")
     if st.sidebar.button("New chat", use_container_width=True):
         st.session_state.update({"session_id":f"ui-{uuid.uuid4().hex[:10]}","messages":[],"last_result":None})
         st.rerun()
@@ -534,13 +611,13 @@ def _append(role: str, content: str, *, meta: Optional[Dict]=None) -> None:
     st.session_state.messages.append(msg)
  
 def _render_messages() -> None:
-    for m in st.session_state.messages:
+    for msg_idx, m in enumerate(st.session_state.messages):
         with st.chat_message(m["role"]):
             if m["role"]=="assistant" and m.get("meta"):
-                _render_trace(m["meta"])
+                _render_trace(m["meta"], trace_id=f"msg{msg_idx}")
             st.markdown(m["content"])
  
-def _render_trace(result: Dict[str,Any]) -> None:
+def _render_trace(result: Dict[str,Any], trace_id: str = "trace") -> None:
     trace = result.get("trace")
     if not isinstance(trace,list) or not trace:
         return
@@ -554,27 +631,42 @@ def _render_trace(result: Dict[str,Any]) -> None:
                 r = results.get((s.get("step_index"), s.get("agent"), s.get("operation"))) or {}
                 status = "OK" if r.get("ok") is True else ("Failed" if r.get("ok") is False else "Pending")
                 step_title = f"Step {s.get('step_index')}: {s.get('agent')}.{s.get('operation')} — {status}"
-                st.markdown(f"#### {step_title}")
-                if s.get("goal"):
-                    st.caption(s["goal"])
-                st.markdown("**Inputs**")
-                st.json(s.get("inputs") or {})
-                if r:
-                    st.markdown("**Results**")
-                    if r.get("summary"):
-                        st.info(r["summary"])
-                    st.json({k: v for k, v in r.items() if k not in ("phase", "summary", "sql", "mongo_query")})
-                if r and isinstance(r.get("sql"), str) and r["sql"].strip():
-                    st.markdown("**Generated SQL**")
-                    st.code(r["sql"], language="sql")
-                if r and isinstance(r.get("mongo_query"), dict) and any(v is not None for v in (r.get("mongo_query") or {}).values()):
-                    st.markdown("**MongoDB Query**")
-                    st.json(r["mongo_query"])
-                if idx < len(starts) - 1:
+                trace_ns = f"{trace_id}-{result.get('intent_key','na')}-{len(trace)}-{idx}"
+                open_key = f"trace_step_open_{trace_ns}"
+                if open_key not in st.session_state:
+                    st.session_state[open_key] = False
+
+                chevron = "▼" if st.session_state[open_key] else "▶"
+                if st.button(f"{chevron} {step_title}", key=f"trace_step_btn_{trace_ns}", use_container_width=True):
+                    st.session_state[open_key] = not st.session_state[open_key]
+
+                if st.session_state[open_key]:
+                    if s.get("goal"):
+                        st.caption(s["goal"])
+                    st.markdown("**Inputs**")
+                    st.json(s.get("inputs") or {})
+                    if r:
+                        st.markdown("**Results**")
+                        if r.get("summary"):
+                            st.info(r["summary"])
+                        st.json({k: v for k, v in r.items() if k not in ("phase", "summary", "sql", "mongo_query")})
+                    if r and isinstance(r.get("sql"), str) and r["sql"].strip():
+                        st.markdown("**Generated SQL**")
+                        st.code(_format_sql_for_trace(r["sql"]), language="sql")
+                    if r and isinstance(r.get("mongo_query"), dict) and any(v is not None for v in (r.get("mongo_query") or {}).values()):
+                        st.markdown("**MongoDB Query**")
+                        st.json(r["mongo_query"])
                     st.markdown("---")
 
-        st.markdown("#### Raw JSON (Debug)")
-        st.json(trace)
+        raw_ns = f"{trace_id}-{result.get('intent_key','na')}-{len(trace)}-raw"
+        raw_key = f"trace_raw_open_{raw_ns}"
+        if raw_key not in st.session_state:
+            st.session_state[raw_key] = False
+        raw_chev = "▼" if st.session_state[raw_key] else "▶"
+        if st.button(f"{raw_chev} Raw JSON (Debug)", key=f"trace_raw_btn_{raw_ns}", use_container_width=True):
+            st.session_state[raw_key] = not st.session_state[raw_key]
+        if st.session_state[raw_key]:
+            st.json(trace)
  
 def _run_turn(*, router: Any, user_text: str) -> None:
     user_text = (user_text or "").strip()

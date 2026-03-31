@@ -27,6 +27,7 @@ SUPPORTED_INTENTS = [
     # Entity queries
     "voyage.summary",
     "voyage.entity",
+    "voyage.metadata",
     "vessel.summary",
     "vessel.entity",
     "vessel.metadata",
@@ -46,6 +47,9 @@ SUPPORTED_INTENTS = [
 
     # Ranking queries
     "ranking.voyages",
+    "ranking.pnl",
+    "ranking.revenue",
+    "ranking.port_calls",
     "ranking.voyages_by_pnl",
     "ranking.voyages_by_revenue",
     "ranking.voyages_by_commission",
@@ -138,6 +142,50 @@ INTENT-SPECIFIC RULES (finance voyage.summary):
         "needs": {"mongo": False, "finance": True, "ops": True},
         "mongo_intent": "entity.skip",
         "mongo_projection": None,
+        "sql_hints": {
+            "finance": "",
+            "ops": "",
+        },
+    },
+
+    "voyage.metadata": {
+        "description": (
+            "Document-level metadata for a SPECIFIC voyage from MongoDB only — "
+            "fixture/commercial terms, cargo details, route legs, bunkers, emissions, "
+            "projected results, tags, and source URL. Use when the question is about "
+            "voyage document facts, not KPI performance trends."
+        ),
+        "route": "single",
+        "required_slots": [],
+        "optional_slots": ["voyage_number", "voyage_numbers", "voyage_id"],
+        "needs": {"mongo": True, "finance": False, "ops": False},
+        "mongo_intent": "entity.voyage",
+        "mongo_projection": {
+            "_id": 0,
+            "voyageId": 1,
+            "voyageNumber": 1,
+            "vesselName": 1,
+            "vesselImo": 1,
+            "url": 1,
+            "extracted_at": 1,
+            "tags": 1,
+            "fixtures": 1,
+            "revenues": 1,
+            "expenses": 1,
+            "legs.port_name": 1,
+            "legs.activity_type": 1,
+            "legs.display_order": 1,
+            "cargoes.grade_name": 1,
+            "cargoes.quantity": 1,
+            "cargoes.unit": 1,
+            "remarks": 1,
+            "offhire_events": 1,
+            "bunkers": 1,
+            "emissions": 1,
+            "projected_results": 1,
+            "startDateUtc": 1,
+            "endDateUtc": 1,
+        },
         "sql_hints": {
             "finance": "",
             "ops": "",
@@ -373,7 +421,11 @@ INTENT-SPECIFIC RULES (finance analysis.by_module_type):
 - ORDER BY avg_pnl DESC.
 - Keep LIMIT %(limit)s.
 """,
-            "ops": "",
+            "ops": (
+                "For module_type queries, ops should fetch ports_json and grades_json "
+                "grouped by module_type using = ANY(%(voyage_ids)s) filter when voyage_ids "
+                "are available, otherwise return aggregate port/grade data per module_type."
+            ),
         },
     },
 
@@ -389,6 +441,7 @@ INTENT-SPECIFIC RULES (finance analysis.by_module_type):
         "needs": {"mongo": False, "finance": True, "ops": True},
         "mongo_intent": "entity.skip",
         "mongo_projection": None,
+        "guardrails": {"segment_performance_fallback": True},
         "sql_hints": {
             "finance": """
 INTENT-SPECIFIC RULES (finance analysis.segment_performance):
@@ -417,6 +470,7 @@ INTENT-SPECIFIC RULES (finance analysis.segment_performance):
         "needs": {"mongo": False, "finance": True, "ops": False},
         "mongo_intent": "entity.skip",
         "mongo_projection": None,
+        "guardrails": {"inject_voyage_numbers_param": True, "verify_scenario_variance_columns": True},
         "sql_hints": {
             "finance": """
 INTENT-SPECIFIC RULES (analysis.scenario_comparison):
@@ -469,7 +523,7 @@ INTENT-SPECIFIC RULES (finance analysis.cost_breakdown):
             "Quantifies the gap between planned and actual values. "
             "Similar to analysis.scenario_comparison but focuses on delta/variance metric."
         ),
-        "route": "single",
+        "route": "composite",
         "required_slots": [],
         "optional_slots": ["voyage_numbers", "scenario", "metric"],
         "needs": {"mongo": False, "finance": True, "ops": False},
@@ -528,6 +582,7 @@ INTENT-SPECIFIC RULES (finance analysis.profitability):
         "needs": {"mongo": False, "finance": True, "ops": True},
         "mongo_intent": "entity.skip",
         "mongo_projection": None,
+        "guardrails": {"finance_no_ops_join": True, "require_kpi_columns": True},
         "sql_hints": {
             "finance": """
 INTENT-SPECIFIC RULES (finance ranking.voyages):
@@ -536,6 +591,81 @@ INTENT-SPECIFIC RULES (finance ranking.voyages):
 - Return exact aliases: voyage_id, voyage_number, pnl, revenue, total_expense, tce, total_commission.
 - Rank by pnl DESC unless the question asks otherwise.
 - Keep LIMIT %(limit)s.
+""",
+            "ops": "",
+        },
+    },
+
+    "ranking.pnl": {
+        "description": (
+            "Rank voyages or grouped entities by PnL. "
+            "Use for requests like 'top 10 voyages by PnL' or 'highest profit voyages'. "
+            "For cargo-grade phrasing, allow aggregate grouping by cargo grade."
+        ),
+        "route": "composite",
+        "required_slots": [],
+        "optional_slots": ["limit", "group_by", "metric", "date_from", "date_to"],
+        "needs": {"mongo": False, "finance": True, "ops": True},
+        "mongo_intent": "entity.skip",
+        "mongo_projection": None,
+        "guardrails": {"require_kpi_columns": True},
+        "sql_hints": {
+            "finance": """
+INTENT-SPECIFIC RULES (finance ranking.pnl):
+- Rank by PnL metric.
+- If the question asks by cargo grade, GROUP BY normalized cargo grade and include avg_pnl/avg_revenue/voyage_count.
+- For cargo-grade ranking, include most_common_ports using string_agg(DISTINCT port_text, ', ') AS most_common_ports.
+- If the question asks by voyage, return voyage-level rows with pnl/revenue/total_expense.
+- Keep LIMIT %(limit)s and scenario = COALESCE(%(scenario)s, 'ACTUAL') when relevant.
+""",
+            "ops": "",
+        },
+    },
+
+    "ranking.revenue": {
+        "description": (
+            "Rank voyages or grouped entities by revenue. "
+            "Use for requests like 'top voyages by revenue' or 'highest revenue voyages'."
+        ),
+        "route": "composite",
+        "required_slots": [],
+        "optional_slots": ["limit", "group_by", "metric", "date_from", "date_to"],
+        "needs": {"mongo": False, "finance": True, "ops": True},
+        "mongo_intent": "entity.skip",
+        "mongo_projection": None,
+        "guardrails": {"require_kpi_columns": True},
+        "sql_hints": {
+            "finance": """
+INTENT-SPECIFIC RULES (finance ranking.revenue):
+- Rank by revenue metric.
+- Keep LIMIT %(limit)s and scenario = COALESCE(%(scenario)s, 'ACTUAL') when relevant.
+""",
+            "ops": "",
+        },
+    },
+
+    "ranking.port_calls": {
+        "description": (
+            "Rank voyages by number of port calls/port visits/port stops. "
+            "Use for requests like 'Show 10 voyages with most port calls'."
+        ),
+        "route": "composite",
+        "required_slots": [],
+        "optional_slots": ["limit", "date_from", "date_to"],
+        "needs": {"mongo": False, "finance": True, "ops": True},
+        "mongo_intent": "entity.skip",
+        "mongo_projection": None,
+        "guardrails": {"require_kpi_columns": True},
+        "sql_hints": {
+            "finance": """
+INTENT-SPECIFIC RULES (finance ranking.port_calls):
+- Use one row per voyage.
+- To count ports use jsonb_array_length(o.ports_json) AS port_count.
+- Do NOT explode ports_json with jsonb_array_elements for this intent.
+- Join finance_voyage_kpi f with ops_voyage_summary o on voyage_number + normalized vessel_imo.
+- Include voyage_id, voyage_number, pnl, revenue, total_expense, tce, total_commission and port_count.
+- ORDER BY port_count DESC.
+- Keep LIMIT %(limit)s and scenario = COALESCE(%(scenario)s, 'ACTUAL').
 """,
             "ops": "",
         },
@@ -554,6 +684,7 @@ INTENT-SPECIFIC RULES (finance ranking.voyages):
         "needs": {"mongo": False, "finance": True, "ops": True},
         "mongo_intent": "entity.skip",
         "mongo_projection": None,
+        "guardrails": {"finance_no_ops_join": True, "require_kpi_columns": True},
         "sql_hints": {
             "finance": """
 INTENT-SPECIFIC RULES (finance ranking.voyages_by_pnl):
@@ -580,6 +711,7 @@ INTENT-SPECIFIC RULES (finance ranking.voyages_by_pnl):
         "needs": {"mongo": False, "finance": True, "ops": True},
         "mongo_intent": "entity.skip",
         "mongo_projection": None,
+        "guardrails": {"finance_no_ops_join": True, "require_kpi_columns": True},
         "sql_hints": {
             "finance": """
 INTENT-SPECIFIC RULES (finance ranking.voyages_by_revenue):
@@ -606,6 +738,7 @@ INTENT-SPECIFIC RULES (finance ranking.voyages_by_revenue):
         "needs": {"mongo": False, "finance": True, "ops": True},
         "mongo_intent": "entity.skip",
         "mongo_projection": None,
+        "guardrails": {"finance_no_ops_join": True, "require_kpi_columns": True},
         "sql_hints": {
             "finance": """
 INTENT-SPECIFIC RULES (finance ranking.voyages_by_commission):
@@ -878,6 +1011,7 @@ INTENT-SPECIFIC RULES (ops ops.voyages_by_port):
         "needs": {"mongo": False, "finance": True, "ops": True},
         "mongo_intent": "entity.skip",
         "mongo_projection": None,
+        "guardrails": {"inject_filter_port_param": True},
         "sql_hints": {
             "finance": """
 INTENT-SPECIFIC RULES (finance ops.port_query):

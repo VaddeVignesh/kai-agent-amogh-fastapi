@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from typing import Any, Dict
 
 
@@ -23,6 +24,25 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(r, dict):
             return r
 
+        def _grade_text(v: Any) -> str:
+            if v in (None, "", [], {}):
+                return ""
+            if isinstance(v, dict):
+                g = v.get("grade_name") or v.get("gradeName") or v.get("name") or v.get("grade")
+                return str(g).strip() if g not in (None, "", [], {}) else ""
+            if isinstance(v, str):
+                s = v.strip()
+                if s.startswith("{") and s.endswith("}"):
+                    try:
+                        obj = ast.literal_eval(s)
+                        if isinstance(obj, dict):
+                            g = obj.get("grade_name") or obj.get("gradeName") or obj.get("name") or obj.get("grade")
+                            return str(g).strip() if g not in (None, "", [], {}) else ""
+                    except Exception:
+                        pass
+                return s
+            return str(v).strip()
+
         kp = r.get("key_ports")
         if isinstance(kp, list):
             kp_clean = []
@@ -30,14 +50,30 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
                 if x in (None, "", [], {}):
                     continue
                 if isinstance(x, dict):
-                    kp_clean.append({"portName": x.get("portName"), "activityType": x.get("activityType")})
+                    kp_clean.append(
+                        {
+                            "portName": x.get("portName") or x.get("port_name") or x.get("name"),
+                            "activityType": x.get("activityType") or x.get("activity_type"),
+                        }
+                    )
                 else:
                     kp_clean.append(str(x))
             kp = _cap_list(kp_clean, 10)
 
         cg = r.get("cargo_grades")
         if isinstance(cg, list):
-            cg = _cap_list([str(x) for x in cg if x not in (None, "", [], {})], 10)
+            cg_clean = []
+            seen_cg = set()
+            for x in cg:
+                s = _grade_text(x)
+                sn = s.lower()
+                if not s or sn in ("none", "null", "n/a", "na"):
+                    continue
+                if sn in seen_cg:
+                    continue
+                seen_cg.add(sn)
+                cg_clean.append(s)
+            cg = _cap_list(cg_clean, 10)
 
         rem = r.get("remarks")
         if isinstance(rem, list):
@@ -61,6 +97,11 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
         total_expense = _k("total_expense", "Total_expense", "total expense")
         tce = _k("tce", "TCE")
         total_commission = _k("total_commission", "Total_commission", "total commission")
+        # Aggregate intents may use avg_* fields instead of top-level KPI names.
+        if pnl in (None, ""):
+            pnl = _k("avg_pnl")
+        if revenue in (None, ""):
+            revenue = _k("avg_revenue")
 
         out_row = {
             "voyage_id": r.get("voyage_id"),
@@ -70,16 +111,42 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
             "total_expense": total_expense,
             "tce": tce,
             "total_commission": total_commission,
+            "port_calls": (
+                r.get("port_calls")
+                if r.get("port_calls") not in (None, "")
+                else fin.get("port_count")
+            ),
             "key_ports": kp or [],
             "cargo_grades": cg or [],
             "remarks": rem,
+            "voyage_count": (
+                r.get("voyage_count")
+                if r.get("voyage_count") not in (None, "")
+                else fin.get("voyage_count")
+            ),
         }
         # Vessel-level rows (e.g. ranking.vessels) have vessel_imo, vessel_name, voyage_count
         if r.get("vessel_imo") is not None or r.get("vessel_name") is not None:
             out_row["vessel_imo"] = r.get("vessel_imo")
-            out_row["vessel_name"] = r.get("vessel_name")
+            _vname = r.get("vessel_name") or fin.get("vessel_name")
+            _vimo = r.get("vessel_imo") or fin.get("vessel_imo")
+            out_row["vessel_name"] = (
+                _vname if _vname and str(_vname).strip()
+                else f"IMO:{_vimo}" if _vimo
+                else "Unknown Vessel"
+            )
             out_row["voyage_count"] = r.get("voyage_count")
             out_row["avg_pnl"] = r.get("avg_pnl") or r.get("pnl")
+        else:
+            _vname = r.get("vessel_name") or fin.get("vessel_name")
+            _vimo = r.get("vessel_imo") or fin.get("vessel_imo")
+            if _vname is not None or _vimo is not None:
+                out_row["vessel_imo"] = _vimo
+                out_row["vessel_name"] = (
+                    _vname if _vname and str(_vname).strip()
+                    else f"IMO:{_vimo}" if _vimo
+                    else "Unknown Vessel"
+                )
         return out_row
 
     fin = merged.get("finance")

@@ -128,6 +128,20 @@ class QueryResponse(BaseModel):
     slots: Optional[Dict[str, Any]] = None
     dynamic_sql_used: Optional[bool] = None
     dynamic_sql_agents: Optional[List[str]] = None
+
+
+class SessionClearRequest(BaseModel):
+    session_id: str
+    include_idem: bool = True
+    include_lock: bool = True
+
+
+class SessionClearResponse(BaseModel):
+    session_id: str
+    ok: bool
+    deleted: int = 0
+    deleted_keys: Optional[List[str]] = None
+    reason: Optional[str] = None
  
  
 # =========================================================
@@ -164,5 +178,21 @@ def query_agent(req: QueryRequest):
         slots=result.get("slots"),
         dynamic_sql_used=result.get("dynamic_sql_used"),
         dynamic_sql_agents=result.get("dynamic_sql_agents"),
+    )
+
+
+@app.post("/session/clear", response_model=SessionClearResponse)
+def clear_session_memory(req: SessionClearRequest):
+    result = redis_store.clear_session(
+        req.session_id,
+        include_idem=bool(req.include_idem),
+        include_lock=bool(req.include_lock),
+    )
+    return SessionClearResponse(
+        session_id=req.session_id,
+        ok=bool(result.get("ok")),
+        deleted=int(result.get("deleted") or 0),
+        deleted_keys=result.get("deleted_keys") if isinstance(result.get("deleted_keys"), list) else [],
+        reason=result.get("reason"),
     )
  

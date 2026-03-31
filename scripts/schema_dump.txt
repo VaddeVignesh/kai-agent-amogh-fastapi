@@ -1,0 +1,69 @@
+=== finance_voyage_kpi columns ===
+column_name       | data_type                   | is_nullable
+------------------+-----------------------------+------------
+voyage_id         | character varying           | NO         
+voyage_number     | integer                     | NO         
+vessel_imo        | character varying           | YES        
+scenario          | character varying           | NO         
+revenue           | numeric                     | YES        
+total_expense     | numeric                     | YES        
+pnl               | numeric                     | YES        
+tce               | numeric                     | YES        
+total_commission  | numeric                     | YES        
+bunker_cost       | numeric                     | YES        
+port_cost         | numeric                     | YES        
+voyage_days       | numeric                     | YES        
+voyage_start_date | date                        | YES        
+voyage_end_date   | date                        | YES        
+modified_by       | character varying           | YES        
+modified_date     | timestamp without time zone | YES        
+extracted_at      | timestamp without time zone | YES        
+
+=== ops_voyage_summary columns ===
+column_name       | data_type                   | is_nullable
+------------------+-----------------------------+------------
+voyage_id         | character varying           | NO         
+voyage_number     | integer                     | NO         
+vessel_id         | character varying           | YES        
+vessel_imo        | character varying           | YES        
+vessel_name       | character varying           | YES        
+module_type       | character varying           | YES        
+fixture_count     | integer                     | YES        
+offhire_days      | numeric                     | YES        
+is_delayed        | boolean                     | YES        
+delay_reason      | text                        | YES        
+voyage_start_date | date                        | YES        
+voyage_end_date   | date                        | YES        
+ports_json        | jsonb                       | YES        
+grades_json       | jsonb                       | YES        
+activities_json   | jsonb                       | YES        
+remarks_json      | jsonb                       | YES        
+tags              | text                        | YES        
+url               | text                        | YES        
+extracted_at      | timestamp without time zone | YES        
+
+=== sample finance row ===
+voyage_id                        | voyage_number | vessel_imo | scenario | revenue    | total_expense | pnl        | tce      | total_commission | bunker_cost | port_cost | voyage_days | voyage_start_date | voyage_end_date | modified_by        | modified_date              | extracted_at              
+---------------------------------+---------------+------------+----------+------------+---------------+------------+----------+------------------+-------------+-----------+-------------+-------------------+-----------------+--------------------+----------------------------+---------------------------
+F07C63363AA52CE4DA88F51E243FDF49 | 2103          | 9299135.0  | ACTUAL   | 1413109.07 | 986602.41     | 426506.66  | 6278.70  | 65629.56         | 823924.69   | 49955.15  | 67.9292     | 2021-05-20        | 2021-07-27      | Heng, Rainer       | 2024-05-13 00:29:15.670000 | 2026-02-17 08:46:04.793206
+8C8ABAED635849EDC99CCFB4A699F593 | 2201          | 9282730.0  | ACTUAL   | 1759813.61 | 753732.48     | -788254.03 | 24463.98 | 78676.81         | 647113.73   | 138323.10 | 41.1250     | 2022-11-16        | 2022-12-27      | Kajrud, Michaela   | 2023-11-09 08:35:57.793000 | 2026-02-17 08:46:04.793206
+5F1D3AE7140B97ECE1CEE7C339C38316 | 2107          | 9575577.0  | ACTUAL   | 1629946.30 | 1134457.59    | 495488.71  | 8825.03  | 40567.63         | 969974.28   | 39388.68  | 56.1458     | 2021-10-16        | 2021-12-11      | Warnement, William | 2022-08-05 15:54:23.213000 | 2026-02-17 08:46:04.793206
+
+=== sample ops row ===
+voyage_id                        | voyage_number | vessel_id                        | vessel_imo | vessel_name           | module_type | fixture_count | offhire_days | is_delayed | delay_reason | voyage_start_date | voyage_end_date | ports_json                                                                                                                                                                                                                                                                                                   | grades_json                                  | activities_json | remarks_json                                          | tags                                                                                                            | url                                                                            | extracted_at              
+---------------------------------+---------------+----------------------------------+------------+-----------------------+-------------+---------------+--------------+------------+--------------+-------------------+-----------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------+-----------------+-------------------------------------------------------+-----------------------------------------------------------------------------------------------------------------+--------------------------------------------------------------------------------+---------------------------
+F07C63363AA52CE4DA88F51E243FDF49 | 2103          | 209D06702B1690A482F4FC9834526205 | 9299135.0  | Stena Provence        | Spot        | 1             | 0.0000       | False      | NULL         | 2021-05-20        | 2021-07-27      | [{'port_name': 'Ruwais', 'activity_type': 'L', 'display_order': 0}, {'port_name': 'Campana', 'activity_type': 'D', 'display_order': 1}, {'port_name': 'Alpha Zone (Tsa)', 'activity_type': 'D', 'display_order': 2}]                                                                                         | [{'grade_name': 'ULSD', 'display_order': 0}] | NULL            | []                                                    | P-Max, Clean, Stena Provence (#3212), Comm: Yes                                                                 | https://vm.q88.com/VM/Voyage/Voyages?voyageid=F07C63363AA52CE4DA88F51E243FDF49 | 2026-02-17 08:46:25.359755
+8C8ABAED635849EDC99CCFB4A699F593 | 2201          | E2BDD92EE7E8C6D75386141881A16BCC | 9282730.0  | Kuljak Arrow          | Spot        | 1             | 0.0000       | False      | NULL         | 2022-11-16        | 2022-12-27      | [{'port_name': 'Taixing (Jiangsu)', 'activity_type': 'L', 'display_order': 0}, {'port_name': 'Bunbury', 'activity_type': 'D', 'display_order': 1}, {'port_name': 'Qingdao (formerly Tsingtao)', 'activity_type': 'L', 'display_order': 2}, {'port_name': 'Sakai', 'activity_type': 'L', 'display_order': 2}] | [{'grade_name': 'CSS', 'display_order': 0}]  | NULL            | []                                                    | Mitshubishi 22, MR old, short, Non Scrubber, PnC SING, Short Pool (#170), Stena Bulk A/S (#341), Not Sanctioned | https://vm.q88.com/VM/Voyage/Voyages?voyageid=8C8ABAED635849EDC99CCFB4A699F593 | 2026-02-17 08:46:25.359755
+5F1D3AE7140B97ECE1CEE7C339C38316 | 2107          | 4F9EDC019D5E64B0F0E71E9198AE9430 | 9575577.0  | Sonangol Porto Amboim | Spot        | 1             | 0.0000       | False      | NULL         | 2021-10-16        | 2021-12-11      | [{'port_name': 'Egina FPSO', 'activity_type': 'L', 'display_order': 0}, {'port_name': 'Canaport SBM', 'activity_type': 'D', 'display_order': 1}]                                                                                                                                                             | [{'grade_name': 'NHC', 'display_order': 0}]  | NULL            | ['AWRP on c/a. Guards split 50/50, max 40k for c/a.'] | Suezmax, Stena Sonangol Suezmax Pool LP (#3435), Comm: Yes                                                      | https://vm.q88.com/VM/Voyage/Voyages?voyageid=5F1D3AE7140B97ECE1CEE7C339C38316 | 2026-02-17 08:46:25.359755
+
+=== ports_json keys ===
+ERROR: cannot call jsonb_object_keys on an array
+
+
+=== grades_json keys ===
+ERROR: cannot call jsonb_object_keys on an array
+
+
+=== remarks_json keys ===
+ERROR: cannot call jsonb_object_keys on an array
+

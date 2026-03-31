@@ -23,6 +23,8 @@ DEFAULT_ALLOWLIST = SQLAllowlist(
     allowed_tables={
         "finance_voyage_kpi",
         "ops_voyage_summary",
+        "jsonb_array_elements_text",
+        "jsonb_array_elements",
     },
     allowed_columns={
         "finance_voyage_kpi": {

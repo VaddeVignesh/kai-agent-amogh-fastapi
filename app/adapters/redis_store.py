@@ -8,6 +8,17 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 import redis
 
+# Slots that are safe to persist across different intents
+STICKY_SLOTS = {"scenario", "limit", "vessel_name", "vessel_imo"}
+
+# Slots that must be cleared when the intent changes
+VOLATILE_SLOTS = {
+    "voyage_id", "voyage_ids", "voyage_number", "voyage_numbers",
+    "cargo_grades", "port_name", "filter_port",
+}
+
+SESSION_MAX_AGE_SECONDS = 1800  # 30 minutes
+
 # -----------------------------
 # Config
 # -----------------------------
@@ -28,7 +39,7 @@ class RedisConfig:
 class RedisStore:
    """
    RedisStore provides:
-     - session memory (slots + anchor + last_intent + last_user_input)
+     - session memory (slots + anchor + last_intent_key + last_user_input)
      - optional distributed lock (per session)
      - optional idempotency cache (per request)
    For your current graph_router.py you mainly need:
@@ -54,7 +65,7 @@ class RedisStore:
    def _default_session(self) -> Dict[str, Any]:
        return {
            "slots": {},
-           "last_intent": None,
+          "last_intent_key": None,
            "anchor_type": None,
            "anchor_id": None,
            "last_user_input": None,
@@ -101,9 +112,19 @@ class RedisStore:
        if not raw:
            # In-memory fallback if Redis is down / disabled.
            cached = self._fallback_sessions.get(session_id)
-           return dict(cached) if isinstance(cached, dict) else self._default_session()
+           session = dict(cached) if isinstance(cached, dict) else self._default_session()
+           last_updated = session.get("last_updated_ts")
+           if last_updated:
+               if time.time() - float(last_updated) > SESSION_MAX_AGE_SECONDS:
+                   return {}
+           return session
        try:
-           return json.loads(raw)
+           session = json.loads(raw)
+           last_updated = session.get("last_updated_ts")
+           if last_updated:
+               if time.time() - float(last_updated) > SESSION_MAX_AGE_SECONDS:
+                   return {}
+           return session
        except Exception:
            # if corrupted, reset
            return self._default_session()
@@ -112,18 +133,83 @@ class RedisStore:
        Merge patch into existing session and refresh TTL.
        """
        session = self.load_session(session_id)
+       slots = session.get("slots")
+       if not isinstance(slots, dict):
+           slots = {}
+           session["slots"] = slots
+
+       intent_key = (
+           (session_patch or {}).get("intent_key")
+           or (session_patch or {}).get("last_intent_key")
+       )
+       # If intent has changed, clear volatile slots to prevent context poisoning
+       if session.get("last_intent_key") and intent_key and session.get("last_intent_key") != intent_key:
+           for k in VOLATILE_SLOTS:
+               slots.pop(k, None)
+           session.pop("last_result_set", None)
+           session.pop("voyage_ids", None)
+
        # merge patch (shallow merge)
        for k, v in (session_patch or {}).items():
            session[k] = v
+       if intent_key:
+           session["last_intent_key"] = intent_key
        # increment turn
        session["turn"] = int(session.get("turn", 0)) + 1
        session["updated_at"] = int(time.time())
+       session["last_updated_ts"] = time.time()
 
        payload = json.dumps(session)
        ok = self._safe_setex(self._session_key(session_id), self.cfg.session_ttl_sec, payload)
        if not ok:
            # In-memory fallback if Redis is down / disabled.
            self._fallback_sessions[session_id] = dict(session)
+
+   def clear_session(self, session_id: str, *, include_idem: bool = True, include_lock: bool = True) -> Dict[str, Any]:
+       """
+       Clear backend cache for a single session id.
+       Removes session memory key (+ optional idem/lock keys) without touching other sessions.
+       """
+       sid = str(session_id or "").strip()
+       if not sid:
+           return {"ok": False, "reason": "missing_session_id", "deleted": 0, "deleted_keys": []}
+
+       deleted_keys = []
+
+       # Clear in-memory fallback copy if present.
+       if sid in self._fallback_sessions:
+           self._fallback_sessions.pop(sid, None)
+           deleted_keys.append(self._session_key(sid) + " (fallback)")
+
+       if self._redis_disabled() or self._redis_available is False:
+           return {"ok": True, "deleted": len(deleted_keys), "deleted_keys": deleted_keys}
+
+       keys = [self._session_key(sid)]
+       if include_lock:
+           keys.append(self._lock_key(sid))
+
+       try:
+           if include_idem:
+               for k in self.client.scan_iter(match=f"idem:{sid}:*", count=200):
+                   keys.append(k)
+
+           # de-duplicate preserving order
+           seen = set()
+           uniq = []
+           for k in keys:
+               if k not in seen:
+                   seen.add(k)
+                   uniq.append(k)
+
+           if uniq:
+               self.client.delete(*uniq)
+               deleted_keys.extend(uniq)
+               self._redis_available = True
+
+           return {"ok": True, "deleted": len(deleted_keys), "deleted_keys": deleted_keys}
+       except redis.exceptions.RedisError as e:
+           self._redis_available = False
+           return {"ok": False, "reason": f"redis_error: {e}", "deleted": len(deleted_keys), "deleted_keys": deleted_keys}
    # =========================================================
    # Optional: Idempotency Cache (per request)
    # =========================================================

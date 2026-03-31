@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from app.agents.finance_agent import FinanceAgent
 from app.agents.ops_agent import OpsAgent
+from app.services.response_merger import compact_payload
 from app.sql.sql_generator import SQLGenerator
 
 
@@ -133,4 +134,36 @@ def test_finance_agent_ranking_voyages_repairs_sql_that_joins_ops() -> None:
     assert res.mode == "dynamic_sql"
     assert res.rows and res.rows[0]["voyage_id"] == "V1"
     assert any("ops_voyage_summary" not in s for s in executed)
+
+
+def test_compact_payload_parses_dict_shaped_grade_and_keeps_avg_metrics() -> None:
+    merged = {
+        "artifacts": {
+            "merged_rows": [
+                {
+                    "voyage_id": None,
+                    "voyage_number": None,
+                    "pnl": None,
+                    "revenue": None,
+                    "finance": {
+                        "cargo_grade": {"grade_name": "pmf", "display_order": 0},
+                        "avg_pnl": 4590747.52,
+                        "avg_revenue": 7628230.58,
+                        "voyage_count": 7,
+                    },
+                    "cargo_grades": [{"grade_name": "pmf", "display_order": 0}],
+                    "key_ports": [{"port_name": "Pasir Gudang", "activity_type": "L"}],
+                    "remarks": [],
+                }
+            ]
+        }
+    }
+    out = compact_payload(merged)
+    rows = (((out.get("artifacts") or {}).get("merged_rows")) or [])
+    assert len(rows) == 1
+    r0 = rows[0]
+    assert r0.get("cargo_grades") == ["pmf"]
+    assert r0.get("pnl") == 4590747.52
+    assert r0.get("revenue") == 7628230.58
+    assert r0.get("voyage_count") == 7
 

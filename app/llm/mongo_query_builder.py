@@ -45,7 +45,11 @@ class MongoQueryBuilder:
             },
         }
 
-        raw = self.llm._groq_chat(system=system, user=json.dumps(payload, ensure_ascii=False))
+        raw = self.llm._groq_chat(
+            system=system,
+            user=json.dumps(payload, ensure_ascii=False),
+            temperature=0,
+        )
         data = self.llm._safe_json_load(raw, fallback={})
 
         collection = str(data.get("collection") or "").strip()

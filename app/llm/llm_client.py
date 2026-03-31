@@ -13,8 +13,12 @@ Changes from v7:
 
 from __future__ import annotations
 
+import ast
 import json
+import logging
+import os
 import re
+import re as _re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time
@@ -22,6 +26,61 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from groq import Groq
+
+logger = logging.getLogger(__name__)
+
+MONGO_ONLY_VOYAGE_FIELDS = frozenset([
+    # fixture / commercial
+    "charterer", "broker", "commission", "commission rate", "commission rates",
+    "cp date", "cp quantity", "demurrage rate", "laytime", "time bar",
+    "fixture", "fixture terms", "bill of lading", "bl quantity", "shipper",
+    # cargo
+    "cargo grade", "grade", "cargo",
+    # route / legs
+    "route", "leg", "legs", "arrival", "departure",
+    "load port", "discharge port", "port call",
+    "distance", "passage days",
+    # revenue / expense detail
+    "freight rate", "revenue line", "expense line",
+    "rebill", "worldscale", "ws ",
+    # bunkers
+    "bunker consumption", "bunker cost", "bunker grade",
+    "hsbf", "lsgo", "rob", "stems", "bunker",
+    # emissions
+    "cii", "cii band", "co2", "sox", "nox",
+    "emissions", "eeoi", "aer",
+    # remarks
+    "remark", "remarks", "who added", "added by",
+    # projected results
+    "projected", "projected pnl", "projected revenue",
+    "projected tce", "tce projection",
+    # metadata / source
+    "metadata", "voyage metadata", "source link", "url",
+])
+
+
+def _should_use_voyage_metadata(
+    user_input: str,
+    intent_key: str,
+    slots: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """
+    Returns True if the query references MongoDB-only voyage fields
+    and the current intent is voyage.summary or voyage.detail.
+    This override runs AFTER deterministic classification.
+    """
+    if intent_key not in ("voyage.summary", "voyage.detail"):
+        return False
+    voyage_numbers = (slots or {}).get("voyage_numbers")
+    has_voyage_anchor = bool(
+        (slots or {}).get("voyage_number")
+        or (slots or {}).get("voyage_id")
+        or (isinstance(voyage_numbers, list) and len(voyage_numbers) > 0)
+    )
+    if not has_voyage_anchor:
+        return False
+    text_lower = (user_input or "").lower()
+    return any(field in text_lower for field in MONGO_ONLY_VOYAGE_FIELDS)
 
 
 # =========================================================
@@ -44,6 +103,7 @@ class LLMClient:
     def __init__(self, config: LLMConfig):
         self.config = config
         self.client = Groq(api_key=config.api_key)
+        self.sql_max_tokens = int(os.getenv("SQL_MAX_TOKENS", "1024"))
 
     # =========================================================
     # Deterministic intent router (before LLM)
@@ -70,6 +130,14 @@ class LLMClient:
         ):
             return "vessel.summary"
 
+        # 0a) Explicit entity-anchored vessel asks should stay vessel-scoped,
+        # not fleet rankings (e.g., "For vessel X, show voyage-by-voyage trend...").
+        # Keep this generic and avoid fleet phrases like "which vessel/per vessel/each vessel".
+        if ("for vessel " in t or "for ship " in t) and not any(
+            p in t for p in ("which vessel", "per vessel", "each vessel", "vessels have", "vessel have")
+        ):
+            return "vessel.summary"
+
         # 0) Commission ranking
         if ("commission" in t) and ("top" in t) and ("voyage" in t):
             return "ranking.voyages_by_commission"
@@ -78,29 +146,39 @@ class LLMClient:
         if ("high voyage count" in t or "many voyages" in t) and ("above-average" in t or "above average" in t) and ("profit" in t or "pnl" in t or "profitability" in t):
             return "ranking.vessels"
 
-        # 1) Top + profitable/pnl (must beat "visited" in "key ports visited")
-        if "top" in t and ("most profitable" in t or "profit" in t or "pnl" in t):
-            return "ranking.voyages"
+        # 1) Cargo-grade profitability (fleet aggregate) — must run before generic ranking
+        # so grade-level aggregate asks don't get misrouted to ranking.pnl.
+        cargo_grade_terms = ("cargo grade", "cargo grades", "grade", "grades", "cargo")
+        aggregate_terms = ("highest", "top", "most", "average", "avg", "overall", "profit", "profitable", "pnl", "revenue")
+        if any(k in t for k in cargo_grade_terms) and any(k in t for k in aggregate_terms):
+            return "analysis.cargo_profitability"
 
-        # 2) Scenario comparison (before any voyage-number escape)
+        # 2) Ranking by PnL
+        if ("top" in t or "highest" in t or "rank" in t) and ("pnl" in t or "profit" in t):
+            return "ranking.pnl"
+
+        # 2b) Ranking by revenue
+        if ("top" in t or "highest" in t or "rank" in t) and "revenue" in t:
+            return "ranking.revenue"
+
+        # 3) Scenario comparison (before any voyage-number escape)
         if "when-fixed" in t or "when fixed" in t:
             return "analysis.scenario_comparison"
 
-        # 3) Port calls + profitability/compare → composite
-        if ("port call" in t or "port calls" in t) and ("profit" in t or "compare" in t or "most" in t):
-            return "composite.query"
+        # 4) Port-call ranking (voyages with most port calls / ports visited / port stops)
+        if (
+            any(k in t for k in ("port call", "port calls", "port count", "port counts", "port stops", "port visits"))
+            and any(k in t for k in ("top", "most", "highest", "rank", "visited"))
+        ) or ("visited the most ports" in t):
+            return "ranking.port_calls"
 
-        # 4) Offhire + financial impact
+        # 5) Offhire + financial impact
         if "offhire" in t:
             return "ops.delayed_voyages"
 
-        # 5) Loss-making
+        # 6) Loss-making
         if "loss-making" in t or "loss making" in t:
             return "analysis.segment_performance"
-
-        # 6) Cargo profitability
-        if "cargo" in t and "profit" in t:
-            return "analysis.cargo_profitability"
 
         # 6b) High revenue but low/negative PnL
         if "high revenue" in t and ("low pnl" in t or "negative pnl" in t or ("low" in t and "pnl" in t)):
@@ -286,15 +364,44 @@ class LLMClient:
             "cp date",
             "delivery",
             "extracted at",
+            "fixture",
+            "charterer",
+            "laycan",
+            "demurrage",
+            "freight",
+            "cargo quantity",
+            "cargoes",
+            "leg",
+            "legs",
+            "route leg",
+            "bunker",
+            "bunkers",
+            "emission",
+            "emissions",
+            "co2",
+            "projected result",
+            "projected pnl",
+            "url",
+            "source link",
+            "commercial metadata",
+            "voyage metadata",
+            "vessel metadata",
+            "metadata",
         )
 
-        # Metadata-first routing for vessel-anchored or small voyage-number anchored questions.
-        if not deterministic and any(k in tl for k in metadata_keywords):
+        # Metadata-first routing for vessel/voyage-anchored questions.
+        # Allow metadata override when early deterministic pick is summary intent.
+        if any(k in tl for k in metadata_keywords) and (
+            not deterministic or deterministic in ("voyage.summary", "vessel.summary")
+        ):
             has_vessel_anchor = bool(slots.get("vessel_name") or slots.get("imo"))
+            has_voyage_anchor = bool(slots.get("voyage_number") or slots.get("voyage_id"))
             vnums = slots.get("voyage_numbers")
             has_small_voyage_anchor = isinstance(vnums, list) and 1 <= len(vnums) <= 3
             if has_vessel_anchor or has_small_voyage_anchor:
-                deterministic = "vessel.metadata"
+                deterministic = "vessel.metadata" if has_vessel_anchor else "voyage.metadata"
+            elif has_voyage_anchor:
+                deterministic = "voyage.metadata"
 
         # If user asked about a specific vessel and it's not metadata, route to vessel.summary.
         if not deterministic and slots.get("vessel_name"):
@@ -326,8 +433,21 @@ class LLMClient:
 
         # 3️⃣ If deterministic intent found → skip LLM
         if deterministic:
+            intent_key = deterministic
+            # RULE 1 + RULE 4:
+            # - voyage.metadata only when a voyage anchor exists AND Mongo-only fields are asked.
+            # - never fire voyage.metadata without voyage number/id anchor.
+            # RULE 2:
+            # - financial-only voyage questions (PnL/revenue/expense/TCE/performance totals) stay on voyage.summary
+            #   because they do not match Mongo-only field keywords.
+            # RULE 3:
+            # - mixed question (metadata + financial) routes to voyage.metadata (single intent, no split).
+            if _should_use_voyage_metadata(text_norm, intent_key, slots):
+                intent_key = "voyage.metadata"
+            # ─────────────────────────────────────────────────────────────────
+            logger.debug(f"[intent_routing] final intent: {intent_key}")
             return {
-                "intent_key": deterministic,
+                "intent_key": intent_key,
                 "slots": self._sanitize_slots(slots),
             }
 
@@ -372,6 +492,21 @@ CLASSIFICATION RULES:
 - voyage_numbers must be int list
 - limit must be int (default 10 if user says "top N" without specifying N)
 - If no intent clearly fits → out_of_scope (use sparingly — always prefer the closest matching intent over out_of_scope)
+- Ranking aliases (allowed):
+  - ranking.pnl: Rank voyages/entities by PnL (e.g., "top 10 voyages by PnL", "highest profit voyages")
+  - ranking.revenue: Rank voyages/entities by revenue
+  - ranking.port_calls: Rank voyages by number of port calls/visits/stops (e.g., "show 10 voyages with most port calls")
+- Use composite.query only when the question genuinely requires combining heterogeneous data in a way no single ranking/analysis intent can represent.
+
+SLOT EXTRACTION:
+- cargo_grades: list[str] | null
+  Any petroleum/chemical cargo grade or product type the user mentions
+  (e.g. "Naphtha", "Crude", "VLSFO", "Jet Fuel", "DPP", "CPP", "LNG", "Gasoil", etc.).
+  Normalize to lowercase. Return null if no grade mentioned.
+  Examples:
+    "Show Naphtha voyages"     -> ["naphtha"]
+    "crude and fuel oil ships" -> ["crude", "fuel oil"]
+    "all voyages last month"   -> null
 """
 
         result = self._call_with_retry(
@@ -403,12 +538,48 @@ CLASSIFICATION RULES:
             if clean_slots.get("vessel_name"):
                 ql = text_norm.lower()
                 intent = "vessel.metadata" if any(k in ql for k in metadata_keywords) else "vessel.summary"
+            elif clean_slots.get("voyage_number"):
+                ql = text_norm.lower()
+                intent = "voyage.metadata" if any(k in ql for k in metadata_keywords) else "voyage.summary"
             elif clean_slots.get("voyage_numbers"):
                 ql = text_norm.lower()
-                intent = "vessel.metadata" if any(k in ql for k in metadata_keywords) else "voyage.summary"
+                intent = "voyage.metadata" if any(k in ql for k in metadata_keywords) else "voyage.summary"
 
+        # cargo_grades post-processing — no hardcoding, LLM extracted these
+        if clean_slots.get("cargo_grade") and not clean_slots.get("cargo_grades"):
+            clean_slots["cargo_grades"] = [str(clean_slots.get("cargo_grade")).strip().lower()]
+
+        if clean_slots.get("cargo_grades"):
+            clean_slots["cargo_grades"] = [
+                str(g).strip().lower()
+                for g in clean_slots["cargo_grades"]
+                if g
+            ]
+            if clean_slots["cargo_grades"] and not clean_slots.get("cargo_grade"):
+                clean_slots["cargo_grade"] = clean_slots["cargo_grades"][0]
+
+        if (
+            clean_slots.get("cargo_grades")
+            and not clean_slots.get("voyage_number")
+            and not clean_slots.get("voyage_numbers")
+            and not clean_slots.get("voyage_id")
+        ):
+            clean_slots["likely_path"] = "cargo_grade_ops"
+
+        intent_key = intent
+        # RULE 1 + RULE 4:
+        # - voyage.metadata only when a voyage anchor exists AND Mongo-only fields are asked.
+        # - never fire voyage.metadata without voyage number/id anchor.
+        # RULE 2:
+        # - financial-only voyage questions stay as voyage.summary when no Mongo-only field keywords are present.
+        # RULE 3:
+        # - if both metadata and financial keywords exist, choose voyage.metadata (single route).
+        if _should_use_voyage_metadata(text_norm, intent_key, clean_slots):
+            intent_key = "voyage.metadata"
+        # ─────────────────────────────────────────────────────────────────
+        logger.debug(f"[intent_routing] final intent: {intent_key}")
         return {
-            "intent_key": intent,
+            "intent_key": intent_key,
             "slots": clean_slots,
         }
 
@@ -445,7 +616,7 @@ CLASSIFICATION RULES:
             name = str(slots["vessel_name"]).strip()
             # Trim trailing query phrases accidentally captured as part of vessel name.
             name = re.sub(
-                r"\b(?:operating status|operational status|operating|status|passage type|passage types|hire rate|hirerate|account code|market type|scrubber|tags|contract history)\b.*$",
+                r"\b(?:operating status|operational status|operational|operating|is operating|is operational|status|passage type|passage types|hire rate|hirerate|account code|market type|scrubber|tags|contract history)\b.*$",
                 "",
                 name,
                 flags=re.IGNORECASE,
@@ -508,6 +679,38 @@ CLASSIFICATION RULES:
             elif 1 <= len(name) <= 80:
                 clean["port_name"] = name
 
+        # cargo_grades
+        if "cargo_grades" in slots:
+            try:
+                vals = slots["cargo_grades"]
+                if not isinstance(vals, list):
+                    vals = [vals]
+                clean_grades = []
+                seen = set()
+                for v in vals:
+                    s = str(v).strip().lower()
+                    if s and s not in seen:
+                        seen.add(s)
+                        clean_grades.append(s)
+                if clean_grades:
+                    clean["cargo_grades"] = clean_grades
+            except Exception:
+                pass
+
+        # cargo_grade (compat with intents requiring singular slot)
+        if "cargo_grade" in slots:
+            cg = str(slots.get("cargo_grade") or "").strip().lower()
+            if cg:
+                clean["cargo_grade"] = cg
+                if "cargo_grades" not in clean:
+                    clean["cargo_grades"] = [cg]
+
+        # likely_path hint (used by planner/router for specialized branches)
+        if "likely_path" in slots:
+            lp = str(slots.get("likely_path") or "").strip()
+            if lp:
+                clean["likely_path"] = lp
+
         return clean
 
     # =========================================================
@@ -523,11 +726,14 @@ CLASSIFICATION RULES:
         schema_hint: Dict[str, Any],
         agent: str,
         system_prompt: Optional[str] = None,
+        temperature: float = 0,
+        error_hint: Optional[str] = None,
+        **kwargs,
     ) -> Dict[str, Any]:
 
         system = system_prompt or "Return SQL JSON only."
 
-        result = self._call_with_retry(
+        raw = self._call_with_retry(
             system=system,
             user=json.dumps({
                 "question": question,
@@ -537,14 +743,32 @@ CLASSIFICATION RULES:
                 "agent": agent,
             }),
             operation=f"sql_generation_{agent}",
+            temperature=temperature,
+            max_tokens=kwargs.get("max_tokens", getattr(self, "sql_max_tokens", 1024)),
+            return_string=True,
         )
 
-        if not result or "sql" not in result:
+        if not raw:
             return {
                 "sql": "SELECT 1 WHERE 1=0 LIMIT 1",
                 "params": {},
                 "tables": [],
                 "confidence": 0.0,
+            }
+
+        cleaned = str(raw).strip()
+        cleaned = re.sub(r"^```.*?\n", "", cleaned)
+        cleaned = cleaned.replace("```", "")
+
+        parsed = self._safe_json_load(cleaned, fallback=None)
+        if isinstance(parsed, dict) and "sql" in parsed:
+            result = parsed
+        else:
+            result = {
+                "sql": cleaned,
+                "params": {},
+                "tables": [],
+                "confidence": 0.9,
             }
 
         result.setdefault("params", {})
@@ -668,10 +892,30 @@ HARD RULES:
 - Use ONLY the provided JSON. Do NOT invent numbers, entities, or causes.
 - If a value is missing/NULL, say "Not available" (do NOT convert to 0.0 unless the JSON explicitly says 0).
 - Produce clean, readable Markdown with consistent headings and tables.
+- TABLE RULE: Never put a conclusion, summary sentence, or explanatory text as a row inside a markdown table. All conclusions and summary text MUST appear BELOW the table as plain text paragraphs, completely outside the table. A table row must only contain data values, never sentences.
+- EMPTY COLUMN RULE: Before rendering any table, scan every column across ALL rows. If a column contains only null, empty string, or 'Not available' for every single row — DROP that column entirely from the table. Do NOT render a column that has no real data in any row. A column must appear only if at least one row has an actual value.
+- DELAY REASON RULE: If the question asks for delay reasons but the data has no populated delay_reason values, do NOT show a delay reason column. Instead add one line below the table: 'Delay reasons were not recorded for these voyages in the system.'
 - Keep lists short and scannable. Never dump huge raw lists.
 - Never repeat the same '###' heading more than once.
 - You will receive style flags in data.style. Follow them strictly.
 - Do NOT omit rows or metrics for brevity. Include all available data for every voyage/row in the result set.
+- VERDICT FIRST RULE: Always open your response with exactly one sentence that states a direct judgment or conclusion answering the user's question. This sentence must contain an opinion or verdict (e.g. 'Voyage 1901 was profitable with no operational issues.' or 'NHC was the most profitable cargo grade.'). Never open with a table, a data list, or phrases like 'Based on the provided data...' or 'The dataset shows...'
+- ARCHETYPE RULE: Identify the query type and apply the matching structure:
+  DIAGNOSTIC (what went wrong / root cause / explain): prose narrative only, no tables. Format: Verdict -> Financial impact -> Remarks interpreted.
+  RANKING (top N / highest / lowest / most): named winner in sentence 1, then ranked table (max 5 rows), then one insight line.
+  SNAPSHOT (summary of one voyage/vessel): Verdict -> Financial table (Revenue, Expense, PnL, TCE only) -> Ports (max 5) -> Remarks classified.
+  COMPARISON (actual vs fixed / compare voyages): Pattern statement first, then comparison table, then remarks that confirm the pattern.
+  FLEET/VESSEL PROFILE (how is vessel X doing): Performance verdict -> Best voyage -> Worst voyage -> Trend if visible.
+  AGGREGATE (by grade / by module type / by segment): Winner named first, then grouped table sorted by performance, then pattern note.
+- REMARKS CLASSIFICATION RULE: Every remark shown to the user must be prefixed with its category in brackets. Categories: [Operational Issue] [Financial Adjustment] [Administrative] [Delay Related]. Never show a raw unclassified remark string to the user. If no remarks exist, write 'No remarks on record.' once only - never repeat it per row.
+- PORT BREVITY RULE: Show a maximum of 5 ports per voyage. Format must be: 'Port A (L), Port B (D), Port C (D) (+N more)'. Never bullet-list more than 5 ports. Never show a 10+ port list.
+- NUMBERS WITH CONTEXT RULE: When showing PnL and revenue is also available, include the margin percentage inline: '$982K PnL on $7.2M revenue (13.6% margin)'. When showing offhire days and expense is available, include: '67 offhire days - estimated cost impact $X'.
+- INCIDENT FORMAT RULE: For diagnostic queries (what went wrong, root cause, explain delays, give incident summary), use flowing prose paragraphs - NOT tables. Tables are only for ranking, comparison, and snapshot queries.
+- FOLLOW-UP RULE: If the voyage or vessel was already introduced in a prior response in this session, do NOT re-introduce it. Skip 'Voyage 1901 operated by Stena Conquest...' and go directly to the new information being asked.
+- EMPTY COLUMN RULE: Before rendering any table, scan every column across ALL rows. If a column contains only null, empty string, or 'Not available' for every single row - DROP that column entirely. A column must only appear if at least one row has an actual value.
+- TABLE RULE: Never put a conclusion, summary sentence, or explanatory text as a row inside a markdown table. All conclusions MUST appear BELOW the table as plain text. A table row contains only data values.
+- VESSEL ID RULE: The vessel_name field is ALWAYS populated in the merged data. Use vessel_name as the row identifier. If you see a column called vessel_id or voyage_id containing a long hex string, do NOT show that column — drop it entirely. The column header must be 'Vessel' or 'Vessel Name', never 'Vessel ID'.
+- AMBIGUOUS VOYAGE RULE: If the data contains multiple rows with the same voyage_number but different vessel_name values, do NOT silently pick one. Open the response with exactly this pattern: 'Voyage [X] exists across [N] vessels in the dataset. Showing all results below — specify a vessel name to narrow down.' Then show a table with voyage_number, vessel_name, PnL, revenue as the first columns so the user can identify which vessel they meant. Never merge rows from different vessels even if voyage_number matches.
 
 DATA PRIORITY:
 - If data.artifacts.merged_rows exists, it is the PRIMARY joined dataset (one item per voyage).
@@ -805,6 +1049,17 @@ FAILSAFE:
             style=style,
             merged_safe=(merged_safe if isinstance(merged_safe, dict) else {}),
         )
+        cleaned = self._ensure_ranking_voyages_answer(
+            text=cleaned,
+            intent_key=intent_key,
+            merged_safe=(merged_safe if isinstance(merged_safe, dict) else {}),
+        )
+        cleaned = self._ensure_cargo_profitability_answer(
+            text=cleaned,
+            intent_key=intent_key,
+            merged_safe=(merged_safe if isinstance(merged_safe, dict) else {}),
+        )
+        cleaned = _enforce_table_rules(cleaned)
         return cleaned if cleaned else "Not available in dataset."
 
     def _polish_answer_if_needed(
@@ -900,7 +1155,7 @@ FAILSAFE:
 
         return {
             "intent_key": intent_key,
-            "narrative_summary": bool(narrative_summary) if intent_key == "voyage.summary" else False,
+            "narrative_summary": bool(narrative_summary),
             "financial_first": bool(financial_first),
             "ask_ports": bool(ask_ports),
             "ask_grades": bool(ask_grades),
@@ -1009,6 +1264,328 @@ FAILSAFE:
                 _result.append('_' + _e + '_')
         s = '\n'.join(_result).strip()
 
+        # Readability cleanup for common LLM formatting glitches in narrative text:
+        # - broken numeric grouping: "1, 878, 032" -> "1,878,032"
+        # - compacted ranges: "123to456" -> "123 to 456"
+        # - compacted number+word boundaries: "2301and" -> "2301 and"
+        s = self._normalize_readability_text(s)
+
+        return s.strip()
+
+    def _ensure_ranking_voyages_answer(self, *, text: str, intent_key: str, merged_safe: Dict[str, Any]) -> str:
+        """
+        Deterministic safety net for ranking.voyages answers.
+        If merged_rows contain KPI data but the LLM response still claims metrics are unavailable,
+        rebuild a concise table directly from merged_rows.
+        """
+        ik = str(intent_key or "")
+        if not ik.startswith("ranking.") or ik == "ranking.vessels":
+            return text
+
+        artifacts = merged_safe.get("artifacts") if isinstance(merged_safe, dict) else {}
+        rows = artifacts.get("merged_rows") if isinstance(artifacts, dict) else None
+        if not isinstance(rows, list) or not rows:
+            return text
+
+        def _has_metric(v: Any) -> bool:
+            return v not in (None, "", "Not available", "not available", "N/A", "n/a")
+
+        has_kpi_data = any(
+            isinstance(r, dict) and (
+                _has_metric(r.get("pnl"))
+                or _has_metric(r.get("revenue"))
+                or _has_metric(r.get("total_expense"))
+                or _has_metric(r.get("port_calls"))
+            )
+            for r in rows
+        )
+        if not has_kpi_data:
+            return text
+
+        low = (text or "").lower()
+        if "not available" not in low:
+            return text
+        if not any(k in low for k in ("pnl", "revenue", "total expense", "financial metrics", "port count", "port calls")):
+            return text
+
+        def _fmt_num(v: Any) -> str:
+            s = self._fmt_usd(v)
+            return s if s is not None else "Not available"
+
+        def _fmt_ports(v: Any) -> str:
+            if isinstance(v, list):
+                out: List[str] = []
+                for p in v:
+                    if isinstance(p, dict):
+                        pn = str(p.get("portName") or p.get("port_name") or "").strip()
+                        at = str(p.get("activityType") or p.get("activity_type") or "").strip()
+                        if pn:
+                            out.append(f"{pn} ({at})" if at else pn)
+                    elif p is not None:
+                        s = str(p).strip()
+                        if s:
+                            out.append(s)
+                out = out[:8]
+                return ", ".join(out) if out else "Not available"
+            return "Not available"
+
+        def _fmt_grades(v: Any) -> str:
+            if isinstance(v, list):
+                out: List[str] = []
+                for g in v:
+                    if isinstance(g, dict):
+                        gv = g.get("gradeName") or g.get("grade_name") or g.get("name")
+                        if gv is not None:
+                            s = str(gv).strip()
+                            if s and s.lower() not in ("none", "null", "n/a"):
+                                out.append(s)
+                    elif g is not None:
+                        s = str(g).strip()
+                        if s and s.lower() not in ("none", "null", "n/a"):
+                            out.append(s)
+                out = list(dict.fromkeys(out))[:8]
+                return ", ".join(out) if out else "Not available"
+            return "Not available"
+
+        def _fmt_remarks(v: Any) -> str:
+            if isinstance(v, list):
+                out: List[str] = []
+                for r in v:
+                    if isinstance(r, dict):
+                        rv = r.get("remark")
+                        if rv is not None:
+                            s = str(rv).strip()
+                            if s:
+                                out.append(s)
+                    elif r is not None:
+                        s = str(r).strip()
+                        if s:
+                            out.append(s)
+                return out[0] if out else "Not available"
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            return "Not available"
+
+        top = rows[:10]
+        table_lines = [
+            "### Summary",
+            f"- Ranked the top {len(top)} voyages using available finance + ops data.",
+            "- Included all available requested metrics such as PnL, revenue, total expense, port calls, ports, cargo grades, and remarks.",
+            "",
+            "### Results",
+            "| Voyage # | Vessel Name | Port Calls | PnL | Revenue | Total expense | Key ports | Cargo grades | Remarks |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for r in top:
+            if not isinstance(r, dict):
+                continue
+            vn = r.get("voyage_number") if r.get("voyage_number") is not None else "Not available"
+            vessel_name = r.get("vessel_name") if r.get("vessel_name") not in (None, "") else "Not available"
+            port_calls = r.get("port_calls") if r.get("port_calls") not in (None, "") else "Not available"
+            table_lines.append(
+                f"| {vn} | {vessel_name} | {port_calls} | {_fmt_num(r.get('pnl'))} | {_fmt_num(r.get('revenue'))} | {_fmt_num(r.get('total_expense'))} | {_fmt_ports(r.get('key_ports'))} | {_fmt_grades(r.get('cargo_grades'))} | {_fmt_remarks(r.get('remarks'))} |"
+            )
+        return "\n".join(table_lines).strip()
+
+    def _ensure_cargo_profitability_answer(self, *, text: str, intent_key: str, merged_safe: Dict[str, Any]) -> str:
+        """
+        Deterministic output guard for cargo profitability aggregates.
+        Ensures one row per normalized cargo grade and stable KPI formatting.
+        """
+        ik = str(intent_key or "")
+        if ik not in ("analysis.cargo_profitability", "analysis.cargoprofitability"):
+            return text
+
+        artifacts = merged_safe.get("artifacts") if isinstance(merged_safe, dict) else {}
+        rows = artifacts.get("merged_rows") if isinstance(artifacts, dict) else None
+        if not isinstance(rows, list) or not rows:
+            return text
+
+        def _grade_key(v: Any) -> str:
+            if v is None:
+                return ""
+            if isinstance(v, dict):
+                v = v.get("grade_name") or v.get("gradeName") or v.get("name") or v.get("grade")
+            s = str(v).strip()
+            if s.startswith("{") and s.endswith("}"):
+                try:
+                    obj = ast.literal_eval(s)
+                    if isinstance(obj, dict):
+                        g = obj.get("grade_name") or obj.get("gradeName") or obj.get("name") or obj.get("grade")
+                        s = str(g).strip() if g not in (None, "", [], {}) else ""
+                except Exception:
+                    m = re.search(r"""['"](?:grade_name|gradeName|name|grade)['"]\s*:\s*['"]([^'"]+)['"]""", s)
+                    if m:
+                        s = m.group(1).strip()
+            s = s.lower()
+            if s in ("", "none", "null", "n/a", "na"):
+                return ""
+            return s
+
+        grouped: Dict[str, Dict[str, Any]] = {}
+        order: List[str] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            grades = r.get("cargo_grades")
+            grade_raw = None
+            if isinstance(grades, list) and grades:
+                grade_raw = grades[0]
+            else:
+                grade_raw = (r.get("finance") or {}).get("cargo_grade") if isinstance(r.get("finance"), dict) else None
+            if isinstance(grade_raw, dict):
+                grade_raw = grade_raw.get("grade_name") or grade_raw.get("gradeName") or grade_raw.get("name") or grade_raw.get("grade")
+            if isinstance(grade_raw, str) and grade_raw.strip().startswith("{") and grade_raw.strip().endswith("}"):
+                try:
+                    obj = ast.literal_eval(grade_raw.strip())
+                    if isinstance(obj, dict):
+                        g = obj.get("grade_name") or obj.get("gradeName") or obj.get("name") or obj.get("grade")
+                        grade_raw = str(g).strip() if g not in (None, "", [], {}) else ""
+                except Exception:
+                    m = re.search(r"""['"](?:grade_name|gradeName|name|grade)['"]\s*:\s*['"]([^'"]+)['"]""", grade_raw)
+                    if m:
+                        grade_raw = m.group(1).strip()
+            gk = _grade_key(grade_raw)
+            if not gk:
+                continue
+            if gk not in grouped:
+                order.append(gk)
+                fin = r.get("finance") if isinstance(r.get("finance"), dict) else {}
+                grouped[gk] = {
+                    "display_grade": str(grade_raw).strip() if isinstance(grade_raw, str) and str(grade_raw).strip() else gk,
+                    "pnl": r.get("pnl") if r.get("pnl") not in (None, "") else (fin.get("avg_pnl") or fin.get("pnl")),
+                    "revenue": r.get("revenue") if r.get("revenue") not in (None, "") else (fin.get("avg_revenue") or fin.get("revenue")),
+                    "voyage_count": r.get("voyage_count") if r.get("voyage_count") not in (None, "") else fin.get("voyage_count"),
+                    "ports": [],
+                    "remarks": [],
+                }
+            g = grouped[gk]
+            fin = r.get("finance") if isinstance(r.get("finance"), dict) else {}
+            if g.get("pnl") in (None, ""):
+                gp = r.get("pnl")
+                if gp in (None, ""):
+                    gp = fin.get("avg_pnl") or fin.get("pnl")
+                if gp not in (None, ""):
+                    g["pnl"] = gp
+            if g.get("revenue") in (None, ""):
+                gr = r.get("revenue")
+                if gr in (None, ""):
+                    gr = fin.get("avg_revenue") or fin.get("revenue")
+                if gr not in (None, ""):
+                    g["revenue"] = gr
+            if g.get("voyage_count") in (None, ""):
+                gv = r.get("voyage_count")
+                if gv in (None, ""):
+                    gv = fin.get("voyage_count")
+                if gv not in (None, ""):
+                    g["voyage_count"] = gv
+
+            kp = r.get("key_ports")
+            if isinstance(kp, list):
+                for p in kp:
+                    if isinstance(p, dict):
+                        pn = str(p.get("portName") or p.get("port_name") or p.get("name") or "").strip()
+                    else:
+                        pn = ""
+                        if p is not None:
+                            ps = str(p).strip()
+                            if ps.startswith("{") and ps.endswith("}"):
+                                try:
+                                    obj = ast.literal_eval(ps)
+                                    if isinstance(obj, dict):
+                                        pv = obj.get("port_name") or obj.get("portName") or obj.get("name")
+                                        pn = str(pv).strip() if pv not in (None, "", [], {}) else ""
+                                except Exception:
+                                    m = re.search(r"""['"](?:port_name|portName|name)['"]\s*:\s*['"]([^'"]+)['"]""", ps)
+                                    if m:
+                                        pn = m.group(1).strip()
+                            else:
+                                pn = ps
+                    if pn and pn not in g["ports"]:
+                        g["ports"].append(pn)
+
+            rem = r.get("remarks")
+            if isinstance(rem, list):
+                for rr in rem:
+                    s = str(rr).strip() if rr is not None else ""
+                    if s and s not in g["remarks"]:
+                        g["remarks"].append(s)
+            elif isinstance(rem, str) and rem.strip() and rem.strip() not in g["remarks"]:
+                g["remarks"].append(rem.strip())
+
+        if not grouped:
+            return text
+
+        def _sort_key(item: Dict[str, Any]) -> tuple:
+            try:
+                p = float(item.get("pnl"))
+            except Exception:
+                p = None
+            return (p is None, -(p or 0.0))
+
+        final_rows = [grouped[k] for k in order]
+        final_rows.sort(key=_sort_key)
+        final_rows = final_rows[:10]
+
+        table_lines = [
+            "### Summary",
+            f"- Most profitable cargo grades ranked by average PnL (top {len(final_rows)} shown).",
+            "- Included common ports and recurring congestion/delay remarks where available.",
+            "",
+            "### Results",
+            "| Cargo grade | Avg PnL | Avg Revenue | Voyage count | Common ports | Congestion/Delay remarks |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+        for r in final_rows:
+            ports = r.get("ports") or []
+            if isinstance(ports, list):
+                if len(ports) > 8:
+                    ports_txt = ", ".join(ports[:8]) + f" (+{len(ports)-8} more)"
+                else:
+                    ports_txt = ", ".join(ports) if ports else "Not available"
+            else:
+                ports_txt = "Not available"
+            remarks = r.get("remarks") or []
+            if isinstance(remarks, list):
+                remarks_txt = " | ".join(remarks[:3]) if remarks else "No recurring congestion/delay remarks"
+            else:
+                remarks_txt = str(remarks) if remarks else "No recurring congestion/delay remarks"
+            vc = r.get("voyage_count")
+            vc_txt = str(int(vc)) if isinstance(vc, (int, float)) else (str(vc) if vc not in (None, "") else "Not available")
+            table_lines.append(
+                f"| {r.get('display_grade') or 'Not available'} | {self._fmt_usd(r.get('pnl')) or 'Not available'} | {self._fmt_usd(r.get('revenue')) or 'Not available'} | {vc_txt} | {ports_txt} | {remarks_txt} |"
+            )
+        return "\n".join(table_lines).strip()
+
+    @staticmethod
+    def _normalize_readability_text(text: str) -> str:
+        s = str(text or "")
+        if not s:
+            return s
+
+        # Normalize accidental spacing after currency symbol.
+        s = re.sub(r"\$\s+(?=\d)", "$", s)
+
+        # Normalize common metric tokens if the model outputs spaced letters.
+        s = re.sub(r"\bP\s*n\s*L\b", "PnL", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bT\s*C\s*E\b", "TCE", s, flags=re.IGNORECASE)
+
+        # Remove spaces around commas for thousand groups in numbers.
+        # Run a few passes to fix multi-group numbers (e.g., 1, 878, 032).
+        for _ in range(3):
+            s = re.sub(r"(?<=\d),\s+(?=\d{3}\b)", ",", s)
+            s = re.sub(r"(?<=\d)\s+,\s*(?=\d{3}\b)", ",", s)
+
+        # Fix compacted numeric ranges.
+        s = re.sub(r"(?<=\d)\s*to\s*(?=\$?\d)", " to ", s, flags=re.IGNORECASE)
+
+        # Fix compacted number-word boundaries in narrative text.
+        s = re.sub(r"(?<=\d)(?=[A-Za-z])", " ", s)
+        s = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", s)
+
+        # Normalize whitespace but keep markdown line breaks.
+        s = re.sub(r"[ \t]+", " ", s)
+        s = re.sub(r"\n{3,}", "\n\n", s)
         return s.strip()
 
     def _ensure_voyage_narrative_summary(self, text: str, *, merged_safe: Dict[str, Any]) -> str:
@@ -1159,10 +1736,17 @@ FAILSAFE:
         operation: str,
         max_retries: int = 3,
         return_string: bool = False,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
     ):
         for _ in range(max_retries):
             try:
-                raw = self._groq_chat(system=system, user=user)
+                raw = self._groq_chat(
+                    system=system,
+                    user=user,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
 
                 if return_string:
                     return raw
@@ -1264,13 +1848,85 @@ FAILSAFE:
             return [self._convert_to_json_safe(i) for i in obj]
         return obj
 
-    def _groq_chat(self, *, system: str, user: str) -> str:
+    def _groq_chat(
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
         completion = self.client.chat.completions.create(
             model=self.config.model,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            temperature=self.config.temperature,
+            temperature=(self.config.temperature if temperature is None else temperature),
+            max_tokens=max_tokens,
         )
         return completion.choices[0].message.content or ""
+
+
+def _enforce_table_rules(text: str) -> str:
+    lines = text.splitlines()
+    output = []
+    in_table = False
+    table_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        is_table_row = stripped.startswith("|")
+
+        if is_table_row:
+            in_table = True
+            table_lines.append(line)
+        else:
+            if in_table:
+                output.extend(_drop_empty_columns(table_lines))
+                table_lines = []
+                in_table = False
+            output.append(line)
+
+    if table_lines:
+        output.extend(_drop_empty_columns(table_lines))
+
+    return "\n".join(output)
+
+
+def _drop_empty_columns(table_lines: list) -> list:
+    if len(table_lines) < 2:
+        return table_lines
+
+    def split_row(line):
+        parts = line.strip().strip("|").split("|")
+        return [p.strip() for p in parts]
+
+    rows = [split_row(l) for l in table_lines]
+    if not rows:
+        return table_lines
+
+    num_cols = max(len(r) for r in rows)
+    rows = [r + [""] * (num_cols - len(r)) for r in rows]
+
+    data_rows = [r for i, r in enumerate(rows) if i != 1]
+    EMPTY_VALUES = {"", "not available", "n/a", "none", "null", "-", "—"}
+    keep_cols = []
+    for col_idx in range(num_cols):
+        vals = [r[col_idx].lower() for r in data_rows]
+        if any(v not in EMPTY_VALUES for v in vals):
+            keep_cols.append(col_idx)
+
+    if len(keep_cols) == num_cols:
+        return table_lines
+
+    result = []
+    for row in rows:
+        kept = [row[i] if i < len(row) else "" for i in keep_cols]
+        kept = [
+            "—" if c.strip().lower() in ("not available", "n/a", "none", "null", "")
+            else c
+            for c in kept
+        ]
+        result.append("| " + " | ".join(kept) + " |")
+    return result

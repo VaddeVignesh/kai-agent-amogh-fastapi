@@ -1,0 +1,1982 @@
+{
+  "meta": {
+    "run_started_ts": 1774613749.568442,
+    "api_url": "http://127.0.0.1:8000/query",
+    "benchmark_file": "eval\\benchmark_queries.json",
+    "query_count": 15,
+    "run_finished_ts": 1774613847.0125866,
+    "elapsed_sec": 97.444
+  },
+  "results": [
+    {
+      "id": "Q01",
+      "query": "For voyage 2306, give financial snapshot (revenue, total expense, PnL proxy), cargo grade, fixture ports, and key remarks.",
+      "session_id": "eval-q01",
+      "ok": true,
+      "elapsed_ms": 4689,
+      "intent_key": "voyage.summary",
+      "slots": {
+        "voyage_numbers": [
+          2306
+        ],
+        "voyage_number": 2306,
+        "voyage_id": "ABCD2C938DC82BD236B0161F5E88E263",
+        "imo": "9667485",
+        "vessel_name": "Stena Imperial"
+      },
+      "answer": "### Summary\n- **Vessel**: Stena Imperial (IMO: 9667485)\n\nVoyage 2306 of the Stena Imperial had a revenue of $839,948.97, a total expense of $401,774.31, and a PnL of $438,174.66. The cargo grade was Naphtha. The fixture ports were Bilbao for loading and Antwerp for discharge. Key remarks include: FDA Antwerp approved, inserted waiting for charterers orders and additional bunkers consumed as revenue, and est demurrage updated.",
+      "clarification": null,
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "voyage.summary",
+          "slots": {
+            "voyage_numbers": [
+              2306
+            ],
+            "voyage_number": 2306
+          },
+          "likely_path": "single",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "single",
+          "intent_key": "voyage.summary",
+          "steps": []
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 2,
+          "agent": "finance",
+          "operation": "registry_sql",
+          "inputs": {
+            "intent_key": "voyage.summary"
+          },
+          "goal": "Run finance registry SQL in single plan mode."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "registry_sql",
+          "ok": true,
+          "mode": "registry_sql",
+          "rows": 1,
+          "voyage_ids": 1,
+          "extracted_voyage_ids": [
+            "ABCD2C938DC82BD236B0161F5E88E263"
+          ],
+          "sql_present": true,
+          "sql": "SELECT DISTINCT\n              f.voyage_id,\n              f.voyage_number,\n              f.vessel_imo,\n              f.scenario,\n              f.revenue,\n              f.total_expense,\n              f.pnl,\n              f.tce,\n              f.total_commission,\n              f.voyage_start_date,\n              f.voyage_end_date,\n              o.vessel_name,\n              o.module_type,\n              o.fixture_count,\n              o.is_delayed,\n              o.delay_reason,\n              o.offhire_days,\n              o.ports_json,\n              o.grades_json,\n              o.activities_json\n            FROM finance_voyage_kpi f\n            LEFT JOIN ops_voyage_summary o\n              ON f.voyage_number = o.voyage_number\n              AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')\n            WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')\n              AND (\n                (%(voyage_number)s IS NOT NULL AND f.voyage_number::TEXT = %(voyage_number)s::TEXT)\n                OR (%(voyage_id)s IS NOT NULL AND f.voyage_id::TEXT = %(voyage_id)s::TEXT)\n              )\n              AND (\n                %(vessel_imo)s IS NULL\n                OR REPLACE(f.vessel_imo::TEXT, '.0', '') = %(vessel_imo)s::TEXT\n              )\n            LIMIT 10;",
+          "summary": "Finance(single): fetched 1 rows using registry SQL."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 2,
+          "agent": "ops",
+          "operation": "registry_sql",
+          "inputs": {
+            "intent_key": "voyage.summary"
+          },
+          "goal": "Run ops registry SQL in single plan mode."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "registry_sql",
+          "ok": true,
+          "mode": "registry_sql",
+          "rows": 1,
+          "voyage_ids": 1,
+          "extracted_voyage_ids": [
+            "ABCD2C938DC82BD236B0161F5E88E263"
+          ],
+          "sql_present": true,
+          "sql": "SELECT DISTINCT\n              f.voyage_id,\n              f.voyage_number,\n              f.vessel_imo,\n              f.scenario,\n              f.revenue,\n              f.total_expense,\n              f.pnl,\n              f.tce,\n              f.total_commission,\n              f.voyage_start_date,\n              f.voyage_end_date,\n              o.vessel_name,\n              o.module_type,\n              o.fixture_count,\n              o.is_delayed,\n              o.delay_reason,\n              o.offhire_days,\n              o.ports_json,\n              o.grades_json,\n              o.activities_json\n            FROM finance_voyage_kpi f\n            LEFT JOIN ops_voyage_summary o\n              ON f.voyage_number = o.voyage_number\n              AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')\n            WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')\n              AND (\n                (%(voyage_number)s IS NOT NULL AND f.voyage_number::TEXT = %(voyage_number)s::TEXT)\n                OR (%(voyage_id)s IS NOT NULL AND f.voyage_id::TEXT = %(voyage_id)s::TEXT)\n              )\n              AND (\n                %(vessel_imo)s IS NULL\n                OR REPLACE(f.vessel_imo::TEXT, '.0', '') = %(vessel_imo)s::TEXT\n              )\n            LIMIT 10;",
+          "summary": "Ops(single): fetched 1 rows using registry SQL."
+        }
+      ],
+      "dynamic_sql_used_detected": false,
+      "dynamic_sql_used_flag": false,
+      "dynamic_sql_agents": []
+    },
+    {
+      "id": "Q02",
+      "query": "Among Elka Delphi, Torm Thor, Dee4 Juniper, Nord Himalaya, and Pacific Moonstone, rank by hire rate and identify highest and lowest.",
+      "session_id": "eval-q02",
+      "ok": true,
+      "elapsed_ms": 7749,
+      "intent_key": "ranking.vessels",
+      "slots": {
+        "limit": 10,
+        "voyage_ids": []
+      },
+      "answer": "The highest hire rate among the given vessels is not available, while the lowest hire rate is also not available due to missing financial data.\n\n### Summary\n- **Vessels**: 5 vessels with varying voyage counts\n- **Voyage count**: ranges from 1 to 22\n\n### Results\n| Vessel Name | Voyage Count |\n| --- | --- |\n| Dee 4 Juniper | 22 |\n| Elka Delphi | 3 |\n| Nord Himalaya | 2 |\n| Torm Thor | 1 |\n| Pacific Moonstone | 1 |\nThe vessels are ranked by voyage count, but hire rate information is not available to determine the highest and lowest hire rates.",
+      "clarification": null,
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "ranking.vessels",
+          "slots": {},
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "composite",
+          "intent_key": "ranking.vessels",
+          "steps": [
+            {
+              "agent": "finance",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "question": "Among Elka Delphi, Torm Thor, Dee4 Juniper, Nord Himalaya, and Pacific Moonstone, rank by hire rate and identify highest and lowest.",
+                "limit": 10,
+                "intent_key": "ranking.vessels"
+              }
+            },
+            {
+              "agent": "ops",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "llm",
+              "operation": "merge",
+              "inputs": {}
+            }
+          ]
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 3,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "question": "Among Elka Delphi, Torm Thor, Dee4 Juniper, Nord Himalaya, and Pacific Moonstone, rank by hire rate and identify highest and lowest.",
+            "limit": 10,
+            "intent_key": "ranking.vessels"
+          },
+          "goal": "Fetch top 10 voyages for the ranking intent (Postgres finance KPIs), returning voyage_ids for downstream steps."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "ok": false,
+          "error": "Postgres query failed: operator does not exist: character varying = text[]\nLINE 1: ... = COALESCE('ACTUAL', 'ACTUAL') AND o.vessel_name IN ((ARRAY...\n                                                             ^\nHINT:  No operator matches the given name and argument types. You might need to add explicit type casts."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 3,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch ops summaries (ports/grades/remarks/delay/offhire) for the selected voyage_ids from Postgres."
+        },
+        {
+          "phase": "composite_step_inputs_resolved",
+          "step_index": 2,
+          "agent": "ops",
+          "resolved_voyage_ids_count": 0,
+          "resolved_cargo_grades_count": 0,
+          "intent_key_ops": "ranking.vessels"
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 5,
+          "voyage_ids": 0,
+          "extracted_voyage_ids": [],
+          "sql_present": true,
+          "sql": "SELECT o.vessel_imo, o.vessel_name, COUNT(*) AS voyage_count FROM ops_voyage_summary o WHERE o.vessel_name IN ('Elka Delphi', 'Torm Thor', 'Dee4 Juniper', 'Nord Himalaya', 'Pacific Moonstone') GROUP BY o.vessel_imo, o.vessel_name ORDER BY voyage_count DESC LIMIT %(limit)s",
+          "summary": "Ops: fetched 5 ops rows for voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 3,
+          "step_count": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "inputs": {},
+          "goal": "Deterministically merge finance + ops + mongo context into a single joined dataset for summarization."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "ok": true,
+          "merged_rows": 0,
+          "summary": "Merge: joined finance + ops + mongo context into 0 merged rows."
+        },
+        {
+          "phase": "token_usage",
+          "stage": "pre_sanitize",
+          "total_tokens_est": 191,
+          "mongo_tokens_est": 11,
+          "finance_tokens_est": 7,
+          "ops_tokens_est": 107,
+          "artifacts_tokens_est": 39
+        },
+        {
+          "phase": "token_usage",
+          "stage": "post_sanitize",
+          "total_tokens_est": 270,
+          "saved_tokens_est": -79,
+          "saved_pct_est": -41.361256544502616
+        }
+      ],
+      "dynamic_sql_used_detected": true,
+      "dynamic_sql_used_flag": true,
+      "dynamic_sql_agents": [
+        "ops"
+      ]
+    },
+    {
+      "id": "Q03",
+      "query": "For Elka Delphi, list default ballast and laden speed/IFO, plus current contract owner and duration.",
+      "session_id": "eval-q03",
+      "ok": true,
+      "elapsed_ms": 1478,
+      "intent_key": "vessel.metadata",
+      "slots": {
+        "vessel_name": "Elka Delphi"
+      },
+      "answer": "### Summary\n- **Vessel**: Elka Delphi (IMO: 9705902)\n\n### Passage consumption\n- **Ballast** (default): speed=13.0, IFO=22.5, MGO=0.0\n- **Laden** (default): speed=13.0, IFO=25.0, MGO=0.0\n\n### Contract history\n- Contract HCPC2644230731 | Owner: European Pro | Duration: 6 Months | CP Date: 31 Jul 2023 00:00 | Delivery: 04 Aug 2023 00:00",
+      "clarification": null,
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "vessel.metadata",
+          "slots": {
+            "vessel_name": "Elka Delphi"
+          },
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "single",
+          "intent_key": "vessel.metadata",
+          "steps": []
+        }
+      ],
+      "dynamic_sql_used_detected": false,
+      "dynamic_sql_used_flag": false,
+      "dynamic_sql_agents": []
+    },
+    {
+      "id": "Q04",
+      "query": "For Torm Thor, check scrubber consistency across fields and tags. Report if there is contradiction.",
+      "session_id": "eval-q04",
+      "ok": true,
+      "elapsed_ms": 1978,
+      "intent_key": "vessel.metadata",
+      "slots": {
+        "vessel_name": "Torm Thor"
+      },
+      "answer": "### Summary\n- **Vessel**: Torm Thor (IMO: 9712292)\n- **Hire rate**: $14,888.00\n- **Operating**: Yes\n- **Scrubber**: No\n- **Market type**: Tanker\n- **Tags**: Scrubber, Short Pool (#170), MR ECO, short, Stena Bulk A/S (#341), Not Sanctioned",
+      "clarification": null,
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "vessel.metadata",
+          "slots": {
+            "vessel_name": "Torm Thor"
+          },
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "single",
+          "intent_key": "vessel.metadata",
+          "steps": []
+        }
+      ],
+      "dynamic_sql_used_detected": false,
+      "dynamic_sql_used_flag": false,
+      "dynamic_sql_agents": []
+    },
+    {
+      "id": "Q05",
+      "query": "Compare Elka Delphi vs Nord Himalaya default laden fuel intensity (IFO per knot) and say which is more efficient.",
+      "session_id": "eval-q05",
+      "ok": true,
+      "elapsed_ms": 8108,
+      "intent_key": "comparison.vessels",
+      "slots": {
+        "limit": 10,
+        "voyage_ids": []
+      },
+      "answer": "Elka Delphi is more efficient than Nord Himalaya in terms of default laden fuel intensity (IFO per knot). \nThe comparison is based on the laden fuel intensity of Elka Delphi and Nord Himalaya, with Elka Delphi having a lower average laden fuel intensity. \n| Vessel Name | Laden Fuel Intensity |\n| --- | --- |\n| Elka Delphi | 0.199 |\n| Nord Himalaya | 0.209 |\nThe data suggests that Elka Delphi tends to have a lower fuel intensity, indicating it is more fuel-efficient than Nord Himalaya.",
+      "clarification": null,
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "comparison.vessels",
+          "slots": {},
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "composite",
+          "intent_key": "comparison.vessels",
+          "steps": [
+            {
+              "agent": "finance",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "question": "Compare Elka Delphi vs Nord Himalaya default laden fuel intensity (IFO per knot) and say which is more efficient.",
+                "limit": 10,
+                "intent_key": "comparison.vessels"
+              }
+            },
+            {
+              "agent": "ops",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "llm",
+              "operation": "merge",
+              "inputs": {}
+            }
+          ]
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 3,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "question": "Compare Elka Delphi vs Nord Himalaya default laden fuel intensity (IFO per knot) and say which is more efficient.",
+            "limit": 10,
+            "intent_key": "comparison.vessels"
+          },
+          "goal": "Run a finance analysis query in Postgres (dynamic SQL) and return voyage_ids for downstream steps (limit=10)."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 10,
+          "voyage_ids": 0,
+          "sql_present": true,
+          "sql": "SELECT f.vessel_imo, AVG(f.pnl) AS avg_pnl, SUM(f.pnl) AS total_pnl, COUNT(*) AS voyage_count FROM finance_voyage_kpi f WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL') GROUP BY f.vessel_imo ORDER BY avg_pnl DESC LIMIT %(limit)s",
+          "summary": "Finance: fetched 10 rows (Postgres). No voyage_ids extracted."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 3,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch ops summaries (ports/grades/remarks/delay/offhire) for the selected voyage_ids from Postgres."
+        },
+        {
+          "phase": "composite_step_inputs_resolved",
+          "step_index": 2,
+          "agent": "ops",
+          "resolved_voyage_ids_count": 0,
+          "resolved_cargo_grades_count": 0,
+          "intent_key_ops": "comparison.vessels"
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 5,
+          "voyage_ids": 0,
+          "extracted_voyage_ids": [],
+          "sql_present": true,
+          "sql": "WITH vessel_pnl AS (SELECT f.vessel_imo, o.vessel_name, f.revenue, f.bunker_cost, f.voyage_days FROM finance_voyage_kpi f JOIN ops_voyage_summary o ON f.voyage_number = o.voyage_number AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '') WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')) SELECT vessel_imo, vessel_name, (bunker_cost / voyage_days) / (revenue / voyage_days) AS laden_fuel_intensity FROM vessel_pnl WHERE vessel_name IN ('Elka Delphi', 'Nord Himalaya') ORDER BY laden_fuel_intensity LIMIT %(limit)s",
+          "summary": "Ops: fetched 5 ops rows for voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 3,
+          "step_count": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "inputs": {},
+          "goal": "Deterministically merge finance + ops + mongo context into a single joined dataset for summarization."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "ok": true,
+          "merged_rows": 0,
+          "summary": "Merge: joined finance + ops + mongo context into 0 merged rows."
+        },
+        {
+          "phase": "token_usage",
+          "stage": "pre_sanitize",
+          "total_tokens_est": 558,
+          "mongo_tokens_est": 11,
+          "finance_tokens_est": 317,
+          "ops_tokens_est": 156,
+          "artifacts_tokens_est": 43
+        },
+        {
+          "phase": "token_usage",
+          "stage": "post_sanitize",
+          "total_tokens_est": 637,
+          "saved_tokens_est": -79,
+          "saved_pct_est": -14.157706093189963
+        }
+      ],
+      "dynamic_sql_used_detected": true,
+      "dynamic_sql_used_flag": true,
+      "dynamic_sql_agents": [
+        "finance",
+        "ops"
+      ]
+    },
+    {
+      "id": "Q06",
+      "query": "For voyage 2306, provide an incident-style summary: likely causes, demurrage impact, and commercial adjustments from remarks.",
+      "session_id": "eval-q06",
+      "ok": true,
+      "elapsed_ms": 3691,
+      "intent_key": "voyage.summary",
+      "slots": {
+        "voyage_numbers": [
+          2306
+        ],
+        "voyage_number": 2306,
+        "voyage_id": "ABCD2C938DC82BD236B0161F5E88E263",
+        "imo": "9667485",
+        "vessel_name": "Stena Imperial"
+      },
+      "answer": "### Summary\n- **Vessel**: Stena Imperial (IMO: 9667485)\n\nVoyage 2306 on the Stena Imperial likely experienced delays due to waiting for charterers' orders, resulting in additional bunkers consumed. The demurrage impact was significant, with an estimated demurrage of $185,191.67. Commercial adjustments were made to account for these expenses, including inserting waiting for charterers' orders and additional bunkers consumed as revenue. \n\nThe remarks for this voyage indicate that there were issues with waiting for charterers' orders and additional bunkers consumed, which were inserted as revenue, and that the demurrage was updated. Specifically, the remarks mention: \n- Waiting for charterers' orders and additional bunkers consumed as revenue.\n- Est demurrage updated.\n- Inserted waiting for Chrts orders and additional bunkers consumed as revenue.",
+      "clarification": null,
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "voyage.summary",
+          "slots": {
+            "voyage_numbers": [
+              2306
+            ],
+            "voyage_number": 2306
+          },
+          "likely_path": "single",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "single",
+          "intent_key": "voyage.summary",
+          "steps": []
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 2,
+          "agent": "finance",
+          "operation": "registry_sql",
+          "inputs": {
+            "intent_key": "voyage.summary"
+          },
+          "goal": "Run finance registry SQL in single plan mode."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "registry_sql",
+          "ok": true,
+          "mode": "registry_sql",
+          "rows": 1,
+          "voyage_ids": 1,
+          "extracted_voyage_ids": [
+            "ABCD2C938DC82BD236B0161F5E88E263"
+          ],
+          "sql_present": true,
+          "sql": "SELECT DISTINCT\n              f.voyage_id,\n              f.voyage_number,\n              f.vessel_imo,\n              f.scenario,\n              f.revenue,\n              f.total_expense,\n              f.pnl,\n              f.tce,\n              f.total_commission,\n              f.voyage_start_date,\n              f.voyage_end_date,\n              o.vessel_name,\n              o.module_type,\n              o.fixture_count,\n              o.is_delayed,\n              o.delay_reason,\n              o.offhire_days,\n              o.ports_json,\n              o.grades_json,\n              o.activities_json\n            FROM finance_voyage_kpi f\n            LEFT JOIN ops_voyage_summary o\n              ON f.voyage_number = o.voyage_number\n              AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')\n            WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')\n              AND (\n                (%(voyage_number)s IS NOT NULL AND f.voyage_number::TEXT = %(voyage_number)s::TEXT)\n                OR (%(voyage_id)s IS NOT NULL AND f.voyage_id::TEXT = %(voyage_id)s::TEXT)\n              )\n              AND (\n                %(vessel_imo)s IS NULL\n                OR REPLACE(f.vessel_imo::TEXT, '.0', '') = %(vessel_imo)s::TEXT\n              )\n            LIMIT 10;",
+          "summary": "Finance(single): fetched 1 rows using registry SQL."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 2,
+          "agent": "ops",
+          "operation": "registry_sql",
+          "inputs": {
+            "intent_key": "voyage.summary"
+          },
+          "goal": "Run ops registry SQL in single plan mode."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "registry_sql",
+          "ok": true,
+          "mode": "registry_sql",
+          "rows": 1,
+          "voyage_ids": 1,
+          "extracted_voyage_ids": [
+            "ABCD2C938DC82BD236B0161F5E88E263"
+          ],
+          "sql_present": true,
+          "sql": "SELECT DISTINCT\n              f.voyage_id,\n              f.voyage_number,\n              f.vessel_imo,\n              f.scenario,\n              f.revenue,\n              f.total_expense,\n              f.pnl,\n              f.tce,\n              f.total_commission,\n              f.voyage_start_date,\n              f.voyage_end_date,\n              o.vessel_name,\n              o.module_type,\n              o.fixture_count,\n              o.is_delayed,\n              o.delay_reason,\n              o.offhire_days,\n              o.ports_json,\n              o.grades_json,\n              o.activities_json\n            FROM finance_voyage_kpi f\n            LEFT JOIN ops_voyage_summary o\n              ON f.voyage_number = o.voyage_number\n              AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')\n            WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')\n              AND (\n                (%(voyage_number)s IS NOT NULL AND f.voyage_number::TEXT = %(voyage_number)s::TEXT)\n                OR (%(voyage_id)s IS NOT NULL AND f.voyage_id::TEXT = %(voyage_id)s::TEXT)\n              )\n              AND (\n                %(vessel_imo)s IS NULL\n                OR REPLACE(f.vessel_imo::TEXT, '.0', '') = %(vessel_imo)s::TEXT\n              )\n            LIMIT 10;",
+          "summary": "Ops(single): fetched 1 rows using registry SQL."
+        }
+      ],
+      "dynamic_sql_used_detected": false,
+      "dynamic_sql_used_flag": false,
+      "dynamic_sql_agents": []
+    },
+    {
+      "id": "Q07",
+      "query": "For voyage 1901 on Stena Conquest, give me the financial summary (revenue, expenses, PnL, TCE), main ports and cargo grades, and any remarks on record.",
+      "session_id": "eval-q07",
+      "ok": true,
+      "elapsed_ms": 5442,
+      "intent_key": "voyage.summary",
+      "slots": {
+        "voyage_numbers": [
+          1901
+        ],
+        "vessel_name": "Stena Conquest",
+        "voyage_number": 1901,
+        "voyage_id": "BDEA0AD71D00DE30244B96E0D474F30A",
+        "imo": "9252436"
+      },
+      "answer": "### Summary\n- **Vessel**: Stena Conquest (IMO: 9252436)\n\nVoyage 1901 on Stena Conquest had a revenue of $7,244,739, total expenses of $1,637,929, a profit and loss (PnL) of $982,738, and a time charter equivalent (TCE) of $13,338. The main ports for this voyage include Belem for loading, Sao Sebastiao for discharge, Santos for loading, Manaus for discharge, Suape for loading, Salvador for loading, Guamare for discharge, Rio de Janeiro for loading, and Fortaleza for discharge, among others. The cargo grade is not specified. Remarks on record include COVID Claim reservation added, Petrobras declaring an 11-month option with a new hire rate of $14,900 from July 28, and the vessel being delivered to Petrobras on July 28, 2018, at Manaus.",
+      "clarification": null,
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "voyage.summary",
+          "slots": {
+            "voyage_numbers": [
+              1901
+            ],
+            "vessel_name": "Stena Conquest",
+            "voyage_number": 1901
+          },
+          "likely_path": "single",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "single",
+          "intent_key": "voyage.summary",
+          "steps": []
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 2,
+          "agent": "finance",
+          "operation": "registry_sql",
+          "inputs": {
+            "intent_key": "voyage.summary"
+          },
+          "goal": "Run finance registry SQL in single plan mode."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "registry_sql",
+          "ok": true,
+          "mode": "registry_sql",
+          "rows": 1,
+          "voyage_ids": 1,
+          "extracted_voyage_ids": [
+            "BDEA0AD71D00DE30244B96E0D474F30A"
+          ],
+          "sql_present": true,
+          "sql": "SELECT DISTINCT\n              f.voyage_id,\n              f.voyage_number,\n              f.vessel_imo,\n              f.scenario,\n              f.revenue,\n              f.total_expense,\n              f.pnl,\n              f.tce,\n              f.total_commission,\n              f.voyage_start_date,\n              f.voyage_end_date,\n              o.vessel_name,\n              o.module_type,\n              o.fixture_count,\n              o.is_delayed,\n              o.delay_reason,\n              o.offhire_days,\n              o.ports_json,\n              o.grades_json,\n              o.activities_json\n            FROM finance_voyage_kpi f\n            LEFT JOIN ops_voyage_summary o\n              ON f.voyage_number = o.voyage_number\n              AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')\n            WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')\n              AND (\n                (%(voyage_number)s IS NOT NULL AND f.voyage_number::TEXT = %(voyage_number)s::TEXT)\n                OR (%(voyage_id)s IS NOT NULL AND f.voyage_id::TEXT = %(voyage_id)s::TEXT)\n              )\n              AND (\n                %(vessel_imo)s IS NULL\n                OR REPLACE(f.vessel_imo::TEXT, '.0', '') = %(vessel_imo)s::TEXT\n              )\n            LIMIT 10;",
+          "summary": "Finance(single): fetched 1 rows using registry SQL."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 2,
+          "agent": "ops",
+          "operation": "registry_sql",
+          "inputs": {
+            "intent_key": "voyage.summary"
+          },
+          "goal": "Run ops registry SQL in single plan mode."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "registry_sql",
+          "ok": true,
+          "mode": "registry_sql",
+          "rows": 1,
+          "voyage_ids": 1,
+          "extracted_voyage_ids": [
+            "BDEA0AD71D00DE30244B96E0D474F30A"
+          ],
+          "sql_present": true,
+          "sql": "SELECT DISTINCT\n              f.voyage_id,\n              f.voyage_number,\n              f.vessel_imo,\n              f.scenario,\n              f.revenue,\n              f.total_expense,\n              f.pnl,\n              f.tce,\n              f.total_commission,\n              f.voyage_start_date,\n              f.voyage_end_date,\n              o.vessel_name,\n              o.module_type,\n              o.fixture_count,\n              o.is_delayed,\n              o.delay_reason,\n              o.offhire_days,\n              o.ports_json,\n              o.grades_json,\n              o.activities_json\n            FROM finance_voyage_kpi f\n            LEFT JOIN ops_voyage_summary o\n              ON f.voyage_number = o.voyage_number\n              AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')\n            WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')\n              AND (\n                (%(voyage_number)s IS NOT NULL AND f.voyage_number::TEXT = %(voyage_number)s::TEXT)\n                OR (%(voyage_id)s IS NOT NULL AND f.voyage_id::TEXT = %(voyage_id)s::TEXT)\n              )\n              AND (\n                %(vessel_imo)s IS NULL\n                OR REPLACE(f.vessel_imo::TEXT, '.0', '') = %(vessel_imo)s::TEXT\n              )\n            LIMIT 10;",
+          "summary": "Ops(single): fetched 1 rows using registry SQL."
+        }
+      ],
+      "dynamic_sql_used_detected": false,
+      "dynamic_sql_used_flag": false,
+      "dynamic_sql_agents": []
+    },
+    {
+      "id": "Q08",
+      "query": "Show me the top 5 most profitable voyages with PnL, revenue, margin %, vessel name, cargo grade, and key ports.",
+      "session_id": "eval-q08",
+      "ok": true,
+      "elapsed_ms": 5461,
+      "intent_key": "ranking.voyages",
+      "slots": {
+        "limit": 5,
+        "voyage_ids": [
+          "45CFAE9BA3898833EA01C18E11D16EAE",
+          "85BE36902F793700251791820A4FDC88",
+          "9A0646A2549193FCD7C9AECF6A5E38A7",
+          "56F951129BA83C40D3E9C3C7837D6063",
+          "2D3729F01688442B63D91B819D47904B"
+        ]
+      },
+      "answer": "| Voyage # | Vessel Name | PnL | Revenue | Margin % | Key Ports | Cargo Grades |\n| --- | --- | --- | --- | --- | --- | --- |\n| 2402 | Not available | Not available | Not available | Not available | Bintulu (L), Zhoushan (D) | Not available |\n| 2301 | Not available | Not available | Not available | Not available | Darwin LNG Terminal (L), Niigata-Higashi (D), Incheon (D), Tianjin Lingang (D), Naoetsu (D), Arun LNG Terminal (D), Ras Laffan (L), Bahia Blanca LNG Terminal (D) | Not available |\n| 2201 | Not available | Not available | Not available | Not available | Sabine Pass LNG Terminal (L), Livorno (D), Barcelona LNG Terminal (D) | Not available |\n| 2101 | Not available | Not available | Not available | Not available | Point Fortin (L), AES Andres (D), Taichung (D), Singapore (D), Ras Laffan (L), Cove Point - LNG (L), Marmara Ereglisi (D), Cartagena LNG Terminal, Spain (D) | Not available |\n| 2204 | Not available | Not available | Not available | Not available | Sabine Pass LNG Terminal (L), Rotterdam (D), Dunkirk, France (D), Corpus Christi (L), Aliaga LNG (D), Isle of Grain (D), Calcasieu Pass LNG Terminal (L), Wilhelmshaven (D) | Not available |\nThe top 5 most profitable voyages cannot be determined due to missing financial data.",
+      "clarification": null,
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "ranking.voyages",
+          "slots": {
+            "limit": 5
+          },
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "composite",
+          "intent_key": "ranking.voyages",
+          "steps": [
+            {
+              "agent": "finance",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "question": "Show me the top 5 most profitable voyages with PnL, revenue, margin %, vessel name, cargo grade, and key ports.",
+                "limit": 5,
+                "intent_key": "ranking.voyages"
+              }
+            },
+            {
+              "agent": "ops",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "llm",
+              "operation": "merge",
+              "inputs": {}
+            }
+          ]
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 3,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "question": "Show me the top 5 most profitable voyages with PnL, revenue, margin %, vessel name, cargo grade, and key ports.",
+            "limit": 5,
+            "intent_key": "ranking.voyages"
+          },
+          "goal": "Fetch top 5 voyages for the ranking intent (Postgres finance KPIs), returning voyage_ids for downstream steps."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 5,
+          "voyage_ids": 5,
+          "extracted_voyage_ids": [
+            "45CFAE9BA3898833EA01C18E11D16EAE",
+            "85BE36902F793700251791820A4FDC88",
+            "9A0646A2549193FCD7C9AECF6A5E38A7",
+            "56F951129BA83C40D3E9C3C7837D6063",
+            "2D3729F01688442B63D91B819D47904B"
+          ],
+          "sql_present": true,
+          "sql": "SELECT voyage_id, voyage_number, pnl, revenue, total_expense, tce, total_commission FROM finance_voyage_kpi WHERE scenario = COALESCE(%(scenario)s, 'ACTUAL') ORDER BY pnl DESC LIMIT %(limit)s",
+          "summary": "Finance: fetched 5 rows and extracted 5 voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 3,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch ops summaries (ports/grades/remarks/delay/offhire) for the selected voyage_ids from Postgres."
+        },
+        {
+          "phase": "composite_step_inputs_resolved",
+          "step_index": 2,
+          "agent": "ops",
+          "resolved_voyage_ids_count": 5,
+          "resolved_cargo_grades_count": 0,
+          "intent_key_ops": "ranking.voyages"
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 5,
+          "voyage_ids": 5,
+          "extracted_voyage_ids": [
+            "45CFAE9BA3898833EA01C18E11D16EAE",
+            "85BE36902F793700251791820A4FDC88",
+            "9A0646A2549193FCD7C9AECF6A5E38A7",
+            "56F951129BA83C40D3E9C3C7837D6063",
+            "2D3729F01688442B63D91B819D47904B"
+          ],
+          "sql_present": true,
+          "sql": "SELECT voyage_id,\n                       voyage_number,\n                       vessel_imo,\n                       vessel_name,\n                       module_type,\n                       fixture_count,\n                       offhire_days,\n                       is_delayed,\n                       delay_reason,\n                       ports_json,\n                       grades_json,\n                       remarks_json,\n                       voyage_start_date,\n                       voyage_end_date\n                FROM ops_voyage_summary\n                WHERE voyage_id = ANY(%(voyage_ids)s)\n                LIMIT %(limit)s",
+          "summary": "Ops: fetched 5 ops rows for voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 3,
+          "step_count": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "inputs": {},
+          "goal": "Deterministically merge finance + ops + mongo context into a single joined dataset for summarization."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "ok": true,
+          "merged_rows": 5,
+          "summary": "Merge: joined finance + ops + mongo context into 5 merged rows."
+        },
+        {
+          "phase": "token_usage",
+          "stage": "pre_sanitize",
+          "total_tokens_est": 1117,
+          "mongo_tokens_est": 11,
+          "finance_tokens_est": 215,
+          "ops_tokens_est": 8,
+          "artifacts_tokens_est": 852
+        },
+        {
+          "phase": "token_usage",
+          "stage": "post_sanitize",
+          "total_tokens_est": 1059,
+          "saved_tokens_est": 58,
+          "saved_pct_est": 5.192479856759176
+        }
+      ],
+      "dynamic_sql_used_detected": true,
+      "dynamic_sql_used_flag": true,
+      "dynamic_sql_agents": [
+        "finance",
+        "ops"
+      ]
+    },
+    {
+      "id": "Q09",
+      "query": "Which voyages had high revenue but low or negative PnL? Show revenue, total expense, PnL, and expense-to-revenue ratio. Include remarks where recorded.",
+      "session_id": "eval-q09",
+      "ok": true,
+      "elapsed_ms": 6568,
+      "intent_key": "analysis.high_revenue_low_pnl",
+      "slots": {
+        "limit": 10,
+        "voyage_ids": [
+          "E1AEFBF96F4FB4305C362FAD00017604",
+          "BEAEF4B56052E35E11DF9B0B6BBC61D2",
+          "30F18B2A6124F71D5F60EB8DE66158E2",
+          "230582755165D49CE0AB3F005683CACB",
+          "25ABDFECAE7BC4616336F4F751568812",
+          "C53FB30F82D512F6478DDFA96631D1B6",
+          "EC20210419653CD61CBDA644A4D8C375",
+          "B43197F6B14945B709A166E8D30773A1",
+          "BD4129EC6FC471A83938E8E9BE465AFA",
+          "A39C9634A18E888B924AB9D5931933D8"
+        ]
+      },
+      "answer": "### Financials\n| Voyage # | Revenue | Total Expense | PnL | Expense-to-Revenue Ratio | Remarks |\n| --- | --- | --- | --- | --- | --- |\n| 2103 | $9,690,107 | $220,470 | -$195,640 | 0.023 | Not available |\n| 2302 | $9,278,607 | $1,359,439 | -$18,592 | 0.147 | Not available |\n| 2302 | $8,677,382 | $1,274,080 | -$172,993 | 0.147 | Not available |\n| 2001 | $4,336,612 | $672,033 | -$23,840 | 0.155 | Not available |\n| 2204 | $3,409,767 | $1,208,435 | -$130,606 | 0.354 | Not available |\n| 2101 | $3,335,084 | $1,357,679 | -$33,278 | 0.407 | Continuation of Voy #1905 |\n| 2403 | $3,290,700 | $1,361,946 | -$109,777 | 0.413 | Not available |\n| 2201 | $3,175,537 | $1,737,262 | -$204,259 | 0.548 | Not available |\n| 2201 | $3,037,216 | $1,796,257 | -$47,411 | 0.594 | Not available |\n| 2204 | $2,951,857 | $2,603,078 | -$1,414,909 | 0.875 | Not available |\nThe voyages with high revenue but low or negative PnL were primarily due to high total expenses, with some voyages having expense-to-revenue ratios exceeding 0.4.",
+      "clarification": null,
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "analysis.high_revenue_low_pnl",
+          "slots": {},
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "composite",
+          "intent_key": "analysis.high_revenue_low_pnl",
+          "steps": [
+            {
+              "agent": "finance",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "question": "Which voyages had high revenue but low or negative PnL? Show revenue, total expense, PnL, and expense-to-revenue ratio. Include remarks where recorded.",
+                "limit": 10,
+                "intent_key": "analysis.high_revenue_low_pnl"
+              }
+            },
+            {
+              "agent": "ops",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "llm",
+              "operation": "merge",
+              "inputs": {}
+            }
+          ]
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 3,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "question": "Which voyages had high revenue but low or negative PnL? Show revenue, total expense, PnL, and expense-to-revenue ratio. Include remarks where recorded.",
+            "limit": 10,
+            "intent_key": "analysis.high_revenue_low_pnl"
+          },
+          "goal": "Run a finance analysis query in Postgres (dynamic SQL) and return voyage_ids for downstream steps (limit=10)."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 10,
+          "voyage_ids": 10,
+          "extracted_voyage_ids": [
+            "E1AEFBF96F4FB4305C362FAD00017604",
+            "BEAEF4B56052E35E11DF9B0B6BBC61D2",
+            "30F18B2A6124F71D5F60EB8DE66158E2",
+            "230582755165D49CE0AB3F005683CACB",
+            "25ABDFECAE7BC4616336F4F751568812",
+            "C53FB30F82D512F6478DDFA96631D1B6",
+            "EC20210419653CD61CBDA644A4D8C375",
+            "B43197F6B14945B709A166E8D30773A1",
+            "BD4129EC6FC471A83938E8E9BE465AFA",
+            "A39C9634A18E888B924AB9D5931933D8"
+          ],
+          "sql_present": true,
+          "sql": "SELECT f.voyage_id, f.voyage_number, f.revenue, f.total_expense, f.pnl, f.tce, o.remarks_json, f.total_expense / f.revenue AS expense_to_revenue_ratio FROM finance_voyage_kpi f JOIN ops_voyage_summary o ON f.voyage_number = o.voyage_number AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '') WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL') AND f.revenue > 1000000 AND f.pnl < 0 ORDER BY f.revenue DESC, f.pnl ASC LIMIT %(limit)s",
+          "summary": "Finance: fetched 10 rows and extracted 10 voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 3,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch ops summaries (ports/grades/remarks/delay/offhire) for the selected voyage_ids from Postgres."
+        },
+        {
+          "phase": "composite_step_inputs_resolved",
+          "step_index": 2,
+          "agent": "ops",
+          "resolved_voyage_ids_count": 10,
+          "resolved_cargo_grades_count": 0,
+          "intent_key_ops": "analysis.high_revenue_low_pnl"
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 10,
+          "voyage_ids": 10,
+          "extracted_voyage_ids": [
+            "E1AEFBF96F4FB4305C362FAD00017604",
+            "BEAEF4B56052E35E11DF9B0B6BBC61D2",
+            "30F18B2A6124F71D5F60EB8DE66158E2",
+            "230582755165D49CE0AB3F005683CACB",
+            "25ABDFECAE7BC4616336F4F751568812",
+            "C53FB30F82D512F6478DDFA96631D1B6",
+            "EC20210419653CD61CBDA644A4D8C375",
+            "B43197F6B14945B709A166E8D30773A1",
+            "BD4129EC6FC471A83938E8E9BE465AFA",
+            "A39C9634A18E888B924AB9D5931933D8"
+          ],
+          "sql_present": true,
+          "sql": "SELECT voyage_id,\n                       voyage_number,\n                       vessel_imo,\n                       vessel_name,\n                       module_type,\n                       fixture_count,\n                       offhire_days,\n                       is_delayed,\n                       delay_reason,\n                       ports_json,\n                       grades_json,\n                       remarks_json,\n                       voyage_start_date,\n                       voyage_end_date\n                FROM ops_voyage_summary\n                WHERE voyage_id = ANY(%(voyage_ids)s)\n                LIMIT %(limit)s",
+          "summary": "Ops: fetched 10 ops rows for voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 3,
+          "step_count": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "inputs": {},
+          "goal": "Deterministically merge finance + ops + mongo context into a single joined dataset for summarization."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "ok": true,
+          "merged_rows": 10,
+          "summary": "Merge: joined finance + ops + mongo context into 10 merged rows."
+        },
+        {
+          "phase": "token_usage",
+          "stage": "pre_sanitize",
+          "total_tokens_est": 2072,
+          "mongo_tokens_est": 11,
+          "finance_tokens_est": 368,
+          "ops_tokens_est": 8,
+          "artifacts_tokens_est": 1654
+        },
+        {
+          "phase": "token_usage",
+          "stage": "post_sanitize",
+          "total_tokens_est": 2056,
+          "saved_tokens_est": 16,
+          "saved_pct_est": 0.7722007722007722
+        }
+      ],
+      "dynamic_sql_used_detected": true,
+      "dynamic_sql_used_flag": true,
+      "dynamic_sql_agents": [
+        "finance",
+        "ops"
+      ]
+    },
+    {
+      "id": "Q10",
+      "query": "For vessel Stena Conquest, show voyage-by-voyage PnL trend and its top 5 most visited ports.",
+      "session_id": "eval-q10",
+      "ok": true,
+      "elapsed_ms": 7079,
+      "intent_key": "ranking.voyages",
+      "slots": {
+        "limit": 5,
+        "port_name": "ports",
+        "voyage_ids": [
+          "BDEA0AD71D00DE30244B96E0D474F30A"
+        ]
+      },
+      "answer": "Vessel Stena Conquest has a positive PnL trend with a single voyage showing a profit of $982,738.13 on $7,244,739.62 revenue.\n\n### Summary\n- **Vessel**: Stena Conquest\n- **Voyage count**: 1\n- **PnL / Revenue**: $982,738.13 / $7,244,739.62\n- **Top ports**: Belem (load), Sao Sebastiao (discharge), Santos (load), Manaus (discharge), Suape (load)\n\n### Results\n| Voyage # | PnL | Revenue | Total expense | Total commission | Key ports |\n| --- | --- | --- | --- | --- | --- |\n| 1901 | $982,738.13 | $7,244,739.62 | $1,637,929.97 | $194,773.08 | Belem (L), Sao Sebastiao (D), Santos (L), Manaus (D), Suape (L) |\n\nThe vessel's top 5 most visited ports are not fully represented due to limited data, but the provided ports give an initial insight into its operational activities.",
+      "clarification": null,
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "ranking.voyages",
+          "slots": {
+            "limit": 5,
+            "port_name": "ports"
+          },
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "composite",
+          "intent_key": "ranking.voyages",
+          "steps": [
+            {
+              "agent": "finance",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "question": "For vessel Stena Conquest, show voyage-by-voyage PnL trend and its top 5 most visited ports.",
+                "limit": 5,
+                "intent_key": "ranking.voyages"
+              }
+            },
+            {
+              "agent": "ops",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "llm",
+              "operation": "merge",
+              "inputs": {}
+            }
+          ]
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 3,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "question": "For vessel Stena Conquest, show voyage-by-voyage PnL trend and its top 5 most visited ports.",
+            "limit": 5,
+            "intent_key": "ranking.voyages"
+          },
+          "goal": "Fetch top 5 voyages for the ranking intent (Postgres finance KPIs), returning voyage_ids for downstream steps."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 1,
+          "voyage_ids": 1,
+          "extracted_voyage_ids": [
+            "BDEA0AD71D00DE30244B96E0D474F30A"
+          ],
+          "sql_present": true,
+          "sql": "SELECT voyage_id, voyage_number, pnl, revenue, total_expense, tce, total_commission FROM finance_voyage_kpi WHERE vessel_imo = (SELECT vessel_imo FROM ops_voyage_summary WHERE vessel_name = 'Stena Conquest' LIMIT 1) AND scenario = COALESCE(%(scenario)s, 'ACTUAL') ORDER BY pnl DESC LIMIT %(limit)s",
+          "summary": "Finance: fetched 1 rows and extracted 1 voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 3,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch ops summaries (ports/grades/remarks/delay/offhire) for the selected voyage_ids from Postgres."
+        },
+        {
+          "phase": "composite_step_inputs_resolved",
+          "step_index": 2,
+          "agent": "ops",
+          "resolved_voyage_ids_count": 1,
+          "resolved_cargo_grades_count": 0,
+          "intent_key_ops": "ranking.voyages"
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 1,
+          "voyage_ids": 1,
+          "extracted_voyage_ids": [
+            "BDEA0AD71D00DE30244B96E0D474F30A"
+          ],
+          "sql_present": true,
+          "sql": "SELECT voyage_id,\n                       voyage_number,\n                       vessel_imo,\n                       vessel_name,\n                       module_type,\n                       fixture_count,\n                       offhire_days,\n                       is_delayed,\n                       delay_reason,\n                       ports_json,\n                       grades_json,\n                       remarks_json,\n                       voyage_start_date,\n                       voyage_end_date\n                FROM ops_voyage_summary\n                WHERE voyage_id = ANY(%(voyage_ids)s)\n                LIMIT %(limit)s",
+          "summary": "Ops: fetched 1 ops rows for voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 3,
+          "step_count": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "inputs": {},
+          "goal": "Deterministically merge finance + ops + mongo context into a single joined dataset for summarization."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "ok": true,
+          "merged_rows": 1,
+          "summary": "Merge: joined finance + ops + mongo context into 1 merged rows."
+        },
+        {
+          "phase": "token_usage",
+          "stage": "pre_sanitize",
+          "total_tokens_est": 355,
+          "mongo_tokens_est": 11,
+          "finance_tokens_est": 70,
+          "ops_tokens_est": 8,
+          "artifacts_tokens_est": 235
+        },
+        {
+          "phase": "token_usage",
+          "stage": "post_sanitize",
+          "total_tokens_est": 328,
+          "saved_tokens_est": 27,
+          "saved_pct_est": 7.605633802816901
+        }
+      ],
+      "dynamic_sql_used_detected": true,
+      "dynamic_sql_used_flag": true,
+      "dynamic_sql_agents": [
+        "finance",
+        "ops"
+      ]
+    },
+    {
+      "id": "Q11",
+      "query": "Compare actual vs when-fixed results for voyages 1901, 1902, and 2301. Show PnL variance and TCE variance.",
+      "session_id": "eval-q11",
+      "ok": true,
+      "elapsed_ms": 3884,
+      "intent_key": "analysis.scenario_comparison",
+      "slots": {
+        "voyage_numbers": [
+          1901,
+          1902,
+          2301
+        ],
+        "scenario": [
+          "ACTUAL",
+          "WHEN_FIXED"
+        ]
+      },
+      "answer": "Voyages 1901, 1902, and 2301 show significant variance between actual and when-fixed results, with voyage 1901 having the highest PnL variance of $5,488,002.07. \n### Summary\n- **Voyages compared**: 1901, 1902, 2301\n- **PnL variance range**: -$16,612,481.39 to $5,488,002.07\n- **TCE variance range**: -$54.29 to $8.51\n\n### Results\n| Voyage # | PnL Actual | PnL When Fixed | PnL Variance | TCE Actual | TCE When Fixed | TCE Variance |\n| --- | --- | --- | --- | --- | --- | --- |\n| 1901 | $2,638,997.93 | $8,127,000.00 | $5,488,002.07 | $13,542.83 | $13,545.00 | $2.17 |\n| 1902 | $482,472.90 | $146,365.70 | -$336,107.20 | $15,938.13 | $15,946.64 | $8.51 |\n| 2301 | $102,609,397.82 | $85,996,916.43 | -$16,612,481.39 | $35,510.15 | $35,455.87 | -$54.29 |\nThe variance in PnL and TCE between actual and when-fixed results indicates potential areas for improvement in voyage planning and execution.",
+      "clarification": null,
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "analysis.scenario_comparison",
+          "slots": {
+            "voyage_numbers": [
+              1901,
+              1902,
+              2301
+            ],
+            "scenario": [
+              "ACTUAL",
+              "WHEN_FIXED"
+            ]
+          },
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "single",
+          "intent_key": "analysis.scenario_comparison",
+          "steps": []
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 1,
+          "agent": "finance",
+          "operation": "registry_sql",
+          "inputs": {
+            "intent_key": "analysis.scenario_comparison"
+          },
+          "goal": "Run finance registry SQL in single plan mode."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "registry_sql",
+          "ok": true,
+          "mode": "registry_sql",
+          "rows": 3,
+          "sql_present": true,
+          "sql": "WITH voyage_nums AS (\n                SELECT unnest(%(voyage_numbers)s::integer[]) AS vnum\n            ),\n            per_pair AS (\n                SELECT\n                  f.voyage_number,\n                  REPLACE(f.vessel_imo::TEXT, '.0', '') AS vessel_imo_key,\n                  MAX(f.voyage_id) AS voyage_id,\n                  MAX(CASE WHEN f.scenario = 'ACTUAL' THEN f.pnl END) AS pnl_actual_by_pair,\n                  MAX(CASE WHEN f.scenario = 'WHEN_FIXED' THEN f.pnl END) AS pnl_when_fixed_by_pair,\n                  MAX(CASE WHEN f.scenario = 'ACTUAL' THEN f.tce END) AS tce_actual_by_pair,\n                  MAX(CASE WHEN f.scenario = 'WHEN_FIXED' THEN f.tce END) AS tce_when_fixed_by_pair,\n                  MAX(CASE WHEN f.scenario = 'ACTUAL' THEN f.revenue END) AS revenue_actual_by_pair,\n                  MAX(f.voyage_end_date) AS voyage_end_date\n                FROM finance_voyage_kpi f\n                INNER JOIN voyage_nums vn ON f.voyage_number = vn.vnum\n                WHERE f.scenario IN ('ACTUAL', 'WHEN_FIXED')\n                GROUP BY f.voyage_number, REPLACE(f.vessel_imo::TEXT, '.0', '')\n            )\n            SELECT\n              MAX(voyage_id) AS voyage_id,\n              voyage_number,\n              SUM(COALESCE(pnl_actual_by_pair, 0)) AS pnl_actual,\n              SUM(COALESCE(pnl_when_fixed_by_pair, 0)) AS pnl_when_fixed,\n              (SUM(COALESCE(pnl_when_fixed_by_pair, 0)) - SUM(COALESCE(pnl_actual_by_pair, 0))) AS pnl_variance,\n              AVG(tce_actual_by_pair) AS tce_actual,\n              AVG(tce_when_fixed_by_pair) AS tce_when_fixed,\n              (AVG(tce_when_fixed_by_pair) - AVG(tce_actual_by_pair)) AS tce_variance,\n              SUM(COALESCE(revenue_actual_by_pair, 0)) AS revenue_actual,\n              MAX(voyage_end_date) AS voyage_end_date\n            FROM per_pair\n            GROUP BY voyage_number\n            ORDER BY voyage_number;",
+          "summary": "Finance(single): fetched 3 rows using registry SQL."
+        },
+        {
+          "phase": "token_usage",
+          "stage": "pre_sanitize",
+          "total_tokens_est": 372,
+          "mongo_tokens_est": 11,
+          "finance_tokens_est": 328,
+          "ops_tokens_est": 6,
+          "artifacts_tokens_est": 0
+        },
+        {
+          "phase": "token_usage",
+          "stage": "post_sanitize",
+          "total_tokens_est": 372,
+          "saved_tokens_est": 0,
+          "saved_pct_est": 0.0
+        }
+      ],
+      "dynamic_sql_used_detected": false,
+      "dynamic_sql_used_flag": false,
+      "dynamic_sql_agents": []
+    },
+    {
+      "id": "Q12",
+      "query": "Which cargo grades have the highest average PnL? For each grade show average PnL, average revenue, voyage count, and most common ports.",
+      "session_id": "eval-q12",
+      "ok": true,
+      "elapsed_ms": 10953,
+      "intent_key": "ranking.ports",
+      "slots": {
+        "limit": 10,
+        "voyage_ids": []
+      },
+      "answer": "| Cargo Grade | Average PnL | Average Revenue | Voyage Count | Most Common Ports |\n| --- | --- | --- | --- | --- |\n| no heat crude | $2,888,848 | $4,397,945 | 10 | Bayway, NJ, U.S.A (D), Djeno Terminal (L), Forcados Terminal (L) |\n| pmf | $2,459,395 | $5,188,253 | 24 | Alotau (L), Amsterdam (D), Bialla (L) |\n| pome | $2,279,097 | $5,394,418 | 20 | Amsterdam (D), Augusta, (Sicily), Italy (D), Belawan (L) |\n| nhc | $1,696,623 | $2,895,273 | 898 | Abidjan (D), Abo FPSO (L), Acu Port (L) |\n| fo | $1,692,440 | $3,224,658 | 206 | Algeciras (D), Antwerp (L), Arzew (L) |\nThe top cargo grade by average PnL is \"no heat crude\", with the highest average revenue being $5,394,418 for the \"pome\" cargo grade.",
+      "clarification": null,
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "ranking.ports",
+          "slots": {},
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "composite",
+          "intent_key": "ranking.ports",
+          "steps": [
+            {
+              "agent": "finance",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "question": "Which cargo grades have the highest average PnL? For each grade show average PnL, average revenue, voyage count, and most common ports.",
+                "limit": 10,
+                "intent_key": "ranking.ports"
+              }
+            },
+            {
+              "agent": "ops",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "llm",
+              "operation": "merge",
+              "inputs": {}
+            }
+          ]
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 3,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "question": "Which cargo grades have the highest average PnL? For each grade show average PnL, average revenue, voyage count, and most common ports.",
+            "limit": 10,
+            "intent_key": "ranking.ports"
+          },
+          "goal": "Fetch top 10 voyages for the ranking intent (Postgres finance KPIs), returning voyage_ids for downstream steps."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 10,
+          "voyage_ids": 0,
+          "sql_present": true,
+          "sql": "SELECT lower(trim(elem->>'grade_name')) AS cargo_grade, AVG(f.pnl) AS avg_pnl, AVG(f.revenue) AS avg_revenue, COUNT(*) AS voyage_count, string_agg(DISTINCT port.value, ', ') AS most_common_ports FROM finance_voyage_kpi f JOIN ops_voyage_summary o ON f.voyage_number = o.voyage_number AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '') , jsonb_array_elements(o.grades_json) AS elem, jsonb_array_elements_text(o.ports_json) AS port WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL') AND jsonb_typeof(elem) = 'object' AND elem->>'grade_name' IS NOT NULL AND trim(elem->>'grade_name') != '' GROUP BY lower(trim(elem->>'grade_name')) ORDER BY avg_pnl DESC LIMIT %(limit)s",
+          "summary": "Finance: fetched 10 rows (Postgres). No voyage_ids extracted."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 3,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch ops summaries (ports/grades/remarks/delay/offhire) for the selected voyage_ids from Postgres."
+        },
+        {
+          "phase": "composite_step_inputs_resolved",
+          "step_index": 2,
+          "agent": "ops",
+          "resolved_voyage_ids_count": 0,
+          "resolved_cargo_grades_count": 0,
+          "intent_key_ops": "ranking.ports"
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 10,
+          "voyage_ids": 0,
+          "extracted_voyage_ids": [],
+          "sql_present": true,
+          "sql": "SELECT lower(trim(elem->>'grade_name')) AS cargo_grade, AVG(f.pnl) AS avg_pnl, AVG(f.revenue) AS avg_revenue, COUNT(*) AS voyage_count, string_agg(DISTINCT port_text, ', ') AS most_common_ports FROM finance_voyage_kpi f JOIN ops_voyage_summary o ON f.voyage_number = o.voyage_number AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '') , jsonb_array_elements(o.grades_json) AS elem, jsonb_array_elements_text(o.ports_json) AS port_text WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL') AND jsonb_typeof(elem) = 'object' AND elem->>'grade_name' IS NOT NULL AND trim(elem->>'grade_name') != '' GROUP BY lower(trim(elem->>'grade_name')) ORDER BY avg_pnl DESC LIMIT %(limit)s",
+          "summary": "Ops: fetched 10 ops rows for voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 3,
+          "step_count": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "inputs": {},
+          "goal": "Deterministically merge finance + ops + mongo context into a single joined dataset for summarization."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "ok": true,
+          "merged_rows": 10,
+          "summary": "Merge: joined finance + ops + mongo context into 10 merged rows."
+        },
+        {
+          "phase": "token_usage",
+          "stage": "pre_sanitize",
+          "total_tokens_est": 10206,
+          "mongo_tokens_est": 11,
+          "finance_tokens_est": 9519,
+          "ops_tokens_est": 8,
+          "artifacts_tokens_est": 638
+        },
+        {
+          "phase": "token_usage",
+          "stage": "post_sanitize",
+          "total_tokens_est": 10252,
+          "saved_tokens_est": -46,
+          "saved_pct_est": -0.45071526553008034
+        }
+      ],
+      "dynamic_sql_used_detected": true,
+      "dynamic_sql_used_flag": true,
+      "dynamic_sql_agents": [
+        "finance",
+        "ops"
+      ]
+    },
+    {
+      "id": "Q13",
+      "query": "Show the top 3 voyages by total commission with PnL, revenue, vessel name, and key ports.",
+      "session_id": "eval-q13",
+      "ok": true,
+      "elapsed_ms": 10009,
+      "intent_key": "ranking.voyages_by_commission",
+      "slots": {
+        "limit": 3,
+        "voyage_ids": [
+          "56F951129BA83C40D3E9C3C7837D6063",
+          "9A0646A2549193FCD7C9AECF6A5E38A7",
+          "85BE36902F793700251791820A4FDC88"
+        ]
+      },
+      "answer": "The top 3 voyages by total commission are not determinable due to missing financial data.\n### Summary\n- **Ranking**: Top 3 voyages by total commission\n- **Voyages**: 2101, 2201, 2301\n- **Financial metrics**: Not available for ranking\n\n### Results\n| Voyage # | Vessel Name | PnL | Revenue | Total Expense | Total Commission | Key Ports |\n| --- | --- | --- | --- | --- | --- | --- |\n| 2101 | Not available | Not available | Not available | Not available | Not available | Point Fortin (L), AES Andres (D), Taichung (D), Singapore (D), Ras Laffan (L) (+3 more) |\n| 2201 | Not available | Not available | Not available | Not available | Not available | Sabine Pass LNG Terminal (L), Livorno (D), Barcelona LNG Terminal (D) |\n| 2301 | Not available | Not available | Not available | Not available | Not available | Darwin LNG Terminal (L), Niigata-Higashi (D), Incheon (D), Tianjin Lingang (D), Naoetsu (D) (+3 more) |\nThe voyages have varying numbers of key ports, but specific financial metrics are not available to determine the top 3 by total commission.",
+      "clarification": null,
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "ranking.voyages_by_commission",
+          "slots": {
+            "limit": 3
+          },
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "composite",
+          "intent_key": "ranking.voyages_by_commission",
+          "steps": [
+            {
+              "agent": "finance",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "question": "Show the top 3 voyages by total commission with PnL, revenue, vessel name, and key ports.",
+                "limit": 3,
+                "intent_key": "ranking.voyages_by_commission"
+              }
+            },
+            {
+              "agent": "ops",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "llm",
+              "operation": "merge",
+              "inputs": {}
+            }
+          ]
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 3,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "question": "Show the top 3 voyages by total commission with PnL, revenue, vessel name, and key ports.",
+            "limit": 3,
+            "intent_key": "ranking.voyages_by_commission"
+          },
+          "goal": "Fetch top 3 voyages for the ranking intent (Postgres finance KPIs), returning voyage_ids for downstream steps."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 3,
+          "voyage_ids": 3,
+          "extracted_voyage_ids": [
+            "56F951129BA83C40D3E9C3C7837D6063",
+            "9A0646A2549193FCD7C9AECF6A5E38A7",
+            "85BE36902F793700251791820A4FDC88"
+          ],
+          "sql_present": true,
+          "sql": "SELECT voyage_id, voyage_number, pnl, revenue, total_expense, tce, total_commission FROM finance_voyage_kpi WHERE scenario = COALESCE(%(scenario)s, 'ACTUAL') ORDER BY pnl DESC LIMIT %(limit)s",
+          "summary": "Finance: fetched 3 rows and extracted 3 voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 3,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch ops summaries (ports/grades/remarks/delay/offhire) for the selected voyage_ids from Postgres."
+        },
+        {
+          "phase": "composite_step_inputs_resolved",
+          "step_index": 2,
+          "agent": "ops",
+          "resolved_voyage_ids_count": 3,
+          "resolved_cargo_grades_count": 0,
+          "intent_key_ops": "ranking.voyages_by_commission"
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 3,
+          "voyage_ids": 3,
+          "extracted_voyage_ids": [
+            "56F951129BA83C40D3E9C3C7837D6063",
+            "9A0646A2549193FCD7C9AECF6A5E38A7",
+            "85BE36902F793700251791820A4FDC88"
+          ],
+          "sql_present": true,
+          "sql": "SELECT voyage_id,\n                       voyage_number,\n                       vessel_imo,\n                       vessel_name,\n                       module_type,\n                       fixture_count,\n                       offhire_days,\n                       is_delayed,\n                       delay_reason,\n                       ports_json,\n                       grades_json,\n                       remarks_json,\n                       voyage_start_date,\n                       voyage_end_date\n                FROM ops_voyage_summary\n                WHERE voyage_id = ANY(%(voyage_ids)s)\n                LIMIT %(limit)s",
+          "summary": "Ops: fetched 3 ops rows for voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 3,
+          "step_count": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "inputs": {},
+          "goal": "Deterministically merge finance + ops + mongo context into a single joined dataset for summarization."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "ok": true,
+          "merged_rows": 3,
+          "summary": "Merge: joined finance + ops + mongo context into 3 merged rows."
+        },
+        {
+          "phase": "token_usage",
+          "stage": "pre_sanitize",
+          "total_tokens_est": 735,
+          "mongo_tokens_est": 11,
+          "finance_tokens_est": 132,
+          "ops_tokens_est": 8,
+          "artifacts_tokens_est": 553
+        },
+        {
+          "phase": "token_usage",
+          "stage": "post_sanitize",
+          "total_tokens_est": 695,
+          "saved_tokens_est": 40,
+          "saved_pct_est": 5.442176870748299
+        }
+      ],
+      "dynamic_sql_used_detected": true,
+      "dynamic_sql_used_flag": true,
+      "dynamic_sql_agents": [
+        "finance",
+        "ops"
+      ]
+    },
+    {
+      "id": "Q14",
+      "query": "For each module type (TC Voyage, Spot, etc), show average PnL, average revenue, voyage count, and most common cargo grade.",
+      "session_id": "eval-q14",
+      "ok": true,
+      "elapsed_ms": 9007,
+      "intent_key": "analysis.by_module_type",
+      "slots": {
+        "limit": 50,
+        "voyage_ids": []
+      },
+      "answer": "The module type TC Voyage has the highest average PnL.\n### Summary\n- **Module types**: 3 module types are present in the data\n- **Average PnL**: ranges from $721,506 to $2,185,018\n- **Average revenue**: ranges from $2,193,753 to $4,838,822\n- **Voyage count**: ranges from 10 to 1,617\n\n### Results\n| Module Type | Average PnL | Average Revenue | Voyage Count | Most Common Cargo Grade |\n| --- | --- | --- | --- | --- |\n| LTTC | Not available | Not available | 10 | Not available |\n| TC Voyage | $2,185,018 | $4,838,822 | 128 | Not available |\n| Spot | $721,506 | $2,193,753 | 1,617 | Not available |\nSince there is no data available for most common cargo grades, the results are incomplete.",
+      "clarification": null,
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "analysis.by_module_type",
+          "slots": {},
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "composite",
+          "intent_key": "analysis.by_module_type",
+          "steps": [
+            {
+              "agent": "finance",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "question": "For each module type (TC Voyage, Spot, etc), show average PnL, average revenue, voyage count, and most common cargo grade.",
+                "limit": 50,
+                "intent_key": "analysis.by_module_type"
+              }
+            },
+            {
+              "agent": "ops",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "llm",
+              "operation": "merge",
+              "inputs": {}
+            }
+          ]
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 3,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "question": "For each module type (TC Voyage, Spot, etc), show average PnL, average revenue, voyage count, and most common cargo grade.",
+            "limit": 50,
+            "intent_key": "analysis.by_module_type"
+          },
+          "goal": "Run a finance analysis query in Postgres (dynamic SQL) and return voyage_ids for downstream steps (limit=50)."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 3,
+          "voyage_ids": 0,
+          "sql_present": true,
+          "sql": "WITH module_type_data AS ( SELECT o.module_type, f.pnl, f.revenue, jsonb_array_elements_text(o.grades_json) AS cargo_grade FROM finance_voyage_kpi f JOIN ops_voyage_summary o ON f.voyage_number = o.voyage_number AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '') WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL') ), module_type_summary AS ( SELECT module_type, AVG(pnl) AS avg_pnl, AVG(revenue) AS avg_revenue, COUNT(*) AS voyage_count FROM module_type_data GROUP BY module_type ) SELECT module_type, avg_pnl, avg_revenue, voyage_count FROM module_type_summary ORDER BY avg_pnl DESC LIMIT %(limit)s",
+          "summary": "Finance: fetched 3 rows (Postgres). No voyage_ids extracted."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 3,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch ops summaries (ports/grades/remarks/delay/offhire) for the selected voyage_ids from Postgres."
+        },
+        {
+          "phase": "composite_step_inputs_resolved",
+          "step_index": 2,
+          "agent": "ops",
+          "resolved_voyage_ids_count": 0,
+          "resolved_cargo_grades_count": 0,
+          "intent_key_ops": "analysis.by_module_type"
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "ok": false,
+          "error": "Postgres query failed: column \"voyage_id\" does not exist\nLINE 1: ...go_grade FROM ( SELECT module_type, pnl, revenue, voyage_id,...\n                                                             ^"
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 3,
+          "step_count": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "inputs": {},
+          "goal": "Deterministically merge finance + ops + mongo context into a single joined dataset for summarization."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "ok": true,
+          "merged_rows": 0,
+          "summary": "Merge: joined finance + ops + mongo context into 0 merged rows."
+        },
+        {
+          "phase": "token_usage",
+          "stage": "pre_sanitize",
+          "total_tokens_est": 194,
+          "mongo_tokens_est": 11,
+          "finance_tokens_est": 105,
+          "ops_tokens_est": 7,
+          "artifacts_tokens_est": 43
+        },
+        {
+          "phase": "token_usage",
+          "stage": "post_sanitize",
+          "total_tokens_est": 194,
+          "saved_tokens_est": 0,
+          "saved_pct_est": 0.0
+        }
+      ],
+      "dynamic_sql_used_detected": true,
+      "dynamic_sql_used_flag": true,
+      "dynamic_sql_agents": [
+        "finance"
+      ]
+    },
+    {
+      "id": "Q15",
+      "query": "For voyages flagged as delayed with negative PnL, show offhire days, total expense, PnL, vessel name, and remarks where recorded.",
+      "session_id": "eval-q15",
+      "ok": true,
+      "elapsed_ms": 8299,
+      "intent_key": "finance.loss_due_to_delay",
+      "slots": {
+        "limit": 10,
+        "voyage_ids": [
+          "2DA0080E56ACACE75ECEB989D76DB933",
+          "A39C9634A18E888B924AB9D5931933D8",
+          "8125EAB23DAB3193AE1A0DBF607F16D8",
+          "AAE74337629029006D5B6B988FC1AB65",
+          "A6FB92B6B2B9D60D9AE7B523CB10CDF7",
+          "36A4E7BBC07F80761D4F66A3284D195F",
+          "C179BA9FAE75C8C0FB35D6E691E115F8",
+          "EBC3BE82A903DA46983C727C6908E027",
+          "62D7E24304CBF305248C8C9FDB499827",
+          "F8E5FA1600AB7A07CA5CA5D11F6CFF3B"
+        ]
+      },
+      "answer": "| Vessel Name | Voyage # | Offhire Days | Total Expense | PnL | Remarks |\n| --- | --- | --- | --- | --- | --- |\n| Stena Imperator | 2205 | 67.3333 | $642,098.98 | -$1,733,432.31 | Not available |\n| Green Sea | 2204 | 0.7167 | $2,603,077.99 | -$1,414,908.76 | Updated Suez Canal rebate of + 38.870 USD / TCE + 331 USD, removed Liverpool prewash 6 k, updated final port cost at Bialla |\n| Crude Zephyrus | 2301 | 19.6917 | $1,231,094.19 | -$1,226,438.19 | reset revenue to zero due to cancelled CP, Disport changed as per VO. TCE up abt. 5 K |\n| Green Sky | 2007 | 0.7083 | $1,217,292.79 | -$1,166,341.40 | updated skuld deductible for May 2024, updated skuld dedudctible for April 2024, updpated skuld deductible for March 2024 (717 USD) |\n| Nord Vanquish | 2101 | 2.1104 | $1,033,621.15 | -$658,019.89 | Port costs in Portbury settled by UMOL directly |\n| Stena Conquest | 2206 | Not available | $1,511,710.70 | -$631,925.26 | Port costs updated, demurrage less than expected due more pilotage time and less…, HEDGE profit updated - better than expected, Proman backed off on paying 50/50 and said only $20 k they will cover for auction… |\n| Not available | 2201 | Not available | $577,363.78 | -$626,267.67 | Please note that vessel was re-delivered to Concordia on 12 March 2022 at 08:54 … |\n| Not available | 2108 | Not available | $937,045.21 | -$616,561.58 | Not available |\n| Not available | 2201 | Not available | $612,809.56 | -$608,889.11 | Miscellaneous is estimated off-hire due to Covid. |\n| Not available | 2201 | Not available | $1,528,426.75 | -$528,428.75 | PED: increased to USD 1,176 k to include disputed Demurrage (11 days), 800,000 USD added as reservation for towage costs in Argentina |\nThe voyages with the highest losses due to delays are primarily from vessels such as the Stena Imperator, Green Sea, and Crude Zephyrus, with significant offhire days and expenses contributing to their negative PnL.",
+      "clarification": null,
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "finance.loss_due_to_delay",
+          "slots": {},
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "composite",
+          "intent_key": "finance.loss_due_to_delay",
+          "steps": [
+            {
+              "agent": "finance",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "question": "For voyages flagged as delayed with negative PnL, show offhire days, total expense, PnL, vessel name, and remarks where recorded.",
+                "limit": 10,
+                "intent_key": "finance.loss_due_to_delay"
+              }
+            },
+            {
+              "agent": "ops",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "mongo",
+              "operation": "fetchRemarks",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "llm",
+              "operation": "merge",
+              "inputs": {}
+            }
+          ]
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 4,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "question": "For voyages flagged as delayed with negative PnL, show offhire days, total expense, PnL, vessel name, and remarks where recorded.",
+            "limit": 10,
+            "intent_key": "finance.loss_due_to_delay"
+          },
+          "goal": "Run a finance analysis query in Postgres (dynamic SQL) and return voyage_ids for downstream steps (limit=10)."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 10,
+          "voyage_ids": 10,
+          "extracted_voyage_ids": [
+            "2DA0080E56ACACE75ECEB989D76DB933",
+            "A39C9634A18E888B924AB9D5931933D8",
+            "8125EAB23DAB3193AE1A0DBF607F16D8",
+            "AAE74337629029006D5B6B988FC1AB65",
+            "A6FB92B6B2B9D60D9AE7B523CB10CDF7",
+            "36A4E7BBC07F80761D4F66A3284D195F",
+            "C179BA9FAE75C8C0FB35D6E691E115F8",
+            "EBC3BE82A903DA46983C727C6908E027",
+            "62D7E24304CBF305248C8C9FDB499827",
+            "F8E5FA1600AB7A07CA5CA5D11F6CFF3B"
+          ],
+          "sql_present": true,
+          "sql": "SELECT f.voyage_id, f.voyage_number, f.pnl, f.revenue, f.total_expense, o.offhire_days, o.vessel_name, o.remarks_json FROM finance_voyage_kpi f JOIN ops_voyage_summary o ON f.voyage_number = o.voyage_number AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '') WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL') AND o.offhire_days > 0 AND f.pnl < 0 ORDER BY f.pnl ASC LIMIT %(limit)s",
+          "summary": "Finance: fetched 10 rows and extracted 10 voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 4,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch ops summaries (ports/grades/remarks/delay/offhire) for the selected voyage_ids from Postgres."
+        },
+        {
+          "phase": "composite_step_inputs_resolved",
+          "step_index": 2,
+          "agent": "ops",
+          "resolved_voyage_ids_count": 10,
+          "resolved_cargo_grades_count": 0,
+          "intent_key_ops": "finance.loss_due_to_delay"
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 10,
+          "voyage_ids": 10,
+          "extracted_voyage_ids": [
+            "2DA0080E56ACACE75ECEB989D76DB933",
+            "A39C9634A18E888B924AB9D5931933D8",
+            "8125EAB23DAB3193AE1A0DBF607F16D8",
+            "AAE74337629029006D5B6B988FC1AB65",
+            "A6FB92B6B2B9D60D9AE7B523CB10CDF7",
+            "36A4E7BBC07F80761D4F66A3284D195F",
+            "C179BA9FAE75C8C0FB35D6E691E115F8",
+            "EBC3BE82A903DA46983C727C6908E027",
+            "62D7E24304CBF305248C8C9FDB499827",
+            "F8E5FA1600AB7A07CA5CA5D11F6CFF3B"
+          ],
+          "sql_present": true,
+          "sql": "SELECT voyage_id,\n                       voyage_number,\n                       vessel_imo,\n                       vessel_name,\n                       module_type,\n                       fixture_count,\n                       offhire_days,\n                       is_delayed,\n                       delay_reason,\n                       ports_json,\n                       grades_json,\n                       remarks_json,\n                       voyage_start_date,\n                       voyage_end_date\n                FROM ops_voyage_summary\n                WHERE voyage_id = ANY(%(voyage_ids)s)\n                LIMIT %(limit)s",
+          "summary": "Ops: fetched 10 ops rows for voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 3,
+          "step_count": 4,
+          "agent": "mongo",
+          "operation": "fetch_remarks",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch voyage remarks + minimal fixture context (ports/grades/commissions) for the selected voyage_ids from MongoDB."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 3,
+          "agent": "mongo",
+          "operation": "fetch_remarks",
+          "ok": true,
+          "mode": "mongo_llm",
+          "mongo_ok": true,
+          "mongo_query": {
+            "collection": "voyages",
+            "filter": {
+              "voyageId": {
+                "$in": [
+                  "2DA0080E56ACACE75ECEB989D76DB933",
+                  "A39C9634A18E888B924AB9D5931933D8",
+                  "8125EAB23DAB3193AE1A0DBF607F16D8",
+                  "AAE74337629029006D5B6B988FC1AB65",
+                  "A6FB92B6B2B9D60D9AE7B523CB10CDF7",
+                  "36A4E7BBC07F80761D4F66A3284D195F",
+                  "C179BA9FAE75C8C0FB35D6E691E115F8",
+                  "EBC3BE82A903DA46983C727C6908E027",
+                  "62D7E24304CBF305248C8C9FDB499827",
+                  "F8E5FA1600AB7A07CA5CA5D11F6CFF3B"
+                ]
+              }
+            },
+            "projection": {
+              "_id": 0,
+              "voyageId": 1,
+              "voyageNumber": 1,
+              "remarks": 1,
+              "fixtures.grades": 1,
+              "fixtures.fixtureGrades.gradeName": 1,
+              "fixtures.fixturePorts.portName": 1,
+              "fixtures.fixturePorts.activityType": 1
+            },
+            "sort": null,
+            "limit": 50,
+            "pipeline": null
+          },
+          "rows": 11,
+          "voyage_ids": 10,
+          "extracted_voyage_ids": [
+            "2DA0080E56ACACE75ECEB989D76DB933",
+            "A39C9634A18E888B924AB9D5931933D8",
+            "8125EAB23DAB3193AE1A0DBF607F16D8",
+            "AAE74337629029006D5B6B988FC1AB65",
+            "A6FB92B6B2B9D60D9AE7B523CB10CDF7",
+            "36A4E7BBC07F80761D4F66A3284D195F",
+            "C179BA9FAE75C8C0FB35D6E691E115F8",
+            "EBC3BE82A903DA46983C727C6908E027",
+            "62D7E24304CBF305248C8C9FDB499827",
+            "F8E5FA1600AB7A07CA5CA5D11F6CFF3B"
+          ],
+          "remarks_by_voyage_id": 10,
+          "summary": "Mongo: fetched remarks + minimal context for 10 voyages (MongoDB)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 4,
+          "step_count": 4,
+          "agent": "llm",
+          "operation": "merge",
+          "inputs": {},
+          "goal": "Deterministically merge finance + ops + mongo context into a single joined dataset for summarization."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 4,
+          "agent": "llm",
+          "operation": "merge",
+          "ok": true,
+          "merged_rows": 10,
+          "summary": "Merge: joined finance + ops + mongo context into 10 merged rows."
+        },
+        {
+          "phase": "token_usage",
+          "stage": "pre_sanitize",
+          "total_tokens_est": 2006,
+          "mongo_tokens_est": 14,
+          "finance_tokens_est": 402,
+          "ops_tokens_est": 8,
+          "artifacts_tokens_est": 1551
+        },
+        {
+          "phase": "token_usage",
+          "stage": "post_sanitize",
+          "total_tokens_est": 2041,
+          "saved_tokens_est": -35,
+          "saved_pct_est": -1.744765702891326
+        }
+      ],
+      "dynamic_sql_used_detected": true,
+      "dynamic_sql_used_flag": true,
+      "dynamic_sql_agents": [
+        "finance",
+        "ops"
+      ]
+    }
+  ]
+}

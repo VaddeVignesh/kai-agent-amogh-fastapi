@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+import os
 from typing import Any, Dict, List, Optional
 
 from app.adapters.postgres_adapter import PostgresAdapter
+from app.registries.intent_registry import INTENT_REGISTRY
 from app.sql.sql_allowlist import DEFAULT_ALLOWLIST
 from app.sql.sql_guard import validate_and_prepare_sql
 from app.sql.sql_generator import SQLGenerator
@@ -40,12 +42,28 @@ class FinanceAgent:
         self.allowlist = allowlist or DEFAULT_ALLOWLIST
         self.sql_generator = sql_generator or (SQLGenerator(llm_client) if llm_client else None)
 
+    @staticmethod
+    def _normalize_slots(slots: Dict[str, Any] | None) -> Dict[str, Any]:
+        """
+        Accept both flat slot dicts and nested step inputs carrying a `slots` object.
+        Top-level keys win; nested `slots` provides fallback values.
+        """
+        if not isinstance(slots, dict):
+            return {}
+        nested = slots.get("slots")
+        if isinstance(nested, dict):
+            merged = {**nested, **slots}
+            merged.pop("slots", None)
+            return merged
+        return dict(slots)
+
     # =========================================================
     # ENTRY
     # =========================================================
 
     def run(self, *, intent_key, slots, session_context=None, user_input=None):
         session_context = session_context or {}
+        slots = self._normalize_slots(slots)
 
         try:
             query_key, params = self._map_intent(intent_key, slots)
@@ -74,12 +92,33 @@ class FinanceAgent:
         if not self.sql_generator:
             raise RuntimeError("FinanceAgent.run_dynamic requires sql_generator")
 
+        slots = self._normalize_slots(slots)
+        # Composite intent hygiene: keep only registry-declared slots plus
+        # core execution keys to avoid stale entity filters leaking into SQL.
+        _cfg = INTENT_REGISTRY.get(intent_key, {})
+        if _cfg.get("route") == "composite":
+            _allowed = set((_cfg.get("required_slots") or []) + (_cfg.get("optional_slots") or []))
+            _allowed.update({"scenario", "limit", "voyage_ids", "voyage_numbers", "voyage_number", "voyage_id", "cargo_grades", "vessel_imos"})
+            slots = {k: v for k, v in slots.items() if k in _allowed}
         limit_val = min(int(slots.get("limit") or self.DEFAULT_LIMIT), self.MAX_LIMIT)
         slots = {**slots, "limit": limit_val}
+        guardrails = INTENT_REGISTRY.get(intent_key, {}).get("guardrails", {})
 
-        def _generate_once(q: str) -> tuple[str, Dict[str, Any]]:
+        MAX_SQL_RETRIES = int(os.getenv("SQL_MAX_RETRIES", "2"))
+
+        def _generate_once(q: str, error_hint: str = "") -> tuple[str, Dict[str, Any]]:
+            q_eff = q
+            if error_hint:
+                q_eff = (
+                    f"{q}\n\n"
+                    "PREVIOUS ATTEMPT FAILED WITH THIS ERROR:\n"
+                    f"{error_hint}\n"
+                    "Fix the SQL. The most common cause is a column in SELECT "
+                    "that is missing from GROUP BY. Check every non-aggregated "
+                    "column and ensure it appears in GROUP BY."
+                )
             gen = self.sql_generator.generate(
-                question=q,
+                question=q_eff,
                 intent_key=intent_key,
                 slots=slots,
                 agent="finance",
@@ -89,74 +128,65 @@ class FinanceAgent:
         def _is_repairable_sql_error(msg: str) -> bool:
             m = (msg or "").lower()
             patterns = (
+                "must appear in the group by",
+                "aggregate function",
                 "column",
                 "does not exist",
                 "ambiguous",
                 "set-returning function",
                 "aggregate function calls cannot contain set-returning function calls",
                 "syntax error",
+                "forbidden sql pattern",
+                "placeholder",
             )
             return any(p in m for p in patterns)
 
-        def _repair_prompt(base_question: str, err: str) -> str:
-            extra = (
-                "IMPORTANT SQL REPAIR RULES:\n"
-                "- Use only existing columns from finance_voyage_kpi / ops_voyage_summary.\n"
-                "- If using CTE aliases, reference only columns explicitly selected in that CTE.\n"
-                "- Return finance KPI columns with these aliases when relevant: voyage_id, voyage_number, revenue, total_expense, pnl, tce, total_commission.\n"
-                "- Do NOT use set-returning functions inside aggregates (e.g., jsonb_array_elements_* inside json_agg).\n"
-                "- If array expansion is needed, use LATERAL in FROM/JOIN, otherwise avoid JSON aggregation in finance SQL.\n"
-                "- Prefer simple row-level SQL over nested JSON aggregation.\n"
-                "- If joining ops, join safely by voyage_number and optionally normalized vessel_imo. Avoid invalid alias references.\n"
-                "- Keep LIMIT %(limit)s and psycopg2 named params.\n"
-                f"- Previous error to fix: {err}\n"
-            )
-            return f"{base_question}\n\n{extra}"
-
         sql, params = _generate_once(question)
 
-        if (
-            intent_key == "analysis.scenario_comparison"
-            and "%(voyage_numbers)s" in (sql or "")
-            and "voyage_numbers" not in params
-            and slots.get("voyage_numbers") is not None
-        ):
-            try:
-                params["voyage_numbers"] = [int(v) for v in (slots.get("voyage_numbers") or [])]
-            except Exception:
-                pass
+        if guardrails.get("inject_voyage_numbers_param"):
+            if "%(voyage_numbers)s" in (sql or "") and "voyage_numbers" not in params:
+                if slots.get("voyage_numbers") is not None:
+                    try:
+                        params["voyage_numbers"] = [int(v) for v in (slots.get("voyage_numbers") or [])]
+                    except Exception:
+                        pass
 
-        # Defensive: ops.port_query must always have a port filter.
-        # If upstream params lost it, restore from slots (works for both ":filter_port" and "%(filter_port)s").
-        if intent_key == "ops.port_query":
+        if guardrails.get("inject_filter_port_param"):
             port_name = (slots.get("port_name") or "").strip()
             if port_name and "filter_port" not in params:
                 params["filter_port"] = port_name
 
+        if "%(scenario)s" in sql and "scenario" not in params:
+            params["scenario"] = slots.get("scenario") or "ACTUAL"
+
         if not sql:
             raise RuntimeError("Empty SQL generated")
 
-        # Guardrail: ranking.voyages* MUST NOT reference ops tables. If it does, repair immediately.
-        if (intent_key or "").startswith("ranking.voyages"):
-            sql_lower = sql.lower()
-            if "ops_voyage_summary" in sql_lower:
-                repair_q = (
-                    f"{question}\n\n"
-                    "IMPORTANT FIX: Do NOT join ops tables. Query ONLY finance_voyage_kpi. "
-                    "Return voyage_id, voyage_number, pnl, revenue, total_expense, tce, total_commission. "
-                    "Filter scenario = COALESCE(%(scenario)s,'ACTUAL'). Order by pnl DESC. LIMIT %(limit)s."
-                )
-                sql, params = _generate_once(repair_q)
+        if guardrails.get("finance_no_ops_join") and "ops_voyage_summary" in sql.lower():
+            repair_q = (
+                f"{question}\n\n"
+                "IMPORTANT FIX: Do NOT join ops tables. Query ONLY finance_voyage_kpi. "
+                "Return voyage_id, voyage_number, pnl, revenue, total_expense, tce, total_commission. "
+                "Filter scenario = COALESCE(%(scenario)s,'ACTUAL'). Order by pnl DESC. LIMIT %(limit)s."
+            )
+            sql, params = _generate_once(repair_q)
 
         guard = None
         rows = []
-        max_attempts = 3
+        max_attempts = MAX_SQL_RETRIES + 1
         last_err = ""
         for attempt in range(max_attempts):
             guard = validate_and_prepare_sql(sql=sql, params=params, allowlist=self.allowlist, enforce_limit=True)
             if not guard.ok:
-                # One repair attempt for common LLM shape mistakes on ranking intents.
-                if (intent_key or "").startswith("ranking.voyages"):
+                if (guard.reason or "").lower().find("forbidden sql pattern") >= 0:
+                    repair_q = (
+                        f"{question}\n\n"
+                        "IMPORTANT FIX: Return plain SQL only with no comments and no extra statements. "
+                        "Use a single SELECT query and avoid any forbidden tokens."
+                    )
+                    sql, params = _generate_once(repair_q)
+                    continue
+                if guardrails.get("finance_no_ops_join"):
                     repair_q = (
                         f"{question}\n\n"
                         "IMPORTANT FIX: Generate SQL on finance_voyage_kpi ONLY (no joins). "
@@ -167,7 +197,7 @@ class FinanceAgent:
                     continue
                 last_err = guard.reason or "validation failed"
                 if attempt < max_attempts - 1 and _is_repairable_sql_error(last_err):
-                    sql, params = _generate_once(_repair_prompt(question, last_err))
+                    sql, params = _generate_once(question, error_hint=last_err)
                     continue
                 raise RuntimeError(f"Finance SQL validation failed: {guard.reason}")
 
@@ -177,19 +207,19 @@ class FinanceAgent:
             except Exception as e:
                 last_err = str(e)
                 if attempt < max_attempts - 1 and _is_repairable_sql_error(last_err):
-                    sql, params = _generate_once(_repair_prompt(question, last_err))
+                    sql, params = _generate_once(question, error_hint=last_err)
                     continue
                 raise
 
-        # Post-check: ensure the returned rows include expected KPI columns for ranking intents.
-        if (intent_key or "").startswith("ranking.voyages") and rows:
+        if guardrails.get("require_kpi_columns") and rows:
             first = rows[0] if isinstance(rows[0], dict) else {}
             required_cols = {"voyage_id", "voyage_number", "pnl", "revenue", "total_expense"}
-            if not required_cols.issubset(set(k for k in first.keys())):
+            if not required_cols.issubset(set(first.keys())):
                 repair_q = (
                     f"{question}\n\n"
                     "IMPORTANT FIX: Your last SQL did not return the required KPI columns. "
-                    "Return voyage_id, voyage_number, pnl, revenue, total_expense (and optionally tce,total_commission). "
+                    "Return voyage_id, voyage_number, pnl, revenue, total_expense "
+                    "(and optionally tce, total_commission). "
                     "Use finance_voyage_kpi only and alias columns exactly as named."
                 )
                 sql2, params2 = _generate_once(repair_q)
@@ -198,18 +228,11 @@ class FinanceAgent:
                     rows = self.pg.execute_dynamic_select(guard2.sql, guard2.params)
                     guard = guard2
 
-        # Post-check/repair for scenario comparison:
-        # - ensure required variance columns are present
-        # - avoid under-coverage when multiple voyage_numbers were requested
-        if intent_key == "analysis.scenario_comparison":
+        if guardrails.get("verify_scenario_variance_columns") and rows:
             req_cols = {
                 "voyage_number",
-                "pnl_actual",
-                "pnl_when_fixed",
-                "pnl_variance",
-                "tce_actual",
-                "tce_when_fixed",
-                "tce_variance",
+                "pnl_actual", "pnl_when_fixed", "pnl_variance",
+                "tce_actual", "tce_when_fixed", "tce_variance",
             }
             requested_vnums = []
             if isinstance(slots.get("voyage_numbers"), list):
@@ -219,7 +242,7 @@ class FinanceAgent:
                     requested_vnums = []
             requested_set = set(requested_vnums)
 
-            def _needs_repair(rows_in: List[Dict[str, Any]]) -> bool:
+            def _needs_repair(rows_in):
                 if not rows_in:
                     return False
                 first = rows_in[0] if isinstance(rows_in[0], dict) else {}
@@ -232,10 +255,8 @@ class FinanceAgent:
                             got.add(int(r.get("voyage_number")))
                         except Exception:
                             continue
-                # Must cover all requested voyages for this intent.
                 if requested_set and not requested_set.issubset(got):
                     return True
-                # Final rows should be voyage-level, not many rows per voyage.
                 if len(rows_in) > len(got):
                     return True
                 return False
@@ -244,30 +265,112 @@ class FinanceAgent:
                 repair_q = (
                     f"{question}\n\n"
                     "IMPORTANT FIX (scenario comparison): "
-                    "Use TWO CTEs aggregated to one row per (voyage_number, normalized vessel_imo) for ACTUAL and WHEN_FIXED, "
-                    "then join on BOTH voyage_number and normalized vessel_imo, and FINALLY aggregate to one row per voyage_number. "
+                    "Use TWO CTEs aggregated to one row per (voyage_number, normalized vessel_imo) "
+                    "for ACTUAL and WHEN_FIXED, then join on BOTH and aggregate to one row per voyage_number. "
                     "Filter voyage_number = ANY(%(voyage_numbers)s). "
                     "Return exactly: voyage_number, pnl_actual, pnl_when_fixed, pnl_variance, "
                     "tce_actual, tce_when_fixed, tce_variance. "
-                    "Use SUM for pnl fields and AVG for tce fields in final voyage-level aggregation. "
-                    "Do not create many-to-many joins or vessel-level final rows."
+                    "Use SUM for pnl fields and AVG for tce fields."
                 )
                 sql2, params2 = _generate_once(repair_q)
-                if (
-                    "%(voyage_numbers)s" in (sql2 or "")
-                    and "voyage_numbers" not in params2
-                    and slots.get("voyage_numbers") is not None
-                ):
-                    try:
-                        params2["voyage_numbers"] = [int(v) for v in (slots.get("voyage_numbers") or [])]
-                    except Exception:
-                        pass
+                if "%(voyage_numbers)s" in (sql2 or "") and "voyage_numbers" not in params2:
+                    if slots.get("voyage_numbers") is not None:
+                        try:
+                            params2["voyage_numbers"] = [int(v) for v in (slots.get("voyage_numbers") or [])]
+                        except Exception:
+                            pass
                 guard2 = validate_and_prepare_sql(sql=sql2, params=params2, allowlist=self.allowlist, enforce_limit=True)
                 if guard2.ok:
                     rows2 = self.pg.execute_dynamic_select(guard2.sql, guard2.params)
                     if rows2 and not _needs_repair(rows2):
                         rows = rows2
                         guard = guard2
+
+        if guardrails.get("segment_performance_fallback"):
+            has_voyage_id = any(isinstance(r, dict) and r.get("voyage_id") for r in (rows or []))
+            if (not rows) or (not has_voyage_id):
+                voyage_numbers = slots.get("voyage_numbers")
+                if voyage_numbers is None and slots.get("voyage_number") is not None:
+                    voyage_numbers = [slots.get("voyage_number")]
+                if voyage_numbers is not None and not isinstance(voyage_numbers, list):
+                    voyage_numbers = [voyage_numbers]
+                try:
+                    voyage_numbers = [int(v) for v in (voyage_numbers or []) if v is not None]
+                except Exception:
+                    voyage_numbers = []
+
+                if voyage_numbers:
+                    fallback_sql = """
+                        SELECT
+                          f.voyage_id,
+                          f.voyage_number,
+                          f.vessel_imo,
+                          f.revenue,
+                          f.total_expense,
+                          f.pnl,
+                          f.tce,
+                          f.total_commission,
+                          f.voyage_start_date,
+                          f.voyage_end_date,
+                          o.vessel_name,
+                          o.module_type,
+                          o.ports_json,
+                          o.grades_json,
+                          o.activities_json,
+                          o.remarks_json
+                        FROM finance_voyage_kpi f
+                        LEFT JOIN ops_voyage_summary o
+                          ON f.voyage_number = o.voyage_number
+                          AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+                        WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
+                          AND f.voyage_number = ANY(%(voyage_numbers)s)
+                        ORDER BY f.voyage_end_date DESC
+                        LIMIT %(limit)s
+                    """
+                else:
+                    fallback_sql = """
+                        SELECT
+                          f.voyage_id,
+                          f.voyage_number,
+                          f.vessel_imo,
+                          f.revenue,
+                          f.total_expense,
+                          f.pnl,
+                          f.tce,
+                          f.total_commission,
+                          f.voyage_start_date,
+                          f.voyage_end_date,
+                          o.vessel_name,
+                          o.module_type,
+                          o.ports_json,
+                          o.grades_json,
+                          o.activities_json,
+                          o.remarks_json
+                        FROM finance_voyage_kpi f
+                        LEFT JOIN ops_voyage_summary o
+                          ON f.voyage_number = o.voyage_number
+                          AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+                        WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
+                          AND f.pnl < 0
+                        ORDER BY f.pnl ASC
+                        LIMIT %(limit)s
+                    """
+                fallback_params = {
+                    "scenario": slots.get("scenario") or "ACTUAL",
+                    "limit": min(int(slots.get("limit") or self.DEFAULT_LIMIT), self.MAX_LIMIT),
+                    "voyage_numbers": voyage_numbers,
+                }
+                fallback_guard = validate_and_prepare_sql(
+                    sql=fallback_sql,
+                    params=fallback_params,
+                    allowlist=self.allowlist,
+                    enforce_limit=True,
+                )
+                if fallback_guard.ok:
+                    rows_fb = self.pg.execute_dynamic_select(fallback_guard.sql, fallback_guard.params)
+                    if isinstance(rows_fb, list):
+                        rows = rows_fb
+                        guard = fallback_guard
 
         return FinanceAgentResult(
             intent_key=intent_key,
@@ -291,7 +394,7 @@ class FinanceAgent:
 
     def _map_intent(self, intent_key: str, slots: Dict[str, Any]):
 
-        s = dict(slots or {})
+        s = self._normalize_slots(slots)
         limit = min(int(s.get("limit") or self.DEFAULT_LIMIT), self.MAX_LIMIT)
         scenario = s.get("scenario") or "ACTUAL"
 

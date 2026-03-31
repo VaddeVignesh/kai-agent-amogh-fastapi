@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ast
+import json
+import logging
 import os
 import traceback
 from dataclasses import asdict, is_dataclass
@@ -39,6 +42,93 @@ def _dprint(*args: Any, **kwargs: Any) -> None:
             except Exception:
                 # Last-resort: don't crash debug logging.
                 return
+
+logger = logging.getLogger(__name__)
+
+
+def _first_fixture(doc: dict) -> dict:
+    raw = doc.get("fixtures")
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                return item
+        return {}
+    if isinstance(raw, dict):
+        for key in ("fixtureList", "fixtures", "list"):
+            val = raw.get(key)
+            if isinstance(val, list):
+                for item in val:
+                    if isinstance(item, dict):
+                        return item
+        return raw
+    return {}
+
+
+VOYAGE_SECTION_MAP = {
+    "commissions": lambda d: _first_fixture(d).get("fixtureCommissions", []),
+    "cargo":       lambda d: _first_fixture(d).get("fixtureBillsOfLading", []),
+    "fixture":     lambda d: {k: _first_fixture(d).get(k) for k in
+                       ["cpDate", "cpQuantity", "demurrage", "laytime",
+                        "timeBar", "overage", "grades", "fixtureRemark"]},
+    "ports":       lambda d: _first_fixture(d).get("fixturePorts", []),
+    "legs":        lambda d: d.get("legs", []),
+    "revenues":    lambda d: d.get("revenues", []),
+    "expenses":    lambda d: d.get("expenses", []),
+    "bunkers":     lambda d: d.get("bunkers", []),
+    "emissions":   lambda d: d.get("emissions", {}),
+    "projected":   lambda d: d.get("projected_results", {}),
+    "remarks":     lambda d: d.get("remarks", []),
+}
+
+TOPIC_KEYWORDS = {
+    "commissions": ["charterer", "broker", "commission", "rate", "agent", "co broker"],
+    "cargo":       ["cargo", "grade", "bl ", "shipper", "naphtha", "bill of lading",
+                    "quantity", "mt ", "bbls"],
+    "fixture":     ["cp date", "laytime", "demurrage", "time bar", "fixture",
+                    "overage", "lay can"],
+    "ports":       ["port", "load port", "discharge port", "bilbao", "antwerp",
+                    "activity"],
+    "legs":        ["route", "leg", "arrival", "departure", "distance", "passage",
+                    "speed", "ballast", "laden", "draft", "eca"],
+    "revenues":    ["revenue", "freight", "rebill", "ws ", "worldscale", "flat rate",
+                    "revenue line"],
+    "expenses":    ["expense", "miscellaneous", "ets", "expense line"],
+    "bunkers":     ["bunker", "hsbf", "lsgo", "rob", "consumption", "stem",
+                    "fuel", "refill"],
+    "emissions":   ["cii", "co2", "sox", "nox", "emission", "eeoi", "aer", "band"],
+    "projected":   ["projected", "tce", "pnl", "efficiency", "estimated",
+                    "projection", "forecast"],
+    "remarks":     ["remark", "note", "who added", "comment", "added by",
+                    "modified by"],
+}
+
+
+def select_voyage_sections(user_input: str, doc: dict) -> dict:
+    """
+    Picks only the doc sections relevant to the user's question.
+    Returns a dict of {section_name: section_data}.
+    Falls back to fixture + basic identity fields if nothing matches.
+    """
+    text = (user_input or "").lower()
+    selected = {}
+
+    for section, keywords in TOPIC_KEYWORDS.items():
+        if any(kw in text for kw in keywords):
+            selected[section] = VOYAGE_SECTION_MAP[section](doc)
+
+    # Always include basic identity
+    selected["voyage_info"] = {
+        "voyageNumber": doc.get("voyageNumber"),
+        "vesselName":   doc.get("vesselName"),
+        "voyageId":     doc.get("voyageId"),
+        "startDateUtc": doc.get("startDateUtc"),
+    }
+
+    # Fallback: if nothing matched, send fixture summary
+    if len(selected) == 1:
+        selected["fixture"] = VOYAGE_SECTION_MAP["fixture"](doc)
+
+    return selected
 
 # =========================================================
 # Helpers
@@ -133,7 +223,7 @@ class GraphRouter:
             return f"Run a finance analysis query in Postgres (dynamic SQL) and return voyage_ids for downstream steps (limit={limit})."
 
         if agent == "ops" and op == "dynamic_sql":
-            return "Fetch ops summaries (ports/grades/remarks/delay/offhire) for the selected voyage_ids from Postgres."
+            return "Fetch ops summaries (ports/grades/remarks/delay/offhire) for selected voyage_ids from Postgres when available; skip if finance aggregate result is self-contained."
 
         if agent == "mongo" and op == "fetch_remarks":
             return "Fetch voyage remarks + minimal fixture context (ports/grades/commissions) for the selected voyage_ids from MongoDB."
@@ -528,6 +618,33 @@ class GraphRouter:
                 "for ",
                 "which ",
                 "what ",
+                "if ",
+                "is ",
+                "how ",
+                "does ",
+                "did ",
+                "are ",
+                "was ",
+                "were ",
+                "ports ",
+                "port ",
+                "cargo ",
+                "vessels ",
+                "vessel ",
+                "voyages ",
+                "voyage ",
+                "average ",
+                "avg ",
+                "top ",
+                "bottom ",
+                "highest ",
+                "lowest ",
+                "most ",
+                "least ",
+                "total ",
+                "count ",
+                "find ",
+                "calculate ",
             )
         )
 
@@ -552,18 +669,27 @@ class GraphRouter:
         starts_followup_verb = ul.startswith(("explain", "why", "what went wrong", "went wrong"))
         mentions_remarks = ("remark" in ul) or ("remarks" in ul)
         if has_result_set and mentions_remarks and is_short_followup and starts_followup_verb and not starts_like_new_request and turn_type == "followup":
-            state["intent_key"] = "followup.result_set"
-            state["slots"] = {"action": "explain_remarks"}
-            artifacts = state.get("artifacts") or {}
-            artifacts["intent_key"] = "followup.result_set"
-            artifacts["slots"] = state["slots"]
-            artifacts["user_input"] = user_input
-            state["artifacts"] = artifacts
-            self._trace(
-                state,
-                {"phase": "intent_extraction", "intent_key": "followup.result_set", "slots": state["slots"], "source": "result_set_followup"},
+            _looks_fresh = any(
+                ul.startswith(p) for p in [
+                    "is ", "for vessel", "how is", "show me", "which vessel",
+                    "find vessel", "stena", "sonangol"
+                ]
             )
-            return state
+            if _looks_fresh:
+                pass  # fall through to normal intent extraction
+            else:
+                state["intent_key"] = "followup.result_set"
+                state["slots"] = {"action": "explain_remarks"}
+                artifacts = state.get("artifacts") or {}
+                artifacts["intent_key"] = "followup.result_set"
+                artifacts["slots"] = state["slots"]
+                artifacts["user_input"] = user_input
+                state["artifacts"] = artifacts
+                self._trace(
+                    state,
+                    {"phase": "intent_extraction", "intent_key": "followup.result_set", "slots": state["slots"], "source": "result_set_followup"},
+                )
+                return state
 
         # Extremes (highest/lowest) as a short follow-up prompt.
         if (
@@ -572,6 +698,10 @@ class GraphRouter:
             and is_short_followup
             and (not starts_like_new_request or any(k in ul for k in ("out of it", "out of them", "among these", "among them")))
             and turn_type == "followup"
+            and not any(ul.startswith(p) for p in [
+                "is ", "is stena", "is sonangol", "for vessel",
+                "how is", "stena ", "sonangol ", "which vessel"
+            ])
         ):
             state["intent_key"] = "followup.result_set"
             state["slots"] = {"action": "compare_extremes"}
@@ -1698,6 +1828,20 @@ class GraphRouter:
         intent_key = state.get("intent_key", "out_of_scope")
         slots = state.get("slots") or {}
 
+        if intent_key == "ops.port_query" and not slots.get("port_name"):
+            _ul = (state.get("user_input") or "").lower()
+            _is_fleet_port_aggregate = any(p in _ul for p in [
+                "most commonly visited", "most visited", "busiest port",
+                "busiest ports", "most frequent port", "all voyages",
+                "across all", "highest demurrage", "average demurrage",
+                "port frequency", "port count", "how many ports"
+            ])
+            if _is_fleet_port_aggregate:
+                # Route to aggregate intent, not port lookup
+                intent_key = "ranking.ports"
+                state["intent_key"] = intent_key
+                # Fall through to normal planning — do NOT trigger clarification
+
         if intent_key not in INTENT_REGISTRY:
             state["missing_keys"] = []
             return state
@@ -1720,6 +1864,10 @@ class GraphRouter:
             return False
 
         missing = [k for k in required if _is_effectively_missing(k)]
+
+        # Fleet-wide/composite intents never need an entity anchor — skip clarification.
+        if INTENT_REGISTRY.get(intent_key, {}).get("route") == "composite":
+            missing = []
 
         # Heuristic: treat "tell me about vessel" as missing vessel_name/imo.
         ui = (state.get("user_input") or "").lower()
@@ -1987,6 +2135,7 @@ class GraphRouter:
         session_context = state.get("session_ctx") or {}
         slots = self._merge_slots(intent_key, session_context, state.get("slots") or {})
         user_input = state.get("user_input") or ""
+        plan_type = str(state.get("plan_type") or (state.get("plan") or {}).get("plan_type") or "single").lower()
 
         _dprint(f"\n▶️  SINGLE EXECUTION: {intent_key}")
 
@@ -2369,6 +2518,194 @@ class GraphRouter:
         # LangGraph may populate declared state keys with None. Ensure data is always a dict.
         if not isinstance(state.get("data"), dict):
             state["data"] = {}
+
+        # =========================================================
+        # Mixed voyage query: PostgreSQL financials + Mongo metadata
+        # =========================================================
+        if plan_type == "multi" and intent_key in ("voyage.summary", "voyage.metadata"):
+            if not slots.get("voyage_number") and isinstance(slots.get("voyage_numbers"), list) and slots.get("voyage_numbers"):
+                slots["voyage_number"] = slots.get("voyage_numbers")[0]
+
+            # Canonical voyage resolve before finance call:
+            # when voyage_number is reused across vessels, adding canonical voyage_id/imo
+            # keeps the finance query anchored to the same voyage identity used by Mongo.
+            if slots.get("voyage_number") and (not slots.get("voyage_id") or not (slots.get("vessel_imo") or slots.get("imo"))):
+                try:
+                    canon = self.mongo_agent.fetch_full_voyage_context(
+                        voyage_number=slots.get("voyage_number"),
+                        voyage_id=slots.get("voyage_id"),
+                    )
+                except Exception:
+                    canon = {}
+                if isinstance(canon, dict) and canon:
+                    if canon.get("voyage_id") and not slots.get("voyage_id"):
+                        slots["voyage_id"] = str(canon.get("voyage_id"))
+                    if canon.get("vessel_imo") and not (slots.get("vessel_imo") or slots.get("imo")):
+                        slots["vessel_imo"] = str(canon.get("vessel_imo"))
+                    if canon.get("vessel_name") and not slots.get("vessel_name"):
+                        slots["vessel_name"] = str(canon.get("vessel_name"))
+
+            # Step 1: financials from Postgres (authoritative for PnL/revenue/expense/TCE/commission)
+            self._trace(state, {
+                "phase": "multi_step_start",
+                "step_index": 1,
+                "step_count": 2,
+                "intent_key": "voyage.summary",
+                "agent": "finance",
+                "description": "Fetch actual PnL, revenue, expense, TCE from PostgreSQL",
+            })
+            try:
+                finance_data = self.finance_agent.run(
+                    intent_key="voyage.summary",
+                    slots=slots,
+                    session_context=session_context,
+                    user_input=user_input,
+                )
+            except TypeError:
+                finance_data = self.finance_agent.run(
+                    intent_key="voyage.summary",
+                    slots=slots,
+                    session_context={**session_context, "user_input": user_input},
+                )
+            except Exception as e:
+                finance_data = {"mode": "error", "rows": [], "fallback_reason": f"Finance agent error: {e}"}
+            finance_safe = _json_safe(finance_data)
+            finance_rows = finance_safe.get("rows") if isinstance(finance_safe, dict) else []
+            finance_rows = finance_rows if isinstance(finance_rows, list) else []
+            self._trace(state, {
+                "phase": "multi_step_result",
+                "step_index": 1,
+                "intent_key": "voyage.summary",
+                "agent": "finance",
+                "rows": len(finance_rows),
+                "ok": True,
+            })
+
+            # Step 2: metadata from Mongo
+            self._trace(state, {
+                "phase": "multi_step_start",
+                "step_index": 2,
+                "step_count": 2,
+                "intent_key": "voyage.metadata",
+                "agent": "mongo",
+                "description": "Fetch remarks, ports, cargo, fixture from MongoDB",
+            })
+            projection = cfg.get("mongo_projection") or {
+                "_id": 0,
+                "voyageId": 1,
+                "voyageNumber": 1,
+                "vesselName": 1,
+                "fixtures": 1,
+                "legs": 1,
+                "revenues": 1,
+                "expenses": 1,
+                "bunkers": 1,
+                "emissions": 1,
+                "remarks": 1,
+                "projected_results": 1,
+                "startDateUtc": 1,
+            }
+            doc = None
+            if slots.get("voyage_id") not in (None, ""):
+                try:
+                    doc = self.mongo_agent.adapter.fetch_voyage(str(slots.get("voyage_id")), projection=projection)
+                except Exception:
+                    doc = None
+            if not isinstance(doc, dict) or not doc:
+                try:
+                    vnum = slots.get("voyage_number")
+                    if vnum not in (None, ""):
+                        doc = self.mongo_agent.adapter.get_voyage_by_number(int(vnum), projection=projection)
+                except Exception:
+                    doc = None
+            if not isinstance(doc, dict):
+                doc = {}
+            self._trace(state, {
+                "phase": "multi_step_result",
+                "step_index": 2,
+                "intent_key": "voyage.metadata",
+                "agent": "mongo",
+                "rows": 1 if doc else 0,
+                "ok": True,
+            })
+
+            # Assemble source-separated context (financial values MUST come from PostgreSQL).
+            selected_fin = None
+            for r in finance_rows:
+                if not isinstance(r, dict):
+                    continue
+                if slots.get("voyage_number") is None or str(r.get("voyage_number")) == str(slots.get("voyage_number")):
+                    selected_fin = r
+                    break
+            if not selected_fin and finance_rows:
+                selected_fin = finance_rows[0]
+            selected_fin = selected_fin or {}
+            financial_data_postgres = {
+                "voyage_id": selected_fin.get("voyage_id"),
+                "voyage_number": selected_fin.get("voyage_number") or slots.get("voyage_number"),
+                "vessel_name": selected_fin.get("vessel_name") or doc.get("vesselName"),
+                "pnl": selected_fin.get("pnl"),
+                "revenue": selected_fin.get("revenue"),
+                "total_expense": selected_fin.get("total_expense"),
+                "tce": selected_fin.get("tce"),
+                "total_commission": selected_fin.get("total_commission"),
+                "scenario": selected_fin.get("scenario"),
+            }
+            metadata_mongodb = select_voyage_sections(user_input, doc) if doc else {}
+
+            system_prompt = """You are a voyage data analyst.
+You have been given data from TWO sources:
+1. FINANCIAL DATA (ACTUAL settled figures, use these for PnL/revenue/expense/TCE)
+2. METADATA (use these for ports, cargo, remarks, fixture, bunkers)
+Never mix the two sources. Always prefer FINANCIAL DATA for any financial figure.
+Write a clean business answer for end users. Do NOT mention internal source names, system/debug wording,
+or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dataset shows'."""
+            user_prompt = (
+                "Context JSON:\n"
+                + json.dumps(
+                    {
+                        "financial_data_postgres": financial_data_postgres,
+                        "metadata_mongodb": metadata_mongodb,
+                    },
+                    default=str,
+                    indent=2,
+                )
+                + f"\n\nQuestion: {user_input}"
+            )
+            answer = self.llm._call_with_retry(
+                system=system_prompt,
+                user=user_prompt,
+                operation="multi_voyage_answer",
+                return_string=True,
+            )
+            if not answer:
+                answer = "### Summary\n- I found the voyage financial and operational details, but could not format the final response right now."
+
+            mongo_safe = {"mode": "mongo_metadata", "ok": True, "rows": [doc] if doc else []}
+            merged = {
+                "finance": finance_safe,
+                "ops": {"mode": None, "rows": []},
+                "mongo": mongo_safe,
+                "artifacts": {
+                    "intent_key": intent_key,
+                    "slots": slots,
+                    "financial_data_postgres": financial_data_postgres,
+                    "metadata_mongodb": metadata_mongodb,
+                },
+                "dynamic_sql_used": False,
+                "dynamic_sql_agents": [],
+            }
+            state["merged"] = merged
+            state["answer"] = answer
+            state["slots"] = slots
+            state["finance"] = finance_safe
+            state["ops"] = {"mode": None, "rows": []}
+            state["mongo"] = mongo_safe
+            state["data"]["finance"] = finance_safe
+            state["data"]["ops"] = {"mode": None, "rows": []}
+            state["data"]["mongo"] = mongo_safe
+            state["data"]["artifacts"] = merged.get("artifacts") or {"intent_key": intent_key, "slots": slots}
+            return state
 
         # =========================================================
         # Voyage summary: full context (finance, ops, mongo)
@@ -2914,21 +3251,11 @@ class GraphRouter:
 
             ql = (user_input or "").lower()
             ask_identity = any(k in ql for k in ("identity", "imo", "vessel id", "account code", "who is vessel", "vessel details", "name"))
-            ask_commercial = any(
-                k in ql
-                for k in (
-                    "hire rate",
-                    "hirerate",
-                    "hire_rate",
-                    "hire-rate",
-                    "market type",
-                    "scrubber",
-                    "operating status",
-                    "is operating",
-                    "operational",
-                    "is vessel operating",
-                )
-            )
+            ask_hire_rate = any(k in ql for k in ("hire rate", "hirerate", "hire_rate", "hire-rate"))
+            ask_scrubber = "scrubber" in ql
+            ask_market_type = "market type" in ql
+            ask_operating = any(k in ql for k in ("is operating", "is vessel operating", "operational", "operating status", "is it operating", "is it operational"))
+            ask_commercial = any((ask_hire_rate, ask_scrubber, ask_market_type, ask_operating))
             ask_passage_types = any(k in ql for k in ("passage type", "passage types"))
             ask_passage_consumption = any(k in ql for k in ("consumption profile", "consumption profiles", "consumption", "speed", "ifo", "mgo", "rpm"))
             ask_default_consumption = any(k in ql for k in ("default consumption", "default speed", "defaults", "isdefault", "default"))
@@ -2987,19 +3314,23 @@ class GraphRouter:
                         answer_lines.append(f"- **Vessel ID**: {doc.get('vesselId')}" if doc.get("vesselId") not in (None, "") else "- **Vessel ID**: Not available")
                         answer_lines.append(f"- **Account code**: {account_code}" if account_code not in (None, "") else "- **Account code**: Not available")
                     if ask_commercial:
-                        if hire_rate is not None:
-                            try:
-                                answer_lines.append(f"- **Hire rate**: ${float(hire_rate):,.2f}")
-                            except Exception:
-                                answer_lines.append(f"- **Hire rate**: {hire_rate}")
-                        else:
-                            answer_lines.append("- **Hire rate**: Not available")
-                        if is_operating is not None:
-                            answer_lines.append(f"- **Operating**: {'Yes' if bool(is_operating) else 'No'}")
-                        else:
-                            answer_lines.append("- **Operating**: Not available")
-                        answer_lines.append(f"- **Scrubber**: {scrubber}" if scrubber not in (None, "") else "- **Scrubber**: Not available")
-                        answer_lines.append(f"- **Market type**: {market_type}" if market_type not in (None, "") else "- **Market type**: Not available")
+                        if ask_hire_rate:
+                            if hire_rate is not None:
+                                try:
+                                    answer_lines.append(f"- **Hire rate**: ${float(hire_rate):,.2f}")
+                                except Exception:
+                                    answer_lines.append(f"- **Hire rate**: {hire_rate}")
+                            else:
+                                answer_lines.append("- **Hire rate**: Not available")
+                        if ask_operating:
+                            if is_operating is not None:
+                                answer_lines.append(f"- **Operating**: {'Yes' if bool(is_operating) else 'No'}")
+                            else:
+                                answer_lines.append("- **Operating**: Not available")
+                        if ask_scrubber:
+                            answer_lines.append(f"- **Scrubber**: {scrubber}" if scrubber not in (None, "") else "- **Scrubber**: Not available")
+                        if ask_market_type:
+                            answer_lines.append(f"- **Market type**: {market_type}" if market_type not in (None, "") else "- **Market type**: Not available")
                     if ask_passage_types:
                         answer_lines.append(f"- **Passage types**: {', '.join(passage_types)}" if passage_types else "- **Passage types**: Not available")
                     if ask_passage_consumption or ask_default_consumption or ask_ballast or ask_laden:
@@ -3100,16 +3431,16 @@ class GraphRouter:
                             details.append(f"Account {doc.get('accountCode')}")
                     if ask_commercial:
                         hr = doc.get("hireRate")
-                        if hr is not None:
+                        if ask_hire_rate and hr is not None:
                             try:
                                 details.append(f"Hire rate ${float(hr):,.2f}")
                             except Exception:
                                 details.append(f"Hire rate {hr}")
-                        if doc.get("isVesselOperating") is not None:
+                        if ask_operating and doc.get("isVesselOperating") is not None:
                             details.append(f"Operating {'Yes' if bool(doc.get('isVesselOperating')) else 'No'}")
-                        if doc.get("scrubber") not in (None, ""):
+                        if ask_scrubber and doc.get("scrubber") not in (None, ""):
                             details.append(f"Scrubber {doc.get('scrubber')}")
-                        if doc.get("marketType") not in (None, ""):
+                        if ask_market_type and doc.get("marketType") not in (None, ""):
                             details.append(f"Market {doc.get('marketType')}")
                     if ask_passage_types:
                         pts = _extract_passage_types(doc)
@@ -3164,6 +3495,131 @@ class GraphRouter:
                 "dynamic_sql_agents": [],
             }
 
+            state["merged"] = merged
+            state["answer"] = answer
+            state["slots"] = slots
+            state["mongo"] = mongo_safe
+            state["finance"] = {"mode": None, "rows": []}
+            state["ops"] = {"mode": None, "rows": []}
+            state["data"]["mongo"] = mongo_safe
+            state["data"]["finance"] = {"mode": None, "rows": []}
+            state["data"]["ops"] = {"mode": None, "rows": []}
+            state["data"]["artifacts"] = {"intent_key": intent_key, "slots": slots}
+            return state
+
+        # =========================================================
+        # Voyage metadata: Mongo-only deterministic summary
+        # =========================================================
+        if intent_key == "voyage.metadata":
+            projection = cfg.get("mongo_projection") or {
+                "voyageId": 1,
+                "voyageNumber": 1,
+                "vesselName": 1,
+                "tags": 1,
+                "url": 1,
+                "fixtures": 1,
+                "legs": 1,
+                "revenues": 1,
+                "expenses": 1,
+                "bunkers": 1,
+                "emissions": 1,
+                "remarks": 1,
+                "projected_results": 1,
+                "startDateUtc": 1,
+                "extracted_at": 1,
+                "_id": 0,
+            }
+            records: list[Dict[str, Any]] = []
+            mongo_rows: list[Dict[str, Any]] = []
+
+            # Primary anchors: voyage_id / voyage_number(s)
+            if slots.get("voyage_id") not in (None, ""):
+                try:
+                    doc = self.mongo_agent.adapter.fetch_voyage(str(slots.get("voyage_id")), projection=projection)
+                except Exception:
+                    doc = None
+                if isinstance(doc, dict) and doc:
+                    records.append(doc)
+                    mongo_rows.append(doc)
+
+            vnums = slots.get("voyage_numbers")
+            if not isinstance(vnums, list):
+                vn = slots.get("voyage_number")
+                vnums = [vn] if vn not in (None, "", [], {}) else []
+            unique_vnums: list[int] = []
+            for v in vnums:
+                try:
+                    iv = int(v)
+                    if iv not in unique_vnums:
+                        unique_vnums.append(iv)
+                except Exception:
+                    continue
+            unique_vnums = unique_vnums[:3]
+            for vnum in unique_vnums:
+                try:
+                    doc = self.mongo_agent.adapter.get_voyage_by_number(vnum, projection=projection)
+                except Exception:
+                    doc = None
+                if isinstance(doc, dict) and doc:
+                    records.append(doc)
+                    mongo_rows.append(doc)
+
+            # De-duplicate by voyageId if present.
+            seen_vid: set[str] = set()
+            deduped: list[Dict[str, Any]] = []
+            for r in records:
+                vid = str(r.get("voyageId") or "")
+                if vid and vid in seen_vid:
+                    continue
+                if vid:
+                    seen_vid.add(vid)
+                deduped.append(r)
+            records = deduped
+
+            if not records:
+                answer = (
+                    "### Summary\n"
+                    "- No voyage metadata found for the requested voyage.\n"
+                    "- Try with a specific voyage number.\n"
+                )
+            else:
+                if len(records) == 1:
+                    sections = select_voyage_sections(user_input, records[0])
+                else:
+                    sections = {
+                        "voyages": [select_voyage_sections(user_input, d) for d in records]
+                    }
+
+                context_json = json.dumps(sections, default=str, indent=2)
+                system_prompt = """You are a voyage data analyst.
+Answer the user's question using ONLY the data provided in the JSON context below.
+Format currency with $ and commas. Format dates as YYYY-MM-DD.
+If a value is null, say "not recorded". Never invent values."""
+                user_prompt = f"""Voyage Data:
+{context_json}
+
+Question: {user_input}"""
+                try:
+                    answer = self.llm._call_with_retry(
+                        system=system_prompt,
+                        user=user_prompt,
+                        operation="voyage_metadata_answer",
+                        return_string=True,
+                    )
+                except Exception:
+                    answer = ""
+                if not answer:
+                    answer = "### Summary\n- Voyage metadata is available but I could not generate a formatted response right now."
+
+            mongo_safe = {"mode": "mongo_metadata", "ok": True, "rows": mongo_rows}
+            merged = {
+                "finance": {"mode": None, "rows": []},
+                "ops": {"mode": None, "rows": []},
+                "mongo": mongo_safe,
+                "artifacts": {"intent_key": intent_key, "slots": slots},
+                "dynamic_sql_used": False,
+                "dynamic_sql_agents": [],
+            }
             state["merged"] = merged
             state["answer"] = answer
             state["slots"] = slots
@@ -3472,6 +3928,23 @@ class GraphRouter:
         slots = {**(state.get("slots") or {}), **(artifacts.get("slots") or {})}
         sess = state.get("session_ctx") or {}
 
+        # Composite-step slot hygiene: keep only registry-declared slots plus a
+        # small set of derived execution keys. This prevents stale entity slots
+        # from leaking into dynamic SQL generation across steps.
+        current_intent = state.get("intent_key") or (state.get("plan") or {}).get("intent_key") or ""
+        current_cfg = INTENT_REGISTRY.get(current_intent, {})
+        if current_cfg.get("route") == "composite":
+            _allowed_step_slots = set(
+                (current_cfg.get("required_slots") or [])
+                + (current_cfg.get("optional_slots") or [])
+            )
+            _allowed_step_slots.update({
+                "scenario", "limit",
+                "voyage_ids", "cargo_grades", "vessel_imos",
+                "voyage_number", "voyage_numbers", "voyage_id",
+            })
+            slots = {k: v for k, v in (slots or {}).items() if k in _allowed_step_slots}
+
         if idx >= len(steps):
             return state
 
@@ -3617,13 +4090,23 @@ class GraphRouter:
                     # Some finance aggregate intents return no voyage_ids (e.g., cargo profitability by grade).
                     # For those, carry forward key dimension values so ops can provide context.
                     if state.get("intent_key") in ("analysis.cargo_profitability", "analysis.cargoprofitability"):
-                        cargo_grades = [
-                            (r.get("cargo_grade") or r.get("grade") or "").strip()
-                            for r in rows
-                            if isinstance(r, dict) and isinstance((r.get("cargo_grade") or r.get("grade")), str)
-                        ]
-                        cargo_grades = [g for g in cargo_grades if g]
-                        cargo_grades = list(dict.fromkeys(cargo_grades))[:50]
+                        cargo_grades = []
+                        seen_cg = set()
+                        for r in rows:
+                            if not isinstance(r, dict):
+                                continue
+                            g = r.get("cargo_grade") or r.get("grade")
+                            if not isinstance(g, str):
+                                continue
+                            s = g.strip()
+                            sn = s.lower()
+                            if (not s) or sn in ("none", "null", "n/a", "na"):
+                                continue
+                            if sn in seen_cg:
+                                continue
+                            seen_cg.add(sn)
+                            cargo_grades.append(s)
+                        cargo_grades = cargo_grades[:50]
                         if cargo_grades:
                             artifacts["cargo_grades"] = cargo_grades
                             slots["cargo_grades"] = cargo_grades
@@ -3696,7 +4179,94 @@ class GraphRouter:
         # =========================================================
         # OPS STEP
         # =========================================================
+        elif agent == "ops" and op == "voyage_ids_from_step":
+            step_inputs = step.get("inputs") or {}
+
+            # Read voyage_ids from artifacts set by the previous mongo step
+            voyage_ids = artifacts.get("voyage_ids") or []
+
+            if not voyage_ids:
+                self._trace(state, {
+                    "phase": "composite_step_result",
+                    "step_index": idx + 1,
+                    "agent": "ops",
+                    "operation": op,
+                    "ok": False,
+                    "error": "No voyages found for the specified cargo grade.",
+                })
+                state["data"]["ops"] = {"mode": "dynamic_sql", "rows": []}
+
+            else:
+                enriched_slots = {
+                    **slots,
+                    "voyage_ids": voyage_ids,
+                    "limit": min(25, int(slots.get("limit") or 25)),
+                }
+                result = self.ops_agent.run_dynamic(
+                    question=state["user_input"],
+                    intent_key=(
+                        state.get("intent_key")
+                        or step_inputs.get("intent_key")
+                        or "composite.query"
+                    ),
+                    slots=enriched_slots,
+                )
+                safe = _json_safe(result)
+                rows = (safe.get("rows") or [])[:25]
+                safe["rows"] = rows
+
+                artifacts["ops_rows"] = rows
+                state["ops"] = safe
+                state["data"]["ops"] = safe
+
+                self._trace(state, {
+                    "phase": "composite_step_result",
+                    "step_index": idx + 1,
+                    "agent": "ops",
+                    "operation": op,
+                    "ok": True,
+                    "rows": len(rows),
+                    "voyage_ids": len(voyage_ids),
+                    "extracted_voyage_ids": voyage_ids,
+                    "sql": safe.get("sql"),
+                    "summary": (
+                        f"ops voyage_ids_from_step: {len(rows)} rows for {len(voyage_ids)} voyage_ids"
+                    ),
+                })
+
         elif agent == "ops" and op == "dynamic_sql":
+            # ── Aggregate rows without voyage_ids guard ──────────────────────
+            _finance_rows = (state.get("finance") or {}).get("rows") or []
+            _voyage_ids_available = bool(
+                artifacts.get("voyage_ids") or
+                (state.get("finance") or {}).get("voyage_ids")
+            )
+
+            if (not _voyage_ids_available) and _finance_rows:
+                self._trace(state, {
+                    "phase": "composite_step_result",
+                    "step_index": idx + 1,
+                    "agent": "ops",
+                    "operation": op,
+                    "ok": True,
+                    "skipped": True,
+                    "rows": len(_finance_rows),
+                    "reason": (
+                        "Finance returned aggregate rows (GROUP BY query). "
+                        "No voyage_ids to pass — ops step not needed, finance result is self-contained."
+                    ),
+                    "summary": "Ops step skipped — finance aggregate query is self-contained.",
+                })
+                state["data"]["ops"] = {
+                    "mode": "skipped",
+                    "rows": _finance_rows,
+                    "skipped_reason": "aggregate_no_voyage_ids",
+                }
+                artifacts["slots"] = slots
+                state["artifacts"] = artifacts
+                state["slots"] = slots
+                state["step_index"] = idx + 1
+                return state
 
             # Resolve step inputs (e.g. voyage_ids: "$finance.voyage_ids") so we never pass literal placeholders to the agent
             step_inputs = step.get("inputs") or {}
@@ -3711,7 +4281,10 @@ class GraphRouter:
             voyage_ids = artifacts.get("voyage_ids") or []
             if not isinstance(voyage_ids, list):
                 voyage_ids = []
-            slots["voyage_ids"] = voyage_ids[:20]
+            if voyage_ids:
+                slots["voyage_ids"] = voyage_ids[:20]
+            else:
+                slots.pop("voyage_ids", None)
 
             intent_key_ops = state.get("intent_key") or (state.get("plan") or {}).get("intent_key") or "composite.query"
             if intent_key_ops in ("analysis.cargo_profitability", "analysis.cargoprofitability") and (artifacts.get("cargo_grades") or []):
@@ -3790,6 +4363,53 @@ class GraphRouter:
         # =========================================================
         # MONGO STEP
         # =========================================================
+        elif agent == "mongo" and op == "cargo_grade_lookup":
+            step_inputs = step.get("inputs") or {}
+            grades = step_inputs.get("cargo_grades") or slots.get("cargo_grades") or []
+            grades = [str(g).strip().lower() for g in grades if g]
+
+            docs = []
+            voyage_ids = []
+
+            if grades:
+                mongo_resp = self.mongo_agent.run_llm_find(
+                    question=state["user_input"],
+                    slots={"cargo_grades": grades},
+                )
+                safe = _json_safe(mongo_resp)
+                rows = safe.get("rows") if isinstance(safe, dict) else []
+                rows = rows if isinstance(rows, list) else []
+                docs = rows[:25]
+                voyage_ids = [
+                    str(r.get("voyageId"))
+                    for r in docs
+                    if isinstance(r, dict) and r.get("voyageId")
+                ]
+
+            voyage_ids = list(dict.fromkeys(voyage_ids))   # deduplicate, preserve order
+
+            # ── write to artifacts (NOT step_results) ──────────────────────
+            artifacts["voyage_ids"] = voyage_ids
+            artifacts["mongo_grade_docs"] = docs
+            slots["voyage_ids"] = voyage_ids
+
+            state["mongo"] = {"mode": "mongo_llm", "ok": True, "rows": docs}
+            state["data"]["mongo"] = state["mongo"]
+
+            self._trace(state, {
+                "phase": "composite_step_result",
+                "step_index": idx + 1,
+                "agent": "mongo",
+                "operation": op,
+                "ok": True,
+                "rows": len(docs),
+                "voyage_ids": len(voyage_ids),
+                "extracted_voyage_ids": voyage_ids,
+                "summary": (
+                    f"cargo_grade_lookup: grades={grades} -> {len(voyage_ids)} voyage_ids"
+                ),
+            })
+
         elif agent == "mongo" and op == "resolve_anchor":
             q = (step.get("inputs") or {}).get("goal") or state.get("user_input") or ""
             try:
@@ -4116,11 +4736,75 @@ class GraphRouter:
             commissions_by = artifacts.get("commissions_by_voyage_id") or {}
             intent_key_merge = state.get("intent_key") or ""
 
+            def _num(v):
+                if v is None or v == "":
+                    return None
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return v
+
+            def _grade_key(v):
+                if v is None:
+                    return ""
+                if isinstance(v, dict):
+                    v = v.get("grade_name") or v.get("gradeName") or v.get("name") or v.get("grade")
+                s = str(v).strip()
+                if s.startswith("{") and s.endswith("}"):
+                    try:
+                        obj = ast.literal_eval(s)
+                        if isinstance(obj, dict):
+                            g = obj.get("grade_name") or obj.get("gradeName") or obj.get("name") or obj.get("grade")
+                            s = str(g).strip() if g not in (None, "", [], {}) else ""
+                    except Exception:
+                        m = re.search(r"""['"](?:grade_name|gradeName|name|grade)['"]\s*:\s*['"]([^'"]+)['"]""", s)
+                        if m:
+                            s = m.group(1).strip()
+                s = s.lower()
+                if s in ("", "none", "null", "n/a", "na"):
+                    return ""
+                return s
+
+            def _dedup_merged_rows(rows):
+                out = []
+                seen_rows = set()
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    vid = r.get("voyage_id")
+                    if vid not in (None, "", [], {}):
+                        key = ("voyage_id", str(vid))
+                    else:
+                        cgs = r.get("cargo_grades") if isinstance(r.get("cargo_grades"), list) else []
+                        cgs_norm = tuple(sorted({_grade_key(x) for x in cgs if _grade_key(x)}))
+                        if cgs_norm:
+                            key = ("cargo_grades", cgs_norm)
+                        elif r.get("vessel_imo") not in (None, "", [], {}):
+                            key = ("vessel_imo", str(r.get("vessel_imo")), str(r.get("voyage_number") or ""))
+                        else:
+                            key = (
+                                "fallback",
+                                str(r.get("voyage_number") or ""),
+                                str(r.get("pnl") or ""),
+                                str(r.get("revenue") or ""),
+                                str(r.get("total_expense") or ""),
+                            )
+                    if key in seen_rows:
+                        continue
+                    seen_rows.add(key)
+                    out.append(r)
+                return out
+
             # Index ops rows by voyage_id
+            def _vid_key(v):
+                if v in (None, ""):
+                    return ""
+                return str(v).strip().upper()
+
             ops_by_vid = {}
             for r in ops_rows:
                 if isinstance(r, dict) and r.get("voyage_id"):
-                    ops_by_vid.setdefault(r["voyage_id"], []).append(r)
+                    ops_by_vid.setdefault(_vid_key(r.get("voyage_id")), []).append(r)
 
             # ranking.vessels: finance returns vessel-level rows (vessel_imo, voyage_count, avg_pnl) without voyage_id
             if intent_key_merge == "ranking.vessels" and finance_rows:
@@ -4182,6 +4866,7 @@ class GraphRouter:
                             "key_ports": [],
                             "remarks": None,
                         })
+                    merged_rows = _dedup_merged_rows(merged_rows)
                     artifacts["merged_rows"] = merged_rows
                     try:
                         cov = artifacts.get("coverage") if isinstance(artifacts.get("coverage"), dict) else {}
@@ -4201,6 +4886,178 @@ class GraphRouter:
                     state["step_index"] = idx + 1
                     return state
 
+            # Grade-level merge fallback for aggregate intents with no voyage_id (e.g. cargo profitability).
+            # This keeps enrichment deterministic when finance rows are grouped by dimensions instead of voyage.
+            has_voyage_id = any(isinstance(fr, dict) and fr.get("voyage_id") for fr in finance_rows)
+            if (not has_voyage_id) and finance_rows:
+                # Avoid finance/ops column collision on voyage_count for grade-level merges.
+                for fr in finance_rows:
+                    if isinstance(fr, dict) and "voyage_count" in fr and "finance_voyage_count" not in fr:
+                        fr["finance_voyage_count"] = fr.pop("voyage_count")
+                for orow in ops_rows:
+                    if isinstance(orow, dict) and "voyage_count" in orow and "ops_voyage_count" not in orow:
+                        orow["ops_voyage_count"] = orow.pop("voyage_count")
+
+                ops_by_grade = {}
+                for orow in ops_rows:
+                    if not isinstance(orow, dict):
+                        continue
+                    gk = _grade_key(orow.get("cargo_grade") or orow.get("grade"))
+                    if not gk:
+                        continue
+                    cur = ops_by_grade.get(gk) or {}
+                    if not cur.get("common_ports") and isinstance(orow.get("common_ports"), list):
+                        cur["common_ports"] = orow.get("common_ports")
+                    if not cur.get("remarks") and isinstance(orow.get("congestion_delay_remarks"), list):
+                        cur["remarks"] = orow.get("congestion_delay_remarks")
+                    if cur.get("ops_voyage_count") in (None, "") and orow.get("ops_voyage_count") not in (None, ""):
+                        cur["ops_voyage_count"] = orow.get("ops_voyage_count")
+                    ops_by_grade[gk] = cur
+
+                finance_by_grade: Dict[str, Dict[str, Any]] = {}
+                for fr in finance_rows:
+                    if not isinstance(fr, dict):
+                        continue
+                    grade_raw = fr.get("cargo_grade") or fr.get("grade")
+                    gk = _grade_key(grade_raw)
+                    if not gk:
+                        continue
+                    b = finance_by_grade.get(gk)
+                    if not b:
+                        display_grade = (
+                            (grade_raw.get("grade_name") or grade_raw.get("gradeName") or grade_raw.get("name") or grade_raw.get("grade"))
+                            if isinstance(grade_raw, dict)
+                            else grade_raw
+                        )
+                        if isinstance(display_grade, str):
+                            ds = display_grade.strip()
+                            if ds.startswith("{") and ds.endswith("}"):
+                                try:
+                                    obj = ast.literal_eval(ds)
+                                    if isinstance(obj, dict):
+                                        g = obj.get("grade_name") or obj.get("gradeName") or obj.get("name") or obj.get("grade")
+                                        display_grade = str(g).strip() if g not in (None, "", [], {}) else ""
+                                except Exception:
+                                    m = re.search(r"""['"](?:grade_name|gradeName|name|grade)['"]\s*:\s*['"]([^'"]+)['"]""", ds)
+                                    if m:
+                                        display_grade = m.group(1).strip()
+                        b = {
+                            "display_grade": str(display_grade).strip() if display_grade not in (None, "", [], {}) else gk,
+                            "weight": 0.0,
+                            "pnl_wsum": 0.0,
+                            "revenue_wsum": 0.0,
+                            "tce_wsum": 0.0,
+                            "expense_wsum": 0.0,
+                            "commission_wsum": 0.0,
+                            "has_pnl": False,
+                            "has_revenue": False,
+                            "has_tce": False,
+                            "has_expense": False,
+                            "has_commission": False,
+                            "voyage_count": 0.0,
+                            "has_voyage_count": False,
+                        }
+                        finance_by_grade[gk] = b
+
+                    vc = _num(fr.get("finance_voyage_count"))
+                    w = vc if (isinstance(vc, (int, float)) and vc and vc > 0) else 1.0
+                    b["weight"] += w
+                    if isinstance(vc, (int, float)) and vc >= 0:
+                        b["voyage_count"] += float(vc)
+                        b["has_voyage_count"] = True
+
+                    pnl_v = _num(fr.get("avg_pnl") if fr.get("avg_pnl") is not None else fr.get("pnl"))
+                    if isinstance(pnl_v, (int, float)):
+                        b["pnl_wsum"] += float(pnl_v) * w
+                        b["has_pnl"] = True
+
+                    rev_v = _num(fr.get("avg_revenue") if fr.get("avg_revenue") is not None else fr.get("revenue"))
+                    if isinstance(rev_v, (int, float)):
+                        b["revenue_wsum"] += float(rev_v) * w
+                        b["has_revenue"] = True
+
+                    tce_v = _num(fr.get("avg_tce") if fr.get("avg_tce") is not None else fr.get("tce"))
+                    if isinstance(tce_v, (int, float)):
+                        b["tce_wsum"] += float(tce_v) * w
+                        b["has_tce"] = True
+
+                    exp_v = _num(fr.get("total_expense"))
+                    if isinstance(exp_v, (int, float)):
+                        b["expense_wsum"] += float(exp_v) * w
+                        b["has_expense"] = True
+
+                    com_v = _num(fr.get("total_commission"))
+                    if isinstance(com_v, (int, float)):
+                        b["commission_wsum"] += float(com_v) * w
+                        b["has_commission"] = True
+
+                for gk, b in finance_by_grade.items():
+                    w = float(b.get("weight") or 0.0)
+                    if w <= 0:
+                        continue
+                    octx = ops_by_grade.get(gk) or {}
+                    ports = []
+                    cp = octx.get("common_ports")
+                    if isinstance(cp, list):
+                        for p in cp:
+                            if p is None:
+                                continue
+                            pn = None
+                            at = None
+                            if isinstance(p, dict):
+                                pn = p.get("portName") or p.get("port_name") or p.get("name")
+                                at = p.get("activityType") or p.get("activity_type")
+                            else:
+                                ps = str(p).strip()
+                                if ps.startswith("{") and ps.endswith("}"):
+                                    try:
+                                        obj = ast.literal_eval(ps)
+                                        if isinstance(obj, dict):
+                                            pn = obj.get("port_name") or obj.get("portName") or obj.get("name")
+                                            at = obj.get("activity_type") or obj.get("activityType")
+                                    except Exception:
+                                        m_name = re.search(r"""['"](?:port_name|portName|name)['"]\s*:\s*['"]([^'"]+)['"]""", ps)
+                                        m_act = re.search(r"""['"](?:activity_type|activityType)['"]\s*:\s*['"]([^'"]+)['"]""", ps)
+                                        if m_name:
+                                            pn = m_name.group(1).strip()
+                                        if m_act:
+                                            at = m_act.group(1).strip()
+                                else:
+                                    pn = ps
+                            if pn:
+                                ports.append({"portName": str(pn).strip(), "activityType": at})
+                    if not ports:
+                        mcp = fr.get("most_common_ports")
+                        if isinstance(mcp, str) and mcp.strip():
+                            for token in [x.strip() for x in mcp.split(",") if str(x).strip()]:
+                                ports.append({"portName": token, "activityType": None})
+                        elif isinstance(mcp, list):
+                            for p in mcp:
+                                if isinstance(p, dict):
+                                    pn = p.get("portName") or p.get("port_name") or p.get("name")
+                                    at = p.get("activityType") or p.get("activity_type")
+                                    if pn:
+                                        ports.append({"portName": str(pn).strip(), "activityType": at})
+                                elif p is not None and str(p).strip():
+                                    ports.append({"portName": str(p).strip(), "activityType": None})
+                    merged_rows.append({
+                        "voyage_id": None,
+                        "voyage_number": None,
+                        "pnl": (b["pnl_wsum"] / w) if b.get("has_pnl") else None,
+                        "revenue": (b["revenue_wsum"] / w) if b.get("has_revenue") else None,
+                        "total_expense": (b["expense_wsum"] / w) if b.get("has_expense") else None,
+                        "tce": (b["tce_wsum"] / w) if b.get("has_tce") else None,
+                        "total_commission": (b["commission_wsum"] / w) if b.get("has_commission") else None,
+                        "finance": {"cargo_grade": b.get("display_grade")},
+                        "ops": [],
+                        "cargo_grades": [b.get("display_grade") or gk],
+                        "key_ports": ports[:20],
+                        "remarks": octx.get("remarks") or None,
+                        "finance_voyage_count": (int(b["voyage_count"]) if b.get("has_voyage_count") else None),
+                        "ops_voyage_count": octx.get("ops_voyage_count"),
+                        "voyage_count": (int(b["voyage_count"]) if b.get("has_voyage_count") else None),
+                    })
+
             # Deduplicated merge (by voyage_id)
             seen = set()
 
@@ -4209,23 +5066,16 @@ class GraphRouter:
                     continue
 
                 vid = fr.get("voyage_id")
+                vid_k = _vid_key(vid)
 
-                if not vid or vid in seen:
+                if not vid_k or vid_k in seen:
                     continue
 
-                seen.add(vid)
+                seen.add(vid_k)
 
                 # Flatten core finance KPIs at the top-level of merged_rows for deterministic summarization.
                 # This avoids the LLM missing KPIs when `finance.rows` is compacted away.
                 # Normalize numeric keys (support alternate casing from DB) and coerce to float for JSON.
-                def _num(v):
-                    if v is None or v == "":
-                        return None
-                    try:
-                        return float(v)
-                    except (TypeError, ValueError):
-                        return v
-
                 pnl = _num(fr.get("pnl") or fr.get("PnL"))
                 revenue = _num(fr.get("revenue") or fr.get("Revenue"))
                 total_expense = _num(fr.get("total_expense") or fr.get("Total_expense") or fr.get("total expense"))
@@ -4236,7 +5086,7 @@ class GraphRouter:
                     pnl = _num(fr.get("pnl_actual") or pnl)
                     tce = _num(fr.get("tce_actual") or tce)
 
-                ops_for_vid = ops_by_vid.get(vid, [])
+                ops_for_vid = ops_by_vid.get(vid_k, [])
 
                 # Fallback extraction (ops → merged fields) when Mongo enrichment isn't present.
                 # This is critical for composite intents that skip Mongo (e.g. analysis.cargo_profitability)
@@ -4255,8 +5105,15 @@ class GraphRouter:
                             for x in g:
                                 if x is None:
                                     continue
-                                s = str(x).strip()
-                                if s:
+                                if isinstance(x, dict):
+                                    # Common shapes: {"gradeName": "..."} / {"grade_name": "..."} / {"name": "..."}
+                                    gv = x.get("gradeName") or x.get("grade_name") or x.get("name")
+                                    if gv is None:
+                                        continue
+                                    s = str(gv).strip()
+                                else:
+                                    s = str(x).strip()
+                                if s and s.lower() not in ("none", "null", "n/a", "na"):
                                     gs.append(s)
                     # de-dupe preserve order
                     seen_g = set()
@@ -4289,6 +5146,29 @@ class GraphRouter:
                         seen_p.add(key)
                         key_ports.append(p)
 
+                # Aggregate queries may already return a finance-computed common port list.
+                # Preserve it when ops-derived key_ports are absent.
+                if not key_ports:
+                    mcp = fr.get("most_common_ports")
+                    if isinstance(mcp, str) and mcp.strip():
+                        parsed_ports = []
+                        for token in [x.strip() for x in mcp.split(",") if str(x).strip()]:
+                            parsed_ports.append({"portName": token, "activityType": None})
+                        if parsed_ports:
+                            key_ports = parsed_ports[:20]
+                    elif isinstance(mcp, list):
+                        parsed_ports = []
+                        for x in mcp:
+                            if isinstance(x, dict):
+                                pn = x.get("portName") or x.get("port_name") or x.get("name")
+                                at = x.get("activityType") or x.get("activity_type")
+                                if pn:
+                                    parsed_ports.append({"portName": str(pn).strip(), "activityType": at})
+                            elif x is not None and str(x).strip():
+                                parsed_ports.append({"portName": str(x).strip(), "activityType": None})
+                        if parsed_ports:
+                            key_ports = parsed_ports[:20]
+
                 if remark_val in (None, "", [], {}) and isinstance(ops_for_vid, list):
                     rs: list[str] = []
                     for orow in ops_for_vid:
@@ -4311,6 +5191,18 @@ class GraphRouter:
                 row = {
                     "voyage_id": vid,
                     "voyage_number": voyage_number_by.get(str(vid)) or fr.get("voyage_number"),
+                    "vessel_name": (
+                        fr.get("vessel_name")
+                        or (
+                            (ops_for_vid[0].get("vessel_name") if isinstance(ops_for_vid, list) and ops_for_vid and isinstance(ops_for_vid[0], dict) else None)
+                        )
+                    ),
+                    "vessel_imo": (
+                        fr.get("vessel_imo")
+                        or (
+                            (ops_for_vid[0].get("vessel_imo") if isinstance(ops_for_vid, list) and ops_for_vid and isinstance(ops_for_vid[0], dict) else None)
+                        )
+                    ),
                     "pnl": pnl,
                     "revenue": revenue,
                     "total_expense": total_expense,
@@ -4341,11 +5233,19 @@ class GraphRouter:
                             delay_val = delay_val or first_ops.get("delay_reason")
                     row["offhire_days"] = _num(offhire_val)
                     row["delay_reason"] = delay_val
-                # Port calls: expose count when key_ports is a list so "most port calls" table can show it
-                if isinstance(key_ports, list):
-                    row["port_calls"] = len(key_ports)
+                # Port calls: preserve finance-provided count when available,
+                # otherwise fall back to derived key_ports length.
+                pc = fr.get("port_count")
+                if pc in (None, "") and isinstance(key_ports, list):
+                    pc = len(key_ports)
+                if pc not in (None, ""):
+                    try:
+                        row["port_calls"] = int(pc)
+                    except Exception:
+                        row["port_calls"] = _num(pc)
                 merged_rows.append(row)
 
+            merged_rows = _dedup_merged_rows(merged_rows)
             artifacts["merged_rows"] = merged_rows
 
             # Data coverage hints to prevent false "Not available" claims in summarization.
@@ -4474,6 +5374,13 @@ class GraphRouter:
                 for r in finance_rows:
                     if isinstance(r, dict) and r.get("voyage_id"):
                         fin_by_vid[str(r["voyage_id"])] = r
+                def _norm_num(v):
+                    if v in (None, "", "Not available", "not available", "N/A", "n/a", "NA", "na"):
+                        return None
+                    try:
+                        return float(v)
+                    except Exception:
+                        return v
                 for mr in artifacts["merged_rows"]:
                     if not isinstance(mr, dict):
                         continue
@@ -4481,12 +5388,18 @@ class GraphRouter:
                     fin = mr.get("finance") if isinstance(mr.get("finance"), dict) else {}
                     if not fin and vid is not None:
                         fin = fin_by_vid.get(str(vid)) or {}
-                    if mr.get("pnl") is None and fin:
-                        mr["pnl"] = fin.get("pnl") or fin.get("PnL")
-                    if mr.get("revenue") is None and fin:
-                        mr["revenue"] = fin.get("revenue") or fin.get("Revenue")
-                    if mr.get("total_expense") is None and fin:
-                        mr["total_expense"] = fin.get("total_expense") or fin.get("Total_expense") or fin.get("total expense")
+                    if (_norm_num(mr.get("pnl")) is None) and fin:
+                        mr["pnl"] = _norm_num(fin.get("pnl") or fin.get("PnL"))
+                    else:
+                        mr["pnl"] = _norm_num(mr.get("pnl"))
+                    if (_norm_num(mr.get("revenue")) is None) and fin:
+                        mr["revenue"] = _norm_num(fin.get("revenue") or fin.get("Revenue"))
+                    else:
+                        mr["revenue"] = _norm_num(mr.get("revenue"))
+                    if (_norm_num(mr.get("total_expense")) is None) and fin:
+                        mr["total_expense"] = _norm_num(fin.get("total_expense") or fin.get("Total_expense") or fin.get("total expense"))
+                    else:
+                        mr["total_expense"] = _norm_num(mr.get("total_expense"))
         merged = compact_payload(merged_full)
         
         # Ensure merged has all required keys

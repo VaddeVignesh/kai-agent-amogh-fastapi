@@ -93,6 +93,21 @@ class OpsAgent:
         if cargo_grades is not None and not isinstance(cargo_grades, list):
             cargo_grades = [cargo_grades] if cargo_grades else []
 
+        def _clean_grade_name(raw) -> str | None:
+            if raw is None:
+                return None
+            if isinstance(raw, dict):
+                name = raw.get("grade_name") or raw.get("name") or ""
+            else:
+                name = str(raw)
+            name = name.strip()
+            if not name or name.lower() in ("null", "none", "", "unknown"):
+                return None
+            # Drop raw JSON object strings
+            if name.startswith("{") and "grade_name" in name:
+                return None
+            return name
+
         # ----------------------------------------------------------
         # PATH 0: ranking.vessels — most common cargo grades per vessel (no voyage_ids)
         # ----------------------------------------------------------
@@ -181,12 +196,15 @@ class OpsAgent:
 
             cargo_grades_norm = []
             for g in cargo_grades:
-                if g is None:
+                cleaned = _clean_grade_name(g)
+                if cleaned is None:
                     continue
-                s = str(g).strip()
-                if s:
+                s = str(cleaned).strip().lower()
+                if s and s not in ("none", "null", "n/a", "na"):
                     cargo_grades_norm.append(s)
             cargo_grades_norm = list(dict.fromkeys(cargo_grades_norm))[:50]
+            if not cargo_grades_norm:
+                cargo_grades_norm = []
 
             canonical_sql = """
                 WITH grade_rows AS (
@@ -194,12 +212,15 @@ class OpsAgent:
                     o.voyage_id,
                     o.voyage_number,
                     o.is_delayed,
-                    jsonb_array_elements_text(o.grades_json) AS cargo_grade,
+                    lower(trim(grade.value)) AS cargo_grade,
                     o.ports_json,
                     o.remarks_json
-                  FROM ops_voyage_summary o
+                  FROM ops_voyage_summary o,
+                  jsonb_array_elements_text(o.grades_json) AS grade(value)
                   WHERE o.grades_json IS NOT NULL
                     AND o.grades_json::text != '[]'
+                    AND grade.value IS NOT NULL
+                    AND trim(grade.value) != ''
                 ),
                 filtered AS (
                   SELECT *
@@ -251,10 +272,10 @@ class OpsAgent:
                   ) r
                   WHERE remark IS NOT NULL AND remark != ''
                     AND (
-                      lower(remark) LIKE '%congest%'
-                      OR lower(remark) LIKE '%delay%'
-                      OR lower(remark) LIKE '%waiting%'
-                      OR lower(remark) LIKE '%queue%'
+                      lower(remark) LIKE '%%congest%%'
+                      OR lower(remark) LIKE '%%delay%%'
+                      OR lower(remark) LIKE '%%waiting%%'
+                      OR lower(remark) LIKE '%%queue%%'
                     )
                   GROUP BY cargo_grade, remark
                 ),
@@ -409,21 +430,6 @@ class OpsAgent:
 
         sql = gen.sql.strip()
         params = gen.params or {}
-
-        # HARD BLOCK: prevent finance columns leaking into ops
-        forbidden_columns = ["pnl", "revenue", "total_expense", "total_commission", "tce"]
-
-        sql_lower = sql.lower()
-        for col in forbidden_columns:
-            if col in sql_lower:
-                return OpsAgentResult(
-                    intent_key=intent_key,
-                    query_key="blocked.invalid_column",
-                    params={},
-                    rows=[],
-                    mode="dynamic_sql",
-                    sql="ERROR: Ops cannot access finance columns",
-                )
 
         guard = validate_and_prepare_sql(
             sql=sql,
