@@ -184,6 +184,10 @@ QUERY CONSTRUCTION RULES
 6. GROUP BY every non-aggregated SELECT column.
 
 7. ORDER BY the most relevant metric descending unless otherwise implied.
+   When ordering by a numeric metric or aggregate, always add `NULLS LAST`
+   so empty KPI rows do not outrank populated rows.
+   When ordering by a numeric metric or aggregate, always add `NULLS LAST`
+   so empty KPI rows do not outrank populated rows.
 
 8. Always end with LIMIT %(limit)s.
 

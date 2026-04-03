@@ -4,6 +4,7 @@ import os
 import json
 import time
 import uuid
+from decimal import Decimal
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 import redis
@@ -18,6 +19,19 @@ VOLATILE_SLOTS = {
 }
 
 SESSION_MAX_AGE_SECONDS = 1800  # 30 minutes
+
+
+def _json_safe(value: Any) -> Any:
+   if isinstance(value, Decimal):
+       try:
+           return float(value)
+       except Exception:
+           return str(value)
+   if isinstance(value, dict):
+       return {str(k): _json_safe(v) for k, v in value.items()}
+   if isinstance(value, (list, tuple)):
+       return [_json_safe(v) for v in value]
+   return value
 
 # -----------------------------
 # Config
@@ -159,7 +173,7 @@ class RedisStore:
        session["updated_at"] = int(time.time())
        session["last_updated_ts"] = time.time()
 
-       payload = json.dumps(session)
+       payload = json.dumps(_json_safe(session))
        ok = self._safe_setex(self._session_key(session_id), self.cfg.session_ttl_sec, payload)
        if not ok:
            # In-memory fallback if Redis is down / disabled.

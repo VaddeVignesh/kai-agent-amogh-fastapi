@@ -456,6 +456,26 @@ class FinanceAgent:
             }
 
         # ------------------------------------------------------
+        # VOYAGE COMPARISON (multiple voyage numbers)
+        # ------------------------------------------------------
+
+        if intent_key == "comparison.voyages":
+            voyage_numbers = s.get("voyage_numbers") or s.get("voyages") or []
+            if not isinstance(voyage_numbers, list):
+                voyage_numbers = [voyage_numbers]
+            try:
+                voyage_numbers = [int(v) for v in voyage_numbers if v not in (None, "", [], {})]
+            except Exception:
+                voyage_numbers = []
+            if len(voyage_numbers) < 2:
+                raise ValueError("comparison.voyages requires at least two voyage_numbers")
+            return "finance.compare_voyages", {
+                "voyage_numbers": voyage_numbers,
+                "limit": max(limit, len(voyage_numbers)),
+                "scenario": scenario,
+            }
+
+        # ------------------------------------------------------
         # RANKING (SAFE METRIC)
         # ------------------------------------------------------
 

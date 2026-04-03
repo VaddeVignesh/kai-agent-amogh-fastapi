@@ -111,10 +111,72 @@ class LLMClient:
 
     def _deterministic_intent(self, text: str) -> Optional[str]:
         t = text.lower()
+        has_specific_voyage_anchor = bool(
+            re.search(r"\bvoyage(?:s)?\s+\d{3,5}\b", t)
+            or (re.search(r"\bfor\s+voyages?\b", t) and re.search(r"\b\d{3,5}\b", t))
+        )
+        looks_specific_vessel_performance = bool(
+            re.search(r"\bstena\s+[a-z0-9][a-z0-9\-]*\b", t) and any(k in t for k in ("overall", "performing", "voyage history", "trend"))
+        )
+        voyage_resolved_vessel_metadata_terms = (
+            "operating status", "operational status", "is operating", "is operational",
+            "hire rate", "hirerate", "scrubber", "passage type", "passage types",
+            "account code", "market type",
+        )
+
+        if has_specific_voyage_anchor and any(k in t for k in voyage_resolved_vessel_metadata_terms):
+            return "vessel.metadata"
+
+        if any(k in t for k in ("average voyage duration", "average voyage days", "voyage duration in days")) and any(
+            k in t for k in ("per vessel", "each vessel", "by vessel")
+        ):
+            return "aggregation.average"
 
         # FIRST: Delayed voyages with negative PnL / loss / root cause → finance.loss_due_to_delay (avoid mis-classification as port_query)
         if "delayed" in t and ("negative" in t and "pnl" in t or "negative pn" in t or "loss" in t or "root cause" in t):
             return "finance.loss_due_to_delay"
+
+        # 1) Cargo-grade profitability (fleet aggregate) — must run before generic ranking
+        # so grade-level aggregate asks don't get misrouted to ranking.pnl.
+        cargo_grade_terms = ("cargo grade", "cargo grades", "grade", "grades", "cargo")
+        aggregate_terms = ("highest", "top", "most", "average", "avg", "overall", "profit", "profitable", "pnl", "revenue")
+        cargo_frequency_terms = ("frequent", "frequency", "most common", "most commonly", "appears most", "appears the most", "most carried")
+        cargo_subject_is_primary = not any(
+            k in t for k in ("voyages", "for voyage", "voyage-by-voyage", "vessel", "vessels", "module type", "module types")
+        )
+        if cargo_subject_is_primary and any(k in t for k in cargo_grade_terms) and ("when-fixed" in t or "when fixed" in t or ("actual" in t and "variance" in t)):
+            return "analysis.cargo_profitability"
+        if cargo_subject_is_primary and any(k in t for k in cargo_grade_terms) and any(
+            k in t for k in ("average pnl", "avg pnl", "highest average pnl", "average revenue", "avg revenue")
+        ):
+            return "analysis.cargo_profitability"
+        if (
+            cargo_subject_is_primary
+            and any(k in t for k in cargo_grade_terms)
+            and any(k in t for k in cargo_frequency_terms)
+            and not any(k in t for k in ("profitable", "profit", "pnl", "revenue", "overall"))
+        ):
+            return "ranking.cargo"
+        if any(k in t for k in cargo_grade_terms) and any(k in t for k in ("negative pnl", "negative pn", "loss-making", "loss making", "loss-making voyages", "negative profit")):
+            return "ranking.cargo"
+        if cargo_subject_is_primary and any(k in t for k in cargo_grade_terms) and any(k in t for k in aggregate_terms):
+            return "analysis.cargo_profitability"
+
+        # Scenario comparison should win over plain voyage-vs-voyage comparison.
+        if "when-fixed" in t or "when fixed" in t or ("actual" in t and "variance" in t):
+            return "analysis.scenario_comparison"
+
+        # Explicit voyage-to-voyage comparison with 2+ voyage numbers.
+        if any(k in t for k in ("compare", "vs", "versus", "difference", "which is better")):
+            nums = re.findall(r"\b\d{3,5}\b", t)
+            if len(nums) >= 2:
+                return "comparison.voyages"
+
+        # Voyage-anchored port listing should stay voyage-scoped.
+        if re.search(r"\bvoyage\s+\d{3,5}\b", t) and any(
+            k in t for k in ("which ports", "ports were visited", "ports visited", "visited ports", "port list")
+        ):
+            return "voyage.metadata"
 
         # 0) "Tell me about voyage 1901" / "voyage 1901 summary" → voyage summary
         if "voyage" in t and any(k in t for k in ("tell me about", "details about", "information about", "summary", "summarize")):
@@ -146,12 +208,24 @@ class LLMClient:
         if ("high voyage count" in t or "many voyages" in t) and ("above-average" in t or "above average" in t) and ("profit" in t or "pnl" in t or "profitability" in t):
             return "ranking.vessels"
 
-        # 1) Cargo-grade profitability (fleet aggregate) — must run before generic ranking
-        # so grade-level aggregate asks don't get misrouted to ranking.pnl.
-        cargo_grade_terms = ("cargo grade", "cargo grades", "grade", "grades", "cargo")
-        aggregate_terms = ("highest", "top", "most", "average", "avg", "overall", "profit", "profitable", "pnl", "revenue")
-        if any(k in t for k in cargo_grade_terms) and any(k in t for k in aggregate_terms):
-            return "analysis.cargo_profitability"
+        # 1b) Vessel-level fleet aggregates should stay vessel-scoped, not voyage-scoped.
+        vessel_ranking_signals = (
+            "which vessel", "which vessels", "top vessel", "top vessels", "vessel has", "vessels have",
+            "per vessel", "each vessel", "across all voyages", "fleet"
+        )
+        vessel_metric_signals = (
+            "pnl", "profit", "profitability", "revenue", "tce", "expense", "cost",
+            "voyage count", "number of voyage", "speed", "hire rate", "contract", "offhire"
+        )
+        if ("vessel" in t or "vessels" in t) and any(k in t for k in vessel_ranking_signals) and any(
+            k in t for k in vessel_metric_signals
+        ):
+            return "ranking.vessels"
+
+        # 2) Voyage-ranking phrasing should stay voyage-scoped even when extra output
+        # fields like cargo grade / ports are requested.
+        if any(k in t for k in ("most profitable voyages", "top profitable voyages", "top performing voyages")):
+            return "ranking.voyages_by_pnl"
 
         # 2) Ranking by PnL
         if ("top" in t or "highest" in t or "rank" in t) and ("pnl" in t or "profit" in t):
@@ -161,9 +235,18 @@ class LLMClient:
         if ("top" in t or "highest" in t or "rank" in t) and "revenue" in t:
             return "ranking.revenue"
 
-        # 3) Scenario comparison (before any voyage-number escape)
-        if "when-fixed" in t or "when fixed" in t:
-            return "analysis.scenario_comparison"
+        # Emissions / climate metric rankings.
+        if any(k in t for k in ("co2", "emission", "emissions", "eeoi", "aer", "sox", "nox", "cii")) and any(
+            k in t for k in ("top", "highest", "worst", "lowest", "most", "least", "high")
+        ):
+            return "ranking.voyages"
+
+        # Natural language voyage-performance phrasing.
+        if any(k in t for k in ("top performing voyages", "most profitable voyages", "top performing voyage", "most profitable voyage", "least profitable voyage")):
+            if not looks_specific_vessel_performance:
+                return "ranking.voyages_by_pnl"
+        if any(k in t for k in ("best voyage", "worst voyage")) and not looks_specific_vessel_performance:
+            return "ranking.voyages_by_pnl"
 
         # 4) Port-call ranking (voyages with most port calls / ports visited / port stops)
         if (
@@ -173,7 +256,7 @@ class LLMClient:
             return "ranking.port_calls"
 
         # 5) Offhire + financial impact
-        if "offhire" in t:
+        if "offhire" in t and not has_specific_voyage_anchor:
             return "ops.delayed_voyages"
 
         # 6) Loss-making
@@ -185,7 +268,7 @@ class LLMClient:
             return "analysis.high_revenue_low_pnl"
 
         # 6c) Module type: average PnL, most common cargo grades/ports
-        if "module type" in t and ("average pnl" in t or "most common" in t or "cargo grades" in t or "ports" in t or "tc voyage" in t or "spot" in t):
+        if "module type" in t and ("average pnl" in t or "most common" in t or "cargo grades" in t or "cargo grade" in t or "ports" in t or "tc voyage" in t or "spot" in t):
             return "analysis.by_module_type"
 
         # 7) Top voyages (generic)
@@ -194,7 +277,7 @@ class LLMClient:
 
         # 8) Fleet-wide port ranking — catch ALL variants before LLM sees them
         _port_fleet_signals = (
-            "most visit", "most common", "most frequent",
+            "most visit", "most common", "most commonly", "most frequent",
             "commonly visit", "frequently visit",
             "busiest port", "popular port",
             "which port", "top port",
@@ -208,6 +291,44 @@ class LLMClient:
         # 9) Voyage count per vessel (how many voyages does each/per vessel)
         if "voyage" in t and any(k in t for k in ("each vessel", "per vessel", "how many voyage", "number of voyage", "vessel have", "vessels have")):
             return "aggregation.count"
+
+        # 10) Fleet-level vessel aggregate/screening queries.
+        fleet_vessel_terms = (
+            "which vessel", "which vessels", "top vessels", "vessels with", "show vessels",
+            "operating vessels", "active vessels", "scrubber vessels", "non-scrubber vessels",
+            "market type has", "fastest on ballast", "fastest on laden",
+            "longest contract", "highest hire rate", "expensive to operate",
+        )
+        vessel_metadata_agg_terms = (
+            "operating", "operational", "active vessels",
+            "scrubber", "non-scrubber", "non scrubber",
+            "hire rate", "hirerate",
+            "ballast", "laden", "default ballast speed", "default laden speed",
+            "contract", "duration", "current contract",
+            "pool", "short pool", "long pool",
+            "market type",
+        )
+        agg_terms = (
+            "highest", "lowest", "top", "most", "least", "best", "worst",
+            "count", "average", "avg", "total", "longest", "fastest",
+        )
+        explicit_single_vessel = bool(re.search(r"\b(?:vessel|ship)\s+[a-z0-9][a-z0-9\- ]{1,40}\b", t))
+        if (
+            ("vessel" in t or "vessels" in t)
+            and any(k in t for k in vessel_metadata_agg_terms)
+            and not explicit_single_vessel
+        ):
+            return "ranking.vessel_metadata"
+        if any(k in t for k in fleet_vessel_terms):
+            return "ranking.vessels"
+        if ("vessel" in t or "vessels" in t) and any(k in t for k in agg_terms) and not explicit_single_vessel:
+            return "ranking.vessels"
+
+        # 11) Delay/waiting-centric ranking.
+        if any(k in t for k in ("delay", "waiting cost", "waiting", "offhire")) and any(
+            k in t for k in ("highest", "biggest", "most", "worst", "top")
+        ):
+            return "ops.offhire_ranking"
 
         return None
 
@@ -265,7 +386,10 @@ class LLMClient:
         if vessel_match:
             cand = vessel_match.group(1).strip()
             cand = re.sub(r"(?:'s|'s)\s*$", "", cand).strip()
-            slots["vessel_name"] = cand
+            # Ignore pseudo-names from fleet prompts such as
+            # "Which vessel is fastest on ballast?"
+            if not re.match(r"^(?:is|are|was|were|has|have|had|does|do|did|can|could|should|would)\b", cand, re.IGNORECASE):
+                slots["vessel_name"] = cand
         else:
             phr_patterns = [
                 r"(?:how\s+has|how\s+is)\s+([A-Za-z0-9][A-Za-z0-9\- ]{2,60}?)\s+been\b",
@@ -307,9 +431,12 @@ class LLMClient:
         if port_visited:
             slots["port_name"] = port_visited.group(1).strip()
 
-        # If user asked about a specific port ("visited Singapore" etc.), use ops.port_query when we have port_name
+        # Keep direct port lookups port-scoped, but do not override voyage/vessel rankings
+        # just because a port filter is present in the question.
         if not deterministic and slots.get("port_name"):
-            if "visited" in text_norm.lower() or "called at" in text_norm.lower():
+            tl_port = text_norm.lower()
+            rankingish = any(k in tl_port for k in ("top", "rank", "ranking", "compare", "vs", "versus", "pnl", "revenue", "profit"))
+            if ("visited" in tl_port or "called at" in tl_port) and not rankingish and not ("voyage" in tl_port or "voyages" in tl_port):
                 deterministic = "ops.port_query"
 
         # Commission rankings
@@ -391,14 +518,32 @@ class LLMClient:
 
         # Metadata-first routing for vessel/voyage-anchored questions.
         # Allow metadata override when early deterministic pick is summary intent.
+        fleet_wide_markers = (
+            "which vessels",
+            "which vessel has the",
+            "top vessels",
+            "vessels with",
+            "market type has",
+            "across all",
+            "across fleet",
+            "fleet-wide",
+            "all vessels",
+            "most vessels",
+            "highest voyage count",
+            "lowest voyage count",
+        )
+        looks_fleet_wide = any(m in tl for m in fleet_wide_markers)
+
         if any(k in tl for k in metadata_keywords) and (
-            not deterministic or deterministic in ("voyage.summary", "vessel.summary")
+            not deterministic or deterministic in ("voyage.summary", "vessel.summary", "ranking.vessels")
         ):
             has_vessel_anchor = bool(slots.get("vessel_name") or slots.get("imo"))
             has_voyage_anchor = bool(slots.get("voyage_number") or slots.get("voyage_id"))
             vnums = slots.get("voyage_numbers")
             has_small_voyage_anchor = isinstance(vnums, list) and 1 <= len(vnums) <= 3
-            if has_vessel_anchor or has_small_voyage_anchor:
+            if looks_fleet_wide:
+                deterministic = "ranking.vessel_metadata"
+            elif has_vessel_anchor or has_small_voyage_anchor:
                 deterministic = "vessel.metadata" if has_vessel_anchor else "voyage.metadata"
             elif has_voyage_anchor:
                 deterministic = "voyage.metadata"
@@ -483,11 +628,18 @@ SUPPORTED INTENTS (read descriptions carefully before classifying):
 {intents_formatted}
 
 CLASSIFICATION RULES:
+- First identify the PRIMARY subject the rows should represent: voyages, vessels, cargo grades, ports, module types, or a single anchored entity.
+- Supporting columns do NOT change the primary subject. Example: if the user asks for voyages and also wants cargo grades/ports/remarks as extra columns, the intent is still a voyage intent.
 - If the user names a SPECIFIC vessel by name or IMO → use vessel.summary or vessel.metadata
 - If the user names a SPECIFIC voyage by number → use voyage.summary
 - If the user asks about the ENTIRE fleet with no specific entity → use ranking.*, aggregation.*, or analysis.* intents
 - Intents marked FLEET-WIDE must NEVER have vessel_name or voyage_number in slots — those fields should be absent
 - NEVER extract vessel_name from query phrases like "highest PnL", "most voyages", "best performing", "earned the most" — those are metrics, not vessel names
+- If the user asks for voyages ranked by PnL/revenue/commission/port calls and also requests vessel name, cargo grade, key ports, remarks, margin %, or expense ratio, keep it as a voyage ranking intent.
+- If the user asks for module type breakdowns, use `analysis.by_module_type` even if cargo grades or ports are requested as output columns.
+- If the user asks for vessels with voyage count / average PnL / most common cargo grade, use `ranking.vessels` because the grouped subject is vessels.
+- If the user asks for voyages that visited a named port and then says rank by PnL/revenue, keep the intent voyage-ranking and extract the port as a filter slot.
+- If the user asks about one specific vessel overall, its trend, voyage history, best/worst voyage, or whether it is performing well, use `vessel.summary`.
 - NEVER output voyage_ids
 - voyage_numbers must be int list
 - limit must be int (default 10 if user says "top N" without specifying N)
@@ -524,6 +676,8 @@ SLOT EXTRACTION:
         # Merge regex + llm slots (regex wins)
         llm_slots.update({k: v for k, v in slots.items()})
         clean_slots = self._sanitize_slots(llm_slots)
+        ql = text_norm.lower()
+        rankingish_terms = ("top", "rank", "ranking", "compare", "vs", "versus")
 
         # 4b) Post-LLM correction: ops.port_query with "negative PnL" (or similar) as port_name is wrong
         if intent == "ops.port_query" and clean_slots.get("port_name"):
@@ -531,6 +685,60 @@ SLOT EXTRACTION:
             if "pnl" in pn or "negative" in pn or pn in ("revenue", "expense", "tce"):
                 intent = "finance.loss_due_to_delay"
                 clean_slots = {k: v for k, v in clean_slots.items() if k != "port_name"}
+            elif any(k in ql for k in rankingish_terms) and ("voyage" in ql or "voyages" in ql):
+                if "commission" in ql:
+                    intent = "ranking.voyages_by_commission"
+                elif "revenue" in ql and "pnl" not in ql and "profit" not in ql:
+                    intent = "ranking.voyages_by_revenue"
+                else:
+                    intent = "ranking.voyages_by_pnl"
+
+        voyage_numbers_list = clean_slots.get("voyage_numbers") if isinstance(clean_slots.get("voyage_numbers"), list) else []
+        has_single_voyage_anchor = bool(clean_slots.get("voyage_number")) or len(voyage_numbers_list) == 1
+        asks_voyage_details = any(
+            k in ql
+            for k in (
+                "what does the data show",
+                "summary",
+                "incident",
+                "financial",
+                "pnl",
+                "revenue",
+                "expense",
+                "tce",
+                "offhire",
+                "ports",
+                "remarks",
+                "route",
+                "cargo grade",
+            )
+        )
+        if has_single_voyage_anchor and asks_voyage_details and not any(k in ql for k in rankingish_terms):
+            if any(k in ql for k in metadata_keywords):
+                intent = "voyage.metadata"
+            else:
+                intent = "voyage.summary"
+
+        if "module type" in ql and any(k in ql for k in ("average pnl", "average revenue", "voyage count", "most common cargo grade", "most common cargo grades")):
+            intent = "analysis.by_module_type"
+
+        if intent == "ranking.cargo" and any(
+            k in ql for k in (
+                "average pnl", "avg pnl", "average revenue", "avg revenue",
+                "most profitable", "profitable overall", "highest average pnl", "best performing cargo",
+            )
+        ):
+            intent = "analysis.cargo_profitability"
+
+        if intent == "ranking.pnl" and any(
+            k in ql for k in ("most profitable voyages", "top profitable voyages", "top 5 most profitable voyages", "top 10 most profitable voyages")
+        ):
+            intent = "ranking.voyages_by_pnl"
+
+        if clean_slots.get("vessel_name") and any(
+            k in ql for k in ("overall", "performing", "voyage history", "over time", "trend", "best voyage", "worst voyage")
+        ) and not any(k in ql for k in ("top vessels", "which vessels", "across all vessels", "fleet")):
+            intent = "vessel.summary"
 
         # 5️⃣ Recovery for common "false out_of_scope" cases.
         # If we have strong entity slots, do not allow out_of_scope to block a valid answer.
@@ -616,50 +824,59 @@ SLOT EXTRACTION:
             name = str(slots["vessel_name"]).strip()
             # Trim trailing query phrases accidentally captured as part of vessel name.
             name = re.sub(
-                r"\b(?:operating status|operational status|operational|operating|is operating|is operational|status|passage type|passage types|hire rate|hirerate|account code|market type|scrubber|tags|contract history)\b.*$",
+                r"\b(?:operating status|operational status|operational|operating|is operating|is operational|status|passage type|passage types|hire rate|hirerate|account code|market type|scrubber|tags|contract history|highest|lowest|top|most|least|best|worst|fastest|longest|average|avg|voyage count|on ballast|on laden)\b.*$",
                 "",
                 name,
                 flags=re.IGNORECASE,
             ).strip()
             name = re.sub(r"\s{2,}", " ", name).strip()
             if 2 <= len(name) <= 60:
-                # =========================================================
-                # CHANGE 2: Registry-driven semantic guard for vessel_name.
-                # Rejects names that are clearly metric/query phrases, not
-                # real vessel names. Driven by INTENT_REGISTRY allowed_slots —
-                # if the active intent doesn't expect vessel_name, this acts as
-                # a last-resort safety net. No hardcoded phrase lists.
-                # =========================================================
-                name_lower = name.lower()
-                # Pull all slot keys that ranking/aggregation/fleet-wide intents
-                # declare as their metrics — anything matching those patterns
-                # in a vessel_name value means it was mis-extracted.
-                from app.registries.intent_registry import INTENT_REGISTRY
-                fleet_intents_with_metric = [
-                    cfg for cfg in INTENT_REGISTRY.values()
-                    if cfg.get("route") == "composite"
-                    and "metric" in cfg.get("optional_slots", [])
-                ]
-                # Build a set of common metric-related terms from all optional_slot
-                # keys across fleet-wide intents (e.g. "metric", "group_by", "filter")
-                fleet_slot_keys = set()
-                for cfg in fleet_intents_with_metric:
-                    fleet_slot_keys.update(cfg.get("optional_slots", []))
-
-                # If the vessel_name value contains words that are metric slot
-                # keys or common aggregation phrasing, reject it.
-                # This is data-driven: as you add more optional_slot keys to
-                # fleet-wide intents in the registry, they're automatically covered.
-                aggregation_terms = fleet_slot_keys | {
-                    "most", "highest", "lowest", "best", "worst",
-                    "average", "total", "count", "number of",
-                    "frequent", "common", "active", "profitable",
-                    "earning", "earned", "performing", "ranked",
+                generic_placeholders = {
+                    "name", "names", "vessel", "ship", "vessel name", "ship name",
+                    "cargo", "cargo grade", "grade", "module", "module type",
                 }
-                if any(term in name_lower for term in aggregation_terms):
-                    pass  # drop — this is a metric phrase, not a vessel name
+                if name.lower() in generic_placeholders:
+                    pass
                 else:
-                    clean["vessel_name"] = name
+                    # =========================================================
+                    # CHANGE 2: Registry-driven semantic guard for vessel_name.
+                    # Rejects names that are clearly metric/query phrases, not
+                    # real vessel names. Driven by INTENT_REGISTRY allowed_slots —
+                    # if the active intent doesn't expect vessel_name, this acts as
+                    # a last-resort safety net. No hardcoded phrase lists.
+                    # =========================================================
+                    name_lower = name.lower()
+                    # Pull all slot keys that ranking/aggregation/fleet-wide intents
+                    # declare as their metrics — anything matching those patterns
+                    # in a vessel_name value means it was mis-extracted.
+                    from app.registries.intent_registry import INTENT_REGISTRY
+                    fleet_intents_with_metric = [
+                        cfg for cfg in INTENT_REGISTRY.values()
+                        if cfg.get("route") == "composite"
+                        and "metric" in cfg.get("optional_slots", [])
+                    ]
+                    # Build a set of common metric-related terms from all optional_slot
+                    # keys across fleet-wide intents (e.g. "metric", "group_by", "filter")
+                    fleet_slot_keys = set()
+                    for cfg in fleet_intents_with_metric:
+                        fleet_slot_keys.update(cfg.get("optional_slots", []))
+
+                    # If the vessel_name value contains words that are metric slot
+                    # keys or common aggregation phrasing, reject it.
+                    # This is data-driven: as you add more optional_slot keys to
+                    # fleet-wide intents in the registry, they're automatically covered.
+                    aggregation_terms = fleet_slot_keys | {
+                        "most", "highest", "lowest", "best", "worst",
+                        "average", "total", "count", "number of",
+                        "frequent", "common", "active", "profitable",
+                        "earning", "earned", "performing", "ranked",
+                        "fastest", "longest", "ballast", "laden", "scrubber",
+                        "operating", "contract duration", "voyage count",
+                    }
+                    if any(term in name_lower for term in aggregation_terms):
+                        pass  # drop — this is a metric phrase, not a vessel name
+                    else:
+                        clean["vessel_name"] = name
 
         # imo
         if "imo" in slots:
@@ -975,7 +1192,12 @@ IMPORTANT: Tailor the emphasis to the user's wording.
 - CRITICAL: merged_rows for ranking ALWAYS contain pnl, revenue, total_expense at the top level. Include PnL and Revenue (and Total expense, TCE, Total commission when present) as columns in the Results table.
 - Include ALL rows in the result set.
 - When merged_rows contain offhire_days: include **Offhire days** as a column.
+- When merged_rows contain is_delayed: include **Is delayed** as a column if the user asked for delay status.
 - When the question asks for "most port calls" or merged_rows contain port_calls: include **Port calls** as a column.
+- If the user asks for margin % or expense ratio and both revenue and total_expense are available, derive it in the answer:
+  - margin % = pnl / revenue * 100
+  - expense ratio = total_expense / revenue
+- If the user asks about commission types and merged_rows contain commissions, include a compact **Commission types** column derived from the commissionType values.
 ### Summary
 - **Ranking**: what is being ranked and limit
 - **Top result**: voyage_number + key metric value (e.g. PnL)
@@ -985,14 +1207,20 @@ IMPORTANT: Tailor the emphasis to the user's wording.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 (Only include columns that exist in the JSON and are relevant to the question.)
 
-2b) ranking.vessels (vessels with voyage count + profitability + cargo grades):
-- When merged_rows contain vessel_imo, vessel_name, voyage_count, avg_pnl, cargo_grades (no voyage_id), show a **vessel-level** table.
+2b) ranking.vessels (vessel-level aggregates):
+- When merged_rows contain vessel_imo, vessel_name, voyage_count (no voyage_id), show a **vessel-level** table.
+- Choose columns based on the user's metric words:
+  - "expensive/cost/expense/bunker" -> include Total expense / Bunker cost if present
+  - "revenue/earning" -> include Revenue
+  - "tce" -> include TCE
+  - "pnl/profit/performance" -> include PnL
+  - "operating/scrubber/market type" -> include those categorical columns when present
 ### Summary
-- **Vessels**: high voyage count and above-average profitability
+- **Vessels**: what was ranked and by which metric
 - **Count**: how many vessels
 
 ### Results
-| Vessel (IMO) | Vessel name | Voyage count | Avg PnL / PnL | Cargo grades |
+| Vessel (IMO) | Vessel name | Voyage count | Chosen metric(s) | Cargo grades |
 | --- | --- | --- | --- | --- |
 - List the most common cargo grades per vessel from the cargo_grades array in each row.
 
@@ -1050,6 +1278,11 @@ FAILSAFE:
             merged_safe=(merged_safe if isinstance(merged_safe, dict) else {}),
         )
         cleaned = self._ensure_ranking_voyages_answer(
+            text=cleaned,
+            intent_key=intent_key,
+            merged_safe=(merged_safe if isinstance(merged_safe, dict) else {}),
+        )
+        cleaned = self._ensure_ranking_vessels_answer(
             text=cleaned,
             intent_key=intent_key,
             merged_safe=(merged_safe if isinstance(merged_safe, dict) else {}),
@@ -1284,12 +1517,30 @@ FAILSAFE:
 
         artifacts = merged_safe.get("artifacts") if isinstance(merged_safe, dict) else {}
         rows = artifacts.get("merged_rows") if isinstance(artifacts, dict) else None
-        if not isinstance(rows, list) or not rows:
-            return text
+        if not isinstance(rows, list):
+            rows = []
 
         def _has_metric(v: Any) -> bool:
             return v not in (None, "", "Not available", "not available", "N/A", "n/a")
 
+        def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
+            fin = r.get("finance") if isinstance(r.get("finance"), dict) else {}
+            return {
+                "voyage_id": r.get("voyage_id") or fin.get("voyage_id"),
+                "voyage_number": r.get("voyage_number") or fin.get("voyage_number"),
+                "vessel_name": r.get("vessel_name") or fin.get("vessel_name"),
+                "port_calls": r.get("port_calls") if r.get("port_calls") not in (None, "") else (r.get("port_count") if r.get("port_count") not in (None, "") else fin.get("port_calls")),
+                "pnl": r.get("pnl") if r.get("pnl") not in (None, "") else fin.get("pnl"),
+                "revenue": r.get("revenue") if r.get("revenue") not in (None, "") else fin.get("revenue"),
+                "total_expense": r.get("total_expense") if r.get("total_expense") not in (None, "") else fin.get("total_expense"),
+                "tce": r.get("tce") if r.get("tce") not in (None, "") else fin.get("tce"),
+                "total_commission": r.get("total_commission") if r.get("total_commission") not in (None, "") else fin.get("total_commission"),
+                "key_ports": r.get("key_ports"),
+                "cargo_grades": r.get("cargo_grades"),
+                "remarks": r.get("remarks"),
+            }
+
+        normalized_rows = [_normalize_row(r) for r in rows if isinstance(r, dict)]
         has_kpi_data = any(
             isinstance(r, dict) and (
                 _has_metric(r.get("pnl"))
@@ -1297,15 +1548,45 @@ FAILSAFE:
                 or _has_metric(r.get("total_expense"))
                 or _has_metric(r.get("port_calls"))
             )
-            for r in rows
+            for r in normalized_rows
         )
+        if not has_kpi_data:
+            finance_rows = (merged_safe.get("finance") or {}).get("rows") if isinstance(merged_safe.get("finance"), dict) else None
+            if isinstance(finance_rows, list) and finance_rows:
+                normalized_rows = [
+                    {
+                        "voyage_id": fr.get("voyage_id"),
+                        "voyage_number": fr.get("voyage_number"),
+                        "vessel_name": fr.get("vessel_name"),
+                        "port_calls": fr.get("port_calls") if fr.get("port_calls") not in (None, "") else fr.get("port_count"),
+                        "pnl": fr.get("pnl"),
+                        "revenue": fr.get("revenue"),
+                        "total_expense": fr.get("total_expense"),
+                        "tce": fr.get("tce"),
+                        "total_commission": fr.get("total_commission"),
+                        "key_ports": [],
+                        "cargo_grades": [],
+                        "remarks": [],
+                    }
+                    for fr in finance_rows if isinstance(fr, dict)
+                ]
+                has_kpi_data = any(
+                    _has_metric(r.get("pnl"))
+                    or _has_metric(r.get("revenue"))
+                    or _has_metric(r.get("total_expense"))
+                    or _has_metric(r.get("port_calls"))
+                    for r in normalized_rows
+                )
         if not has_kpi_data:
             return text
 
         low = (text or "").lower()
         if "not available" not in low:
             return text
-        if not any(k in low for k in ("pnl", "revenue", "total expense", "financial metrics", "port count", "port calls")):
+        # If the model returned a generic fallback despite data rows, rebuild.
+        if low.strip() in ("not available in dataset.", "not available in dataset"):
+            pass
+        elif not any(k in low for k in ("pnl", "revenue", "total expense", "financial metrics", "port count", "port calls")):
             return text
 
         def _fmt_num(v: Any) -> str:
@@ -1366,7 +1647,27 @@ FAILSAFE:
                 return v.strip()
             return "Not available"
 
-        top = rows[:10]
+        primary_metric = "pnl"
+        descending = not any(k in low for k in ("lowest", "least", "worst"))
+        if "revenue" in low and "pnl" not in low and "profit" not in low:
+            primary_metric = "revenue"
+        elif "commission" in low:
+            primary_metric = "total_commission"
+        elif "tce" in low:
+            primary_metric = "tce"
+
+        def _metric_sort_value(r: Dict[str, Any]) -> tuple:
+            raw = r.get(primary_metric)
+            try:
+                val = float(raw)
+            except Exception:
+                val = None
+            if descending:
+                return (val is None, -(val or 0.0))
+            return (val is None, (val if val is not None else float("inf")))
+
+        normalized_rows.sort(key=_metric_sort_value)
+        top = normalized_rows[:10]
         table_lines = [
             "### Summary",
             f"- Ranked the top {len(top)} voyages using available finance + ops data.",
@@ -1384,6 +1685,143 @@ FAILSAFE:
             port_calls = r.get("port_calls") if r.get("port_calls") not in (None, "") else "Not available"
             table_lines.append(
                 f"| {vn} | {vessel_name} | {port_calls} | {_fmt_num(r.get('pnl'))} | {_fmt_num(r.get('revenue'))} | {_fmt_num(r.get('total_expense'))} | {_fmt_ports(r.get('key_ports'))} | {_fmt_grades(r.get('cargo_grades'))} | {_fmt_remarks(r.get('remarks'))} |"
+            )
+        return "\n".join(table_lines).strip()
+
+    def _ensure_ranking_vessels_answer(self, *, text: str, intent_key: str, merged_safe: Dict[str, Any]) -> str:
+        if str(intent_key or "") != "ranking.vessels":
+            return text
+
+        artifacts = merged_safe.get("artifacts") if isinstance(merged_safe, dict) else {}
+        rows = artifacts.get("merged_rows") if isinstance(artifacts, dict) else None
+        if not isinstance(rows, list) or not rows:
+            finance_rows = (merged_safe.get("finance") or {}).get("rows") if isinstance(merged_safe.get("finance"), dict) else None
+            if isinstance(finance_rows, list) and finance_rows:
+                rows = []
+                for fr in finance_rows[:20]:
+                    if not isinstance(fr, dict):
+                        continue
+                    rows.append({
+                        "vessel_name": fr.get("vessel_name"),
+                        "vessel_imo": fr.get("vessel_imo") or fr.get("imo"),
+                        "voyage_count": fr.get("voyage_count"),
+                        "tce": fr.get("avg_tce") if fr.get("avg_tce") not in (None, "") else fr.get("tce"),
+                        "avg_pnl": fr.get("avg_pnl"),
+                        "total_pnl": fr.get("total_pnl"),
+                        "offhire_days": fr.get("total_offhire_days") if fr.get("total_offhire_days") not in (None, "") else fr.get("offhire_days"),
+                    })
+            else:
+                return text
+        else:
+            normalized_rows = []
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                fin = r.get("finance") if isinstance(r.get("finance"), dict) else {}
+                normalized_rows.append({
+                    "vessel_name": r.get("vessel_name") or fin.get("vessel_name"),
+                    "vessel_imo": r.get("vessel_imo") or r.get("imo") or fin.get("vessel_imo") or fin.get("imo"),
+                    "voyage_count": r.get("voyage_count") if r.get("voyage_count") not in (None, "") else fin.get("voyage_count"),
+                    "tce": r.get("tce") if r.get("tce") not in (None, "") else (r.get("avg_tce") if r.get("avg_tce") not in (None, "") else fin.get("avg_tce")),
+                    "avg_pnl": r.get("avg_pnl") if r.get("avg_pnl") not in (None, "") else fin.get("avg_pnl"),
+                    "total_pnl": r.get("total_pnl") if r.get("total_pnl") not in (None, "") else fin.get("total_pnl"),
+                    "offhire_days": r.get("offhire_days") if r.get("offhire_days") not in (None, "") else (r.get("total_offhire_days") if r.get("total_offhire_days") not in (None, "") else fin.get("total_offhire_days")),
+                    "unique_cargo_grades": r.get("unique_cargo_grades") if r.get("unique_cargo_grades") not in (None, "") else fin.get("unique_cargo_grades"),
+                })
+            rows = normalized_rows
+
+        low = (text or "").lower()
+        if not any(k in low for k in ("not available", "not directly calculable", "could not", "no financial data")):
+            return text
+
+        def _has_metric(v: Any) -> bool:
+            return v not in (None, "", "Not available", "not available", "N/A", "n/a")
+
+        if not any(
+            isinstance(r, dict) and (
+                _has_metric(r.get("tce"))
+                or _has_metric(r.get("pnl"))
+                or _has_metric(r.get("avg_pnl"))
+                or _has_metric(r.get("total_pnl"))
+                or _has_metric(r.get("voyage_count"))
+            )
+            for r in rows
+        ):
+            return text
+
+        ql = low
+        primary = "pnl"
+        primary_label = "Average PnL"
+        if "tce" in ql:
+            primary = "tce"
+            primary_label = "Average TCE"
+        elif "total pnl" in ql or ("earned" in ql and "pnl" in ql):
+            primary = "total_pnl"
+            primary_label = "Total PnL"
+        elif "voyage count" in ql or "number of voyages" in ql:
+            primary = "voyage_count"
+            primary_label = "Voyage Count"
+        elif "offhire" in ql:
+            primary = "offhire_days"
+            primary_label = "Total Offhire Days"
+        elif "diverse" in ql and "cargo" in ql:
+            primary = "unique_cargo_grades"
+            primary_label = "Unique Cargo Grades"
+
+        def _fmt_metric(v: Any) -> str:
+            if primary in ("pnl", "avg_pnl", "total_pnl", "tce"):
+                val = self._fmt_usd(v) if primary != "voyage_count" else None
+                if val is not None:
+                    return val
+            if v in (None, "", [], {}):
+                return "Not available"
+            try:
+                n = float(v)
+                if abs(n - int(n)) < 1e-9:
+                    return f"{int(n):,}"
+                return f"{n:,.2f}"
+            except Exception:
+                return str(v)
+
+        def _fmt_count(v: Any) -> str:
+            if v in (None, "", [], {}):
+                return "Not available"
+            try:
+                s = str(v).replace("$", "").replace(",", "").strip()
+                return f"{int(float(s)):,}"
+            except Exception:
+                return str(v)
+
+        descending = not any(k in ql for k in ("lowest", "least", "worst"))
+
+        def _metric_sort_value(r: Dict[str, Any]) -> tuple:
+            raw = r.get(primary)
+            if raw in (None, "") and primary == "pnl":
+                raw = r.get("avg_pnl")
+            try:
+                val = float(raw)
+            except Exception:
+                val = None
+            if descending:
+                return (val is None, -(val or 0.0))
+            return (val is None, (val if val is not None else float("inf")))
+
+        ranked = [r for r in rows if isinstance(r, dict)]
+        ranked.sort(key=_metric_sort_value)
+        ranked = ranked[:10]
+        table_lines = [
+            "### Results",
+            f"| Vessel Name | Vessel IMO | {primary_label} | Voyage Count |",
+            "| --- | --- | --- | --- |",
+        ]
+        for r in ranked:
+            vessel_name = r.get("vessel_name") or "Not available"
+            imo = r.get("vessel_imo") or r.get("imo") or "Not available"
+            metric_val = r.get(primary)
+            if metric_val in (None, "") and primary == "pnl":
+                metric_val = r.get("avg_pnl")
+            table_lines.append(
+                f"| {vessel_name} | {imo} | {_fmt_metric(metric_val)} | {_fmt_count(r.get('voyage_count'))} |"
             )
         return "\n".join(table_lines).strip()
 
@@ -1455,6 +1893,9 @@ FAILSAFE:
                     "display_grade": str(grade_raw).strip() if isinstance(grade_raw, str) and str(grade_raw).strip() else gk,
                     "pnl": r.get("pnl") if r.get("pnl") not in (None, "") else (fin.get("avg_pnl") or fin.get("pnl")),
                     "revenue": r.get("revenue") if r.get("revenue") not in (None, "") else (fin.get("avg_revenue") or fin.get("revenue")),
+                    "actual_avg_pnl": r.get("actual_avg_pnl") if r.get("actual_avg_pnl") not in (None, "") else fin.get("actual_avg_pnl"),
+                    "when_fixed_avg_pnl": r.get("when_fixed_avg_pnl") if r.get("when_fixed_avg_pnl") not in (None, "") else fin.get("when_fixed_avg_pnl"),
+                    "variance_diff": r.get("variance_diff") if r.get("variance_diff") not in (None, "") else fin.get("variance_diff"),
                     "voyage_count": r.get("voyage_count") if r.get("voyage_count") not in (None, "") else fin.get("voyage_count"),
                     "ports": [],
                     "remarks": [],
@@ -1473,6 +1914,24 @@ FAILSAFE:
                     gr = fin.get("avg_revenue") or fin.get("revenue")
                 if gr not in (None, ""):
                     g["revenue"] = gr
+            if g.get("actual_avg_pnl") in (None, ""):
+                gap = r.get("actual_avg_pnl")
+                if gap in (None, ""):
+                    gap = fin.get("actual_avg_pnl")
+                if gap not in (None, ""):
+                    g["actual_avg_pnl"] = gap
+            if g.get("when_fixed_avg_pnl") in (None, ""):
+                gwp = r.get("when_fixed_avg_pnl")
+                if gwp in (None, ""):
+                    gwp = fin.get("when_fixed_avg_pnl")
+                if gwp not in (None, ""):
+                    g["when_fixed_avg_pnl"] = gwp
+            if g.get("variance_diff") in (None, ""):
+                gvd = r.get("variance_diff")
+                if gvd in (None, ""):
+                    gvd = fin.get("variance_diff")
+                if gvd not in (None, ""):
+                    g["variance_diff"] = gvd
             if g.get("voyage_count") in (None, ""):
                 gv = r.get("voyage_count")
                 if gv in (None, ""):
@@ -1516,7 +1975,32 @@ FAILSAFE:
         if not grouped:
             return text
 
+        has_variance_rows = any(
+            isinstance(r, dict) and (
+                r.get("variance_diff") not in (None, "")
+                or r.get("actual_avg_pnl") not in (None, "")
+                or r.get("when_fixed_avg_pnl") not in (None, "")
+            )
+            for r in grouped.values()
+        )
+
+        def _scenario_gap(item: Dict[str, Any]) -> Optional[float]:
+            try:
+                actual = float(item.get("actual_avg_pnl"))
+                when_fixed = float(item.get("when_fixed_avg_pnl"))
+                return abs(actual - when_fixed)
+            except Exception:
+                pass
+            try:
+                raw_gap = item.get("variance_diff")
+                return abs(float(raw_gap)) if raw_gap not in (None, "") else None
+            except Exception:
+                return None
+
         def _sort_key(item: Dict[str, Any]) -> tuple:
+            if has_variance_rows:
+                v = _scenario_gap(item)
+                return (v is None, -(v or 0.0))
             try:
                 p = float(item.get("pnl"))
             except Exception:
@@ -1527,15 +2011,26 @@ FAILSAFE:
         final_rows.sort(key=_sort_key)
         final_rows = final_rows[:10]
 
-        table_lines = [
-            "### Summary",
-            f"- Most profitable cargo grades ranked by average PnL (top {len(final_rows)} shown).",
-            "- Included common ports and recurring congestion/delay remarks where available.",
-            "",
-            "### Results",
-            "| Cargo grade | Avg PnL | Avg Revenue | Voyage count | Common ports | Congestion/Delay remarks |",
-            "| --- | --- | --- | --- | --- | --- |",
-        ]
+        if has_variance_rows:
+            table_lines = [
+                "### Summary",
+                f"- Cargo grades ranked by ACTUAL vs WHEN_FIXED PnL variance (top {len(final_rows)} shown).",
+                "- Included common ports and recurring congestion/delay remarks where available.",
+                "",
+                "### Results",
+                "| Cargo grade | ACTUAL Avg PnL | WHEN_FIXED Avg PnL | Variance | Voyage count | Common ports | Congestion/Delay remarks |",
+                "| --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        else:
+            table_lines = [
+                "### Summary",
+                f"- Most profitable cargo grades ranked by average PnL (top {len(final_rows)} shown).",
+                "- Included common ports and recurring congestion/delay remarks where available.",
+                "",
+                "### Results",
+                "| Cargo grade | Avg PnL | Avg Revenue | Voyage count | Common ports | Congestion/Delay remarks |",
+                "| --- | --- | --- | --- | --- | --- |",
+            ]
         for r in final_rows:
             ports = r.get("ports") or []
             if isinstance(ports, list):
@@ -1552,9 +2047,19 @@ FAILSAFE:
                 remarks_txt = str(remarks) if remarks else "No recurring congestion/delay remarks"
             vc = r.get("voyage_count")
             vc_txt = str(int(vc)) if isinstance(vc, (int, float)) else (str(vc) if vc not in (None, "") else "Not available")
-            table_lines.append(
-                f"| {r.get('display_grade') or 'Not available'} | {self._fmt_usd(r.get('pnl')) or 'Not available'} | {self._fmt_usd(r.get('revenue')) or 'Not available'} | {vc_txt} | {ports_txt} | {remarks_txt} |"
-            )
+            if has_variance_rows:
+                variance_txt = self._fmt_usd(_scenario_gap(r)) or "Not available"
+                table_lines.append(
+                    f"| {r.get('display_grade') or 'Not available'} | "
+                    f"{self._fmt_usd(r.get('actual_avg_pnl')) or 'Not available'} | "
+                    f"{self._fmt_usd(r.get('when_fixed_avg_pnl')) or 'Not available'} | "
+                    f"{variance_txt} | "
+                    f"{vc_txt} | {ports_txt} | {remarks_txt} |"
+                )
+            else:
+                table_lines.append(
+                    f"| {r.get('display_grade') or 'Not available'} | {self._fmt_usd(r.get('pnl')) or 'Not available'} | {self._fmt_usd(r.get('revenue')) or 'Not available'} | {vc_txt} | {ports_txt} | {remarks_txt} |"
+                )
         return "\n".join(table_lines).strip()
 
     @staticmethod
@@ -1871,25 +2376,23 @@ FAILSAFE:
 def _enforce_table_rules(text: str) -> str:
     lines = text.splitlines()
     output = []
-    in_table = False
     table_lines = []
+    
+    def _flush_table_block() -> None:
+        nonlocal table_lines
+        if table_lines:
+            output.extend(_drop_empty_columns(table_lines))
+            table_lines = []
 
     for line in lines:
         stripped = line.strip()
-        is_table_row = stripped.startswith("|")
-
-        if is_table_row:
-            in_table = True
+        if stripped.startswith("|"):
             table_lines.append(line)
-        else:
-            if in_table:
-                output.extend(_drop_empty_columns(table_lines))
-                table_lines = []
-                in_table = False
-            output.append(line)
+            continue
+        _flush_table_block()
+        output.append(line)
 
-    if table_lines:
-        output.extend(_drop_empty_columns(table_lines))
+    _flush_table_block()
 
     return "\n".join(output)
 
@@ -1902,6 +2405,36 @@ def _drop_empty_columns(table_lines: list) -> list:
         parts = line.strip().strip("|").split("|")
         return [p.strip() for p in parts]
 
+    def is_separator_row(row: list[str]) -> bool:
+        if not row:
+            return False
+        for cell in row:
+            c = cell.strip()
+            if not c:
+                continue
+            if not re.fullmatch(r":?-{3,}:?", c):
+                return False
+        return True
+
+    def is_emptyish(val: str) -> bool:
+        return str(val or "").strip().lower() in {"", "not available", "n/a", "none", "null", "-", "—", "not recorded"}
+
+    def looks_sentence(text: str) -> bool:
+        t = str(text or "").strip()
+        if len(t) < 24 or " " not in t:
+            return False
+        if not any(ch.isalpha() for ch in t):
+            return False
+        if re.fullmatch(r"[\d\s,$%().:/\-]+", t):
+            return False
+        lowered = t.lower()
+        sentence_markers = (
+            " the ", " this ", " these ", " those ", " was ", " were ", " has ", " had ",
+            " have ", " with ", " among ", " overall ", " appears ", " shows ", " indicate",
+            " winner", " conclusion", " result", " voyages ", " vessel ", " cargo ", " port ",
+        )
+        return t.endswith((".", "!", "?")) or any(m in f" {lowered} " for m in sentence_markers)
+
     rows = [split_row(l) for l in table_lines]
     if not rows:
         return table_lines
@@ -1909,24 +2442,52 @@ def _drop_empty_columns(table_lines: list) -> list:
     num_cols = max(len(r) for r in rows)
     rows = [r + [""] * (num_cols - len(r)) for r in rows]
 
-    data_rows = [r for i, r in enumerate(rows) if i != 1]
-    EMPTY_VALUES = {"", "not available", "n/a", "none", "null", "-", "—"}
+    header_row = rows[0]
+    separator_row = rows[1] if len(rows) > 1 and is_separator_row(rows[1]) else ["---"] * num_cols
+    raw_data_rows = rows[2:] if len(rows) > 1 and is_separator_row(rows[1]) else rows[1:]
+
+    cleaned_data_rows: list[list[str]] = []
+    ejected_lines: list[str] = []
+    for row in raw_data_rows:
+        non_empty_cells = [c.strip() for c in row if not is_emptyish(c)]
+        if len(non_empty_cells) == 1 and looks_sentence(non_empty_cells[0]):
+            ejected_lines.append(non_empty_cells[0])
+            continue
+        if non_empty_cells and any(looks_sentence(c) for c in non_empty_cells) and len(non_empty_cells) <= 2:
+            ejected_lines.append(" ".join(non_empty_cells).strip())
+            continue
+        cleaned_data_rows.append(row)
+
+    if cleaned_data_rows:
+        data_rows = cleaned_data_rows
+    elif ejected_lines:
+        data_rows = []
+    else:
+        data_rows = raw_data_rows
+
     keep_cols = []
     for col_idx in range(num_cols):
-        vals = [r[col_idx].lower() for r in data_rows]
-        if any(v not in EMPTY_VALUES for v in vals):
+        vals = [str(r[col_idx] if col_idx < len(r) else "").strip() for r in data_rows]
+        if any(not is_emptyish(v) for v in vals):
             keep_cols.append(col_idx)
 
-    if len(keep_cols) == num_cols:
-        return table_lines
+    if not keep_cols:
+        keep_cols = list(range(num_cols))
 
     result = []
-    for row in rows:
+    for row_idx, row in enumerate([header_row, separator_row, *data_rows]):
         kept = [row[i] if i < len(row) else "" for i in keep_cols]
-        kept = [
-            "—" if c.strip().lower() in ("not available", "n/a", "none", "null", "")
-            else c
-            for c in kept
-        ]
+        if row_idx != 1:
+            kept = [
+                "—" if is_emptyish(c) else c
+                for c in kept
+            ]
+        else:
+            kept = ["---"] * len(keep_cols)
         result.append("| " + " | ".join(kept) + " |")
+
+    if ejected_lines:
+        result.append("")
+        result.extend(ejected_lines)
+
     return result

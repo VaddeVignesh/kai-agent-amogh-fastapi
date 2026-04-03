@@ -280,6 +280,44 @@ INTENT-SPECIFIC RULES (finance vessel.summary):
         },
     },
 
+    "ranking.vessel_metadata": {
+        "description": (
+            "Fleet-wide vessel metadata listing/ranking from MongoDB `vessels` only. "
+            "Use when the user asks about metadata-style vessel attributes across the fleet such as "
+            "operating status, scrubber, hire rate, pool tags, market type, default ballast/laden speed, "
+            "or current contract duration. "
+            "Do NOT answer these using finance aggregates as a proxy."
+        ),
+        "route": "single",
+        "required_slots": [],
+        "optional_slots": ["limit"],
+        "needs": {"mongo": True, "finance": False, "ops": False},
+        "mongo_intent": "vessel.list_all",
+        "mongo_projection": {
+            "_id": 0,
+            "vesselId": 1,
+            "imo": 1,
+            "name": 1,
+            "accountCode": 1,
+            "hireRate": 1,
+            "scrubber": 1,
+            "marketType": 1,
+            "consumption_profiles.profileName": 1,
+            "consumption_profiles.passageProfile.passageType": 1,
+            "consumption_profiles.passageProfile.consumption.speed": 1,
+            "consumption_profiles.passageProfile.consumption.isDefault": 1,
+            "tags.category": 1,
+            "tags.value": 1,
+            "contract_history.list": 1,
+            "isVesselOperating": 1,
+            "extracted_at": 1,
+        },
+        "sql_hints": {
+            "finance": "",
+            "ops": "",
+        },
+    },
+
     "cargo.details": {
         "description": (
             "Details and specifications for a specific cargo type on a specific voyage. "
@@ -392,8 +430,19 @@ INTENT-SPECIFIC RULES (finance analysis.cargo_profitability):
 - MUST filter scenario: `f.scenario = COALESCE(%(scenario)s, 'ACTUAL')`.
 - GROUP BY cargo grade with AVG(pnl), AVG(revenue), COUNT(*) as voyage_count.
 - Return exact aliases: cargo_grade, avg_pnl, avg_revenue, voyage_count.
-- ORDER BY avg_pnl DESC.
+- ORDER BY avg_pnl DESC NULLS LAST.
 - Keep LIMIT %(limit)s.
+- If the question also asks for common ports or congestion/delay remarks for profitable cargo grades:
+  - still GROUP ONLY BY normalized cargo grade,
+  - add `string_agg(DISTINCT lower(trim(p->>'port_name')), ', ') AS most_common_ports`,
+  - aggregate only congestion/delay-like remarks instead of grouping by raw remarks_json,
+  - return one row per cargo grade, never one row per remark payload.
+- If the question compares ACTUAL vs WHEN_FIXED or asks for variance/difference between scenarios by cargo grade:
+  - include BOTH scenarios in the filtered set instead of ACTUAL-only,
+  - return exact aliases: cargo_grade, actual_avg_pnl, when_fixed_avg_pnl, variance_diff,
+  - compute `variance_diff` as `ABS(AVG(CASE WHEN f.scenario = 'ACTUAL' THEN f.pnl END) - AVG(CASE WHEN f.scenario = 'WHEN_FIXED' THEN f.pnl END))`,
+  - do NOT use statistical `VARIANCE()` / `STDDEV()` functions for this question,
+  - ORDER BY variance_diff DESC NULLS LAST.
 """,
             "ops": "",
         },
@@ -403,7 +452,8 @@ INTENT-SPECIFIC RULES (finance analysis.cargo_profitability):
         "description": (
             "Fleet-wide breakdown of average PnL, most common cargo grades and ports "
             "grouped by module type (TC Voyage, Spot, etc.). "
-            "No specific entity required. Needs GROUP BY module_type dynamic SQL."
+            "No specific entity required. Needs GROUP BY module_type dynamic SQL. "
+            "Use this when module type is the grouped subject even if cargo grades or ports are requested as output columns."
         ),
         "route": "composite",
         "required_slots": [],
@@ -616,6 +666,7 @@ INTENT-SPECIFIC RULES (finance ranking.pnl):
 - If the question asks by cargo grade, GROUP BY normalized cargo grade and include avg_pnl/avg_revenue/voyage_count.
 - For cargo-grade ranking, include most_common_ports using string_agg(DISTINCT port_text, ', ') AS most_common_ports.
 - If the question asks by voyage, return voyage-level rows with pnl/revenue/total_expense.
+- When ordering by pnl or another numeric KPI, add `NULLS LAST`.
 - Keep LIMIT %(limit)s and scenario = COALESCE(%(scenario)s, 'ACTUAL') when relevant.
 """,
             "ops": "",
@@ -638,6 +689,7 @@ INTENT-SPECIFIC RULES (finance ranking.pnl):
             "finance": """
 INTENT-SPECIFIC RULES (finance ranking.revenue):
 - Rank by revenue metric.
+- When ordering by revenue or another numeric KPI, add `NULLS LAST`.
 - Keep LIMIT %(limit)s and scenario = COALESCE(%(scenario)s, 'ACTUAL') when relevant.
 """,
             "ops": "",
@@ -676,7 +728,8 @@ INTENT-SPECIFIC RULES (finance ranking.port_calls):
             "Fleet-wide ranking of ALL voyages ordered by PnL (profit and loss) — highest to lowest. "
             "No specific voyage or vessel needed. "
             "Use for 'top N most profitable voyages', 'worst performing voyages by PnL'. "
-            "Needs ORDER BY pnl DESC LIMIT dynamic SQL."
+            "Needs ORDER BY pnl DESC LIMIT dynamic SQL. "
+            "Extra requested columns like vessel name, cargo grades, ports, remarks, margin %, or expense ratio do NOT change the grouped subject away from voyages."
         ),
         "route": "composite",
         "required_slots": [],
@@ -771,7 +824,7 @@ INTENT-SPECIFIC RULES (finance ranking.voyages_by_commission):
         "sql_hints": {
             "finance": """
 INTENT-SPECIFIC RULES (finance ranking.vessels):
-- MANDATORY: Use this EXACT query structure — do NOT use a CTE that omits the ops join:
+- MANDATORY: Keep this vessel-level GROUP BY structure and do NOT use a CTE that omits the ops join:
   SELECT
     REPLACE(f.vessel_imo::TEXT, '.0', '') AS vessel_imo,
     MAX(o.vessel_name)                   AS vessel_name,
@@ -783,10 +836,20 @@ INTENT-SPECIFIC RULES (finance ranking.vessels):
     ON REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
   WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
   GROUP BY REPLACE(f.vessel_imo::TEXT, '.0', '')
-  ORDER BY voyage_count DESC, avg_pnl DESC
+  ORDER BY <chosen_metric> DESC NULLS LAST, voyage_count DESC
   LIMIT %(limit)s
 - CRITICAL: vessel_name MUST come from MAX(o.vessel_name) — it does NOT exist in finance_voyage_kpi.
 - NEVER use a CTE that queries finance_voyage_kpi alone without joining ops_voyage_summary.
+- Pick aggregates and aliases based on the question:
+  - total profit / total pnl / earned most -> SUM(f.pnl) AS total_pnl
+  - average pnl / profitability -> AVG(f.pnl) AS avg_pnl
+  - total revenue / earnings -> SUM(f.revenue) AS total_revenue
+  - average revenue -> AVG(f.revenue) AS avg_revenue
+  - total expense / most expensive -> SUM(f.total_expense) AS total_expense
+  - average expense / cost -> AVG(f.total_expense) AS avg_total_expense
+  - TCE -> AVG(f.tce) AS avg_tce
+- Always include voyage_count. Order by the metric implied by the question, not always by voyage_count.
+- When ordering by avg/total KPI columns, add `NULLS LAST`.
 """,
             "ops": """
 INTENT-SPECIFIC RULES (ops ranking.vessels):
@@ -808,6 +871,7 @@ INTENT-SPECIFIC RULES (ops ranking.vessels):
             "No specific cargo grade known in advance. "
             "Use when user asks 'which cargo grade is most profitable', "
             "'most frequently carried cargo', 'best performing cargo'. "
+            "Do NOT use when voyages, vessels, or module types are the main rows and cargo grade is only a requested output column. "
             "Needs GROUP BY cargo_grade + aggregate dynamic SQL with JSONB unnest."
         ),
         "route": "composite",
@@ -859,7 +923,20 @@ INTENT-SPECIFIC RULES (ops ranking.cargo):
         "mongo_intent": "entity.skip",
         "mongo_projection": None,
         "sql_hints": {
-            "finance": "",
+            "finance": """
+INTENT-SPECIFIC RULES (finance ranking.ports):
+- Use `ops_voyage_summary` with `jsonb_array_elements(ports_json)` to rank ports fleet-wide.
+- Return exact alias `port_name`.
+- If the question asks for most visited / most common / busiest ports:
+  - return `COUNT(*) AS finance_voyage_count`
+  - ORDER BY finance_voyage_count DESC.
+- If the question asks for demurrage / wait time / delay by port:
+  - use `AVG(offhire_days) AS avg_offhire_days` as the port-level waiting proxy,
+  - ignore rows where port_name is null/blank,
+  - ORDER BY avg_offhire_days DESC.
+- Do NOT return `avg_voyage_days` or other unrelated aliases for wait-time questions.
+- Keep LIMIT %(limit)s.
+""",
             "ops": """
 INTENT-SPECIFIC RULES (ops ranking.ports):
 - CRITICAL: There is NO column named 'port_name' at the row level. Ports live in ports_json (JSONB array).
@@ -875,6 +952,8 @@ INTENT-SPECIFIC RULES (ops ranking.ports):
 - CRITICAL: The lateral alias is `port_text` (NOT port_name) to avoid column name conflicts.
 - DO NOT add WHERE voyage_id = ANY(...) — this is a fleet-wide aggregate with NO voyage_id filter.
 - Return exact output aliases: port_name, visit_count.
+- If the user asks for demurrage / wait time / delay by port, aggregate `AVG(offhire_days) AS avg_offhire_days`
+  instead of visit_count and ORDER BY avg_offhire_days DESC.
 """,
         },
     },
@@ -1292,11 +1371,12 @@ INTENT-SPECIFIC RULES (finance aggregation.average):
     ON REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
   WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
   GROUP BY REPLACE(f.vessel_imo::TEXT, '.0', '')
-  ORDER BY avg_<metric> DESC
+  ORDER BY avg_<metric> DESC NULLS LAST
   LIMIT %(limit)s
 - CRITICAL: Replace <metric> with the actual column (tce, pnl, revenue, total_expense).
 - CRITICAL: Use exact descriptive aliases (avg_tce, avg_pnl etc.) — NEVER use 'group_key' or 'avg_value'.
 - vessel_name MUST come from MAX(o.vessel_name) — it does NOT exist in finance_voyage_kpi.
+- When ordering by avg_<metric>, add `NULLS LAST`.
 - Keep LIMIT %(limit)s.
 """,
             "ops": "",

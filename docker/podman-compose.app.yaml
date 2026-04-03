@@ -1,0 +1,77 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Containerfile.api
+    container_name: kai-agent-api
+    environment:
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      GROQ_TEMPERATURE: ${GROQ_TEMPERATURE:-0.0}
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://admin:admin123@postgresdb:5432/postgres}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgresdb}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin123}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      MONGO_URI: ${MONGO_URI:-mongodb://mongodb:27017/}
+      MONGO_DB_NAME: ${MONGO_DB_NAME:-kai_agent}
+      REDIS_HOST: ${REDIS_HOST:-redisdb}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_DB: ${REDIS_DB:-0}
+      KAI_DEBUG: ${KAI_DEBUG:-0}
+    ports:
+      - "${API_HOST_PORT:-8001}:8000"
+    networks:
+      kai-agent_app_net:
+        aliases:
+          - kai-agent-api
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=5).read()",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: ..
+      dockerfile: docker/Containerfile.ui
+    container_name: kai-agent-ui
+    depends_on:
+      - api
+    environment:
+      KAI_API_URL: ${KAI_API_URL:-http://kai-agent-api:8000/query}
+      KAI_API_BASE_URL: ${KAI_API_BASE_URL:-http://kai-agent-api:8000}
+      KAI_API_TIMEOUT_SEC: ${KAI_API_TIMEOUT_SEC:-300}
+    ports:
+      - "${UI_HOST_PORT:-8501}:8501"
+    networks:
+      kai-agent_app_net:
+        aliases:
+          - kai-agent-ui
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=5).read()",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    restart: unless-stopped
+
+networks:
+  kai-agent_app_net:
+    external: true
+    name: kai-agent_kai-net

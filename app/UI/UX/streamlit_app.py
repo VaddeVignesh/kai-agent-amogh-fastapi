@@ -17,6 +17,10 @@ API_URL = os.getenv("KAI_API_URL", "http://127.0.0.1:8000/query")
 API_BASE_URL = os.getenv("KAI_API_BASE_URL", API_URL.rsplit("/", 1)[0])
 SESSION_CLEAR_URL = f"{API_BASE_URL}/session/clear"
 API_TIMEOUT_SEC = int(os.getenv("KAI_API_TIMEOUT_SEC", "300"))
+
+
+def _uses_backend_api() -> bool:
+    return bool((API_URL or "").strip())
  
 def call_api(query: str, session_id: str) -> Dict[str, Any]:
     payload = {
@@ -535,26 +539,35 @@ def _sidebar_settings() -> UiSettings:
   <div style="font-size:.95rem;font-weight:900;font-family:ui-monospace,monospace">{sid}</div>
 </div>""", unsafe_allow_html=True)
  
-    if not (os.getenv("GROQ_API_KEY") or "").strip():
+    if _uses_backend_api():
+        st.sidebar.caption(f"Using backend API: `{API_BASE_URL}`")
+    elif not (os.getenv("GROQ_API_KEY") or "").strip():
         st.sidebar.error("Set `GROQ_API_KEY` in `.env`")
  
     # ── Connections ───────────────────────────────
     st.sidebar.markdown("---")
     st.sidebar.markdown("## Connections")
-    pg_set    = bool(os.getenv("POSTGRES_DSN") or os.getenv("POSTGRES_DB"))
-    mongo_set = bool(os.getenv("MONGO_URI") or os.getenv("MONGO_DB_NAME"))
+    backend_mode = _uses_backend_api()
+    pg_set = backend_mode or bool(os.getenv("POSTGRES_DSN") or os.getenv("POSTGRES_DB"))
+    mongo_set = backend_mode or bool(os.getenv("MONGO_URI") or os.getenv("MONGO_DB_NAME"))
+    redis_set = backend_mode or bool(os.getenv("REDIS_HOST") or os.getenv("REDIS_PORT"))
     st.sidebar.markdown(f"""
 <div class="kai-chips">
   <span class="kai-chip"><span class="kai-dot {'kai-dot-ok' if pg_set else 'kai-dot-warn'}"></span>Postgres</span>
   <span class="kai-chip"><span class="kai-dot {'kai-dot-ok' if mongo_set else 'kai-dot-warn'}"></span>Mongo</span>
-  <span class="kai-chip"><span class="kai-dot kai-dot-ok"></span>Redis</span>
+  <span class="kai-chip"><span class="kai-dot {'kai-dot-ok' if redis_set else 'kai-dot-warn'}"></span>Redis</span>
 </div>""", unsafe_allow_html=True)
  
     with st.sidebar.expander("Details", expanded=False):
-        pg_dsn = _redact_dsn(os.getenv("POSTGRES_DSN","")) or os.getenv("POSTGRES_DB","(not set)")
-        st.caption(f"Postgres: `{pg_dsn}`")
-        st.caption(f"Mongo DB: `{os.getenv('MONGO_DB_NAME','(not set)')}`")
-        st.caption(f"Redis: `{os.getenv('REDIS_HOST','localhost')}:{os.getenv('REDIS_PORT','6379')}`")
+        if backend_mode:
+            st.caption(f"Postgres: `Managed by backend API ({API_BASE_URL})`")
+            st.caption(f"Mongo DB: `Managed by backend API ({API_BASE_URL})`")
+            st.caption(f"Redis: `Managed by backend API ({API_BASE_URL})`")
+        else:
+            pg_dsn = _redact_dsn(os.getenv("POSTGRES_DSN","")) or os.getenv("POSTGRES_DB","(not set)")
+            st.caption(f"Postgres: `{pg_dsn}`")
+            st.caption(f"Mongo DB: `{os.getenv('MONGO_DB_NAME','(not set)')}`")
+            st.caption(f"Redis: `{os.getenv('REDIS_HOST','localhost')}:{os.getenv('REDIS_PORT','6379')}`")
  
     # ── Model ─────────────────────────────────────
     st.sidebar.markdown("---")
@@ -622,41 +635,152 @@ def _render_trace(result: Dict[str,Any], trace_id: str = "trace") -> None:
     if not isinstance(trace,list) or not trace:
         return
     with st.expander("Execution Trace", expanded=False):
-        starts  = [e for e in trace if isinstance(e,dict) and e.get("phase")=="composite_step_start"]
-        results = {(e.get("step_index"),e.get("agent"),e.get("operation")):e
-                   for e in trace if isinstance(e,dict) and e.get("phase")=="composite_step_result"}
+        planning = next((e for e in trace if isinstance(e, dict) and e.get("phase") == "planning"), {}) or {}
+        planning_steps: Dict[Tuple[Any, Any, Any], Dict[str, Any]] = {}
+        if isinstance(planning.get("steps"), list):
+            for pos, step in enumerate(planning.get("steps") or [], start=1):
+                if not isinstance(step, dict):
+                    continue
+                inputs = step.get("inputs") if isinstance(step.get("inputs"), dict) else {}
+                step_index = inputs.get("step_index") or step.get("step_index") or pos
+                agent = step.get("agent")
+                operation = step.get("operation")
+                planning_steps[(step_index, agent, operation)] = step
+                planning_steps[(step_index, agent, None)] = step
 
-        if starts:
-            for idx, s in enumerate(starts):
-                r = results.get((s.get("step_index"), s.get("agent"), s.get("operation"))) or {}
+        def _render_step_panel(
+            *,
+            ns_suffix: str,
+            step_index: Any,
+            agent: Any,
+            operation: Any,
+            status: str,
+            inputs: Dict[str, Any] | None,
+            step_meta: Dict[str, Any] | None,
+            result_meta: Dict[str, Any] | None,
+        ) -> None:
+            step_title = f"Step {step_index}: {agent}.{operation} — {status}"
+            trace_ns = f"{trace_id}-{result.get('intent_key','na')}-{len(trace)}-{ns_suffix}"
+            open_key = f"trace_step_open_{trace_ns}"
+            if open_key not in st.session_state:
+                st.session_state[open_key] = False
+
+            chevron = "▼" if st.session_state[open_key] else "▶"
+            if st.button(f"{chevron} {step_title}", key=f"trace_step_btn_{trace_ns}", use_container_width=True):
+                st.session_state[open_key] = not st.session_state[open_key]
+
+            if not st.session_state[open_key]:
+                return
+
+            caption_text = None
+            if isinstance(step_meta, dict):
+                caption_text = step_meta.get("goal") or step_meta.get("description")
+                if not caption_text:
+                    step_inputs = step_meta.get("inputs") if isinstance(step_meta.get("inputs"), dict) else {}
+                    caption_text = step_inputs.get("description")
+            if not caption_text and isinstance(result_meta, dict):
+                caption_text = result_meta.get("summary")
+            if caption_text:
+                st.caption(caption_text)
+
+            if isinstance(inputs, dict) and inputs:
+                st.markdown("**Inputs**")
+                st.json(inputs)
+
+            if isinstance(result_meta, dict) and result_meta:
+                st.markdown("**Results**")
+                if result_meta.get("summary"):
+                    st.info(result_meta["summary"])
+                st.json({k: v for k, v in result_meta.items() if k not in ("phase", "summary", "sql", "mongo_query")})
+
+            if isinstance(result_meta, dict) and isinstance(result_meta.get("sql"), str) and result_meta["sql"].strip():
+                st.markdown("**Generated SQL**")
+                st.code(_format_sql_for_trace(result_meta["sql"]), language="sql")
+
+            if (
+                isinstance(result_meta, dict)
+                and isinstance(result_meta.get("mongo_query"), dict)
+                and any(v is not None for v in (result_meta.get("mongo_query") or {}).values())
+            ):
+                st.markdown("**MongoDB Query**")
+                st.json(result_meta["mongo_query"])
+
+            st.markdown("---")
+
+        rendered_structured = False
+
+        composite_starts = [e for e in trace if isinstance(e,dict) and e.get("phase")=="composite_step_start"]
+        composite_results = {(e.get("step_index"),e.get("agent"),e.get("operation")):e
+                             for e in trace if isinstance(e,dict) and e.get("phase")=="composite_step_result"}
+
+        if composite_starts:
+            rendered_structured = True
+            for idx, s in enumerate(composite_starts):
+                r = composite_results.get((s.get("step_index"), s.get("agent"), s.get("operation"))) or {}
                 status = "OK" if r.get("ok") is True else ("Failed" if r.get("ok") is False else "Pending")
-                step_title = f"Step {s.get('step_index')}: {s.get('agent')}.{s.get('operation')} — {status}"
-                trace_ns = f"{trace_id}-{result.get('intent_key','na')}-{len(trace)}-{idx}"
-                open_key = f"trace_step_open_{trace_ns}"
-                if open_key not in st.session_state:
-                    st.session_state[open_key] = False
+                _render_step_panel(
+                    ns_suffix=f"composite-{idx}",
+                    step_index=s.get("step_index"),
+                    agent=s.get("agent"),
+                    operation=s.get("operation"),
+                    status=status,
+                    inputs=s.get("inputs") if isinstance(s.get("inputs"), dict) else {},
+                    step_meta=s,
+                    result_meta=r,
+                )
 
-                chevron = "▼" if st.session_state[open_key] else "▶"
-                if st.button(f"{chevron} {step_title}", key=f"trace_step_btn_{trace_ns}", use_container_width=True):
-                    st.session_state[open_key] = not st.session_state[open_key]
+        multi_starts = [e for e in trace if isinstance(e, dict) and e.get("phase") == "multi_step_start"]
+        multi_results = {(e.get("step_index"), e.get("agent")): e
+                         for e in trace if isinstance(e, dict) and e.get("phase") == "multi_step_result"}
 
-                if st.session_state[open_key]:
-                    if s.get("goal"):
-                        st.caption(s["goal"])
-                    st.markdown("**Inputs**")
-                    st.json(s.get("inputs") or {})
-                    if r:
-                        st.markdown("**Results**")
-                        if r.get("summary"):
-                            st.info(r["summary"])
-                        st.json({k: v for k, v in r.items() if k not in ("phase", "summary", "sql", "mongo_query")})
-                    if r and isinstance(r.get("sql"), str) and r["sql"].strip():
-                        st.markdown("**Generated SQL**")
-                        st.code(_format_sql_for_trace(r["sql"]), language="sql")
-                    if r and isinstance(r.get("mongo_query"), dict) and any(v is not None for v in (r.get("mongo_query") or {}).values()):
-                        st.markdown("**MongoDB Query**")
-                        st.json(r["mongo_query"])
-                    st.markdown("---")
+        if multi_starts:
+            rendered_structured = True
+            for idx, s in enumerate(multi_starts):
+                plan_step = planning_steps.get((s.get("step_index"), s.get("agent"), None)) or {}
+                operation = plan_step.get("operation") or s.get("operation") or "single_intent"
+                inputs = plan_step.get("inputs") if isinstance(plan_step.get("inputs"), dict) else {}
+                r = multi_results.get((s.get("step_index"), s.get("agent"))) or {}
+                status = "OK" if r.get("ok") is True else ("Failed" if r.get("ok") is False else "Pending")
+                _render_step_panel(
+                    ns_suffix=f"multi-{idx}",
+                    step_index=s.get("step_index"),
+                    agent=s.get("agent"),
+                    operation=operation,
+                    status=status,
+                    inputs=inputs,
+                    step_meta=s,
+                    result_meta=r,
+                )
+
+        single_results = [e for e in trace if isinstance(e, dict) and e.get("phase") == "single_step_result"]
+        if single_results:
+            rendered_structured = True
+            for idx, r in enumerate(single_results, start=1):
+                step_index = r.get("step_index") or idx
+                operation = r.get("operation") or "single_intent"
+                agent = r.get("agent") or "unknown"
+                plan_step = (
+                    planning_steps.get((step_index, agent, operation))
+                    or planning_steps.get((step_index, agent, None))
+                    or {}
+                )
+                inputs = plan_step.get("inputs") if isinstance(plan_step.get("inputs"), dict) else {}
+                if not inputs:
+                    inputs = result.get("slots") if isinstance(result.get("slots"), dict) else {}
+                status = "OK" if r.get("ok") is True else ("Failed" if r.get("ok") is False else "Completed")
+                _render_step_panel(
+                    ns_suffix=f"single-{idx}",
+                    step_index=step_index,
+                    agent=agent,
+                    operation=operation,
+                    status=status,
+                    inputs=inputs,
+                    step_meta=plan_step if isinstance(plan_step, dict) else {},
+                    result_meta=r,
+                )
+
+        if not rendered_structured:
+            st.caption("Structured step cards are not available for this trace; use the debug JSON below.")
 
         raw_ns = f"{trace_id}-{result.get('intent_key','na')}-{len(trace)}-raw"
         raw_key = f"trace_raw_open_{raw_ns}"
@@ -708,7 +832,7 @@ def main() -> None:
     _apply_runtime_env(settings)
     _render_header()
  
-    if not (os.getenv("GROQ_API_KEY") or "").strip():
+    if (not _uses_backend_api()) and not (os.getenv("GROQ_API_KEY") or "").strip():
         st.info("Set `GROQ_API_KEY` in `.env` to start chatting.")
         _render_messages()
         return

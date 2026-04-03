@@ -294,6 +294,59 @@ class GraphRouter:
         artifacts["trace"] = trace
         state["artifacts"] = artifacts
 
+    @staticmethod
+    def _mongo_projection_for_trace(projection: Dict[str, Any] | None) -> Dict[str, Any]:
+        """
+        Mirror adapter-side projection shaping so the trace shows the effective Mongo spec.
+        """
+        proj = dict(projection or {"_id": 0})
+        if proj.get("remarks") == 1:
+            proj["remarks"] = {"$slice": 5}
+        if proj.get("remarkList") == 1:
+            proj["remarkList"] = {"$slice": 5}
+        return proj
+
+    @staticmethod
+    def _trace_single_mongo_query(
+        state: GraphState,
+        *,
+        intent_key: str,
+        operation: str,
+        collection: str,
+        filt: Dict[str, Any],
+        projection: Dict[str, Any] | None,
+        rows: int | None,
+        summary: str,
+        limit: int | None = None,
+        sort: Any = None,
+        mongo_queries: list[Dict[str, Any]] | None = None,
+    ) -> None:
+        mongo_query = {
+            "collection": collection,
+            "filter": filt,
+            "projection": GraphRouter._mongo_projection_for_trace(projection),
+            "sort": sort,
+            "limit": limit,
+            "pipeline": None,
+        }
+        GraphRouter._trace(
+            state,
+            {
+                "phase": "single_step_result",
+                "intent_key": intent_key,
+                "agent": "mongo",
+                "operation": operation,
+                "ok": True,
+                "mode": "mongo_metadata",
+                "collection": collection,
+                "limit": limit,
+                "mongo_query": mongo_query,
+                "mongo_queries": mongo_queries,
+                "rows": rows,
+                "summary": summary,
+            },
+        )
+
     # =========================================================
     # Pattern Detection for Scenario Comparisons
     # =========================================================
@@ -589,6 +642,7 @@ class GraphRouter:
         words = [w for w in ul.split() if w]
         has_result_set = isinstance(session_ctx, dict) and isinstance(session_ctx.get("last_result_set"), dict)
         turn_type = self._classify_turn_type(session_ctx=session_ctx, user_input=user_input)
+        explicit_fresh_entity = self._looks_like_explicit_fresh_entity_request(user_input)
         explicit_rs_ref = any(
             p in ul
             for p in (
@@ -648,7 +702,7 @@ class GraphRouter:
             )
         )
 
-        if has_result_set and explicit_rs_ref and turn_type == "followup":
+        if has_result_set and explicit_rs_ref and turn_type == "followup" and not explicit_fresh_entity:
             # Explicitly referencing the prior list/result set.
             state["intent_key"] = "followup.result_set"
             state["slots"] = {"action": "compare_extremes"}
@@ -668,7 +722,7 @@ class GraphRouter:
         is_short_followup = len(words) <= 12
         starts_followup_verb = ul.startswith(("explain", "why", "what went wrong", "went wrong"))
         mentions_remarks = ("remark" in ul) or ("remarks" in ul)
-        if has_result_set and mentions_remarks and is_short_followup and starts_followup_verb and not starts_like_new_request and turn_type == "followup":
+        if has_result_set and mentions_remarks and is_short_followup and starts_followup_verb and not starts_like_new_request and turn_type == "followup" and not explicit_fresh_entity:
             _looks_fresh = any(
                 ul.startswith(p) for p in [
                     "is ", "for vessel", "how is", "show me", "which vessel",
@@ -694,9 +748,14 @@ class GraphRouter:
         # Extremes (highest/lowest) as a short follow-up prompt.
         if (
             has_result_set
-            and any(k in ul for k in ("highest", "lowest", "max", "min", "best", "worst"))
+            and any(k in ul for k in ("highest", "lowest", "max", "min", "best", "worst", "better", "higher", "lower"))
             and is_short_followup
-            and (not starts_like_new_request or any(k in ul for k in ("out of it", "out of them", "among these", "among them")))
+            and not explicit_fresh_entity
+            and (
+                not starts_like_new_request
+                or any(k in ul for k in ("out of it", "out of them", "among these", "among them"))
+                or ul.startswith(("which was", "what was"))
+            )
             and turn_type == "followup"
             and not any(ul.startswith(p) for p in [
                 "is ", "is stena", "is sonangol", "for vessel",
@@ -721,7 +780,13 @@ class GraphRouter:
         if has_result_set:
             op_slots = self._parse_result_set_followup_action(user_input=user_input, session_ctx=session_ctx)
             polite_followup = ul.startswith(("can u ", "can you ", "could you ", "please "))
-            if isinstance(op_slots, dict) and op_slots.get("action") and (turn_type == "followup" or polite_followup):
+            concise_followup_override = len(words) <= 8 and any(
+                k in ul for k in (
+                    "best", "worst", "highest", "lowest", "changed the most",
+                    "what about", "cargo grade", "grade", "remarks", "remark", "that one", "that voyage"
+                )
+            )
+            if isinstance(op_slots, dict) and op_slots.get("action") and not explicit_fresh_entity and (turn_type == "followup" or polite_followup or concise_followup_override):
                 state["intent_key"] = "followup.result_set"
                 state["slots"] = op_slots
                 artifacts = state.get("artifacts") or {}
@@ -899,13 +964,23 @@ class GraphRouter:
                 if key in _allowed:
                     cleaned_slots[key] = val
 
-            # Exception: if user explicitly says include/including a specific voyage,
-            # keep the voyage_number(s) so composite can resolve and force-include it.
-            if ("include" in user_input_lower or "including" in user_input_lower):
-                if "voyage_number" in extracted_slots:
-                    cleaned_slots["voyage_number"] = extracted_slots["voyage_number"]
-                if "voyage_numbers" in extracted_slots:
-                    cleaned_slots["voyage_numbers"] = extracted_slots["voyage_numbers"]
+            # Preserve explicit voyage anchors for scoped aggregate prompts such as
+            # "Which ports were visited on voyage 2306?" while still dropping
+            # hallucinated entity text for generic fleet-wide asks.
+            if "voyage_number" in extracted_slots:
+                cleaned_slots["voyage_number"] = extracted_slots["voyage_number"]
+            if "voyage_numbers" in extracted_slots:
+                cleaned_slots["voyage_numbers"] = extracted_slots["voyage_numbers"]
+            if "voyage_id" in extracted_slots:
+                cleaned_slots["voyage_id"] = extracted_slots["voyage_id"]
+
+            # Keep explicit vessel anchors only when the query text truly contains
+            # the candidate value (prevents false anchors like "is fastest on ballast").
+            vname = extracted_slots.get("vessel_name")
+            if isinstance(vname, str) and vname.strip() and vname.lower() in user_input_lower:
+                cleaned_slots["vessel_name"] = vname
+            if "imo" in extracted_slots and str(extracted_slots.get("imo") or "").strip():
+                cleaned_slots["imo"] = extracted_slots["imo"]
         else:
             # For specific entity queries, validate slots are mentioned in query
             for key, value in extracted_slots.items():
@@ -1000,12 +1075,39 @@ class GraphRouter:
         has_voyage_anchor = bool(slots.get("voyage_number") or slots.get("voyage_numbers") or slots.get("voyage_id"))
         has_vessel_anchor = bool(slots.get("vessel_name") or slots.get("imo"))
         has_port_anchor = bool(slots.get("port_name"))
+        is_fleet_port_aggregate = (
+            "all voyages" in ul
+            or "across all" in ul
+            or "fleet" in ul
+            or any(
+                p in ul
+                for p in (
+                    "most visited",
+                    "most commonly visited",
+                    "most common port",
+                    "most frequent port",
+                    "busiest port",
+                    "top port",
+                    "port frequency",
+                    "port count",
+                    "highest average",
+                    "average demurrage",
+                )
+            )
+        )
 
         # Port details intent ONLY when the user is asking about a port,
         # not when "ports" appears as an attribute of a voyage/vessel summary.
         # Safe because we only trigger it when there is no other entity anchor.
         port_topic = bool(re.search(r"\bport\b", ul))
-        if port_topic and wants_details and not has_port_anchor and not has_voyage_anchor and not has_vessel_anchor:
+        if (
+            port_topic
+            and wants_details
+            and not is_fleet_port_aggregate
+            and not has_port_anchor
+            and not has_voyage_anchor
+            and not has_vessel_anchor
+        ):
             return "port.details", slots
 
         # Vessel summary intent if user asks about "vessel/ship" without vessel_name/imo.
@@ -1226,6 +1328,149 @@ class GraphRouter:
         return False
 
     @staticmethod
+    def _looks_like_explicit_fresh_entity_request(user_input: str) -> bool:
+        """
+        Detect obviously fresh entity-anchored asks so they do not get swallowed by
+        result-set follow-up logic.
+        """
+        ui = (user_input or "").strip()
+        if not ui:
+            return False
+        ul = ui.lower()
+
+        if re.search(r"\b(?:for\s+)?voyage\s+\d{3,5}\b", ul):
+            return True
+        if re.search(r"\b(?:vessel|ship)\s+[a-z0-9][a-z0-9 .'\-]{1,60}\b", ul):
+            return True
+        if re.search(r"\bimo\s+\d{6,8}\b", ul):
+            return True
+
+        if re.match(r"^(is|how is)\s+(?!it\b|this\b|that\b|these\b|those\b|them\b|they\b)[a-z0-9][a-z0-9 .'\-]{3,}", ul):
+            return True
+
+        if (
+            re.match(r"^(which|what|show|list|give|tell|find|compare)\s+(?:voyage|voyages|vessel|vessels|port|ports)\b", ul)
+            and not any(p in ul for p in ("among these", "among them", "from above", "in that list", "in the list", "those voyages", "these voyages"))
+        ):
+            return True
+        if (
+            re.match(r"^(ports?\s+with|cargo grades?\s+with|cargo grades?\s+|ports?\s+appear|what are the top\s+\d+\s+cargo grades?)", ul)
+            and not any(p in ul for p in ("among these", "among them", "from above", "in that list", "in the list", "those voyages", "these voyages"))
+        ):
+            return True
+
+        # Proper-name style asks such as "Is Stena Superior ...".
+        proper_name_starts = (
+            "is ", "how is ", "tell me about ", "show ", "show me ", "give ", "what is ", "for "
+        )
+        if any(ul.startswith(p) for p in proper_name_starts):
+            name_match = re.search(r"\b([A-Z][a-zA-Z0-9&'\-]+(?:\s+[A-Z][a-zA-Z0-9&'\-]+){1,3})\b", ui)
+            if name_match and not re.search(r"\b(What|Which|Show|Give|Tell|Compare|For|Is|How)\b", name_match.group(1)):
+                return True
+
+        return False
+
+    @staticmethod
+    def _result_row_label(row: Dict[str, Any]) -> str:
+        if not isinstance(row, dict):
+            return "N/A"
+        for key in (
+            "voyage_number",
+            "vessel_name",
+            "module_type",
+            "port_name",
+            "cargo_grade",
+            "segment",
+            "entity_id",
+            "voyage_id",
+        ):
+            val = row.get(key)
+            if val not in (None, "", [], {}):
+                return str(val)
+        return "N/A"
+
+    @staticmethod
+    def _row_focus_slots(row: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(row, dict):
+            return {}
+        out: Dict[str, Any] = {}
+        for key in ("voyage_number", "voyage_id", "vessel_name", "vessel_imo", "imo", "port_name"):
+            val = row.get(key)
+            if val in (None, "", [], {}):
+                continue
+            if key == "vessel_imo":
+                out["imo"] = val
+            else:
+                out[key] = val
+        return out
+
+    @staticmethod
+    def _result_row_metric_value(row: Dict[str, Any], metric: str) -> float | None:
+        if not isinstance(row, dict):
+            return None
+
+        alias_map = {
+            "expense": "total_expense",
+            "cost": "total_expense",
+            "commission": "total_commission",
+            "profit": "pnl",
+            "loss": "pnl",
+            "avg_revenue": "avg_revenue",
+            "average_revenue": "avg_revenue",
+            "avg_pnl": "avg_pnl",
+            "average_pnl": "avg_pnl",
+            "voyage_count": "voyage_count",
+            "count": "voyage_count",
+            "ratio": "expense_to_revenue_ratio",
+            "expense_ratio": "expense_to_revenue_ratio",
+            "expense_to_revenue_ratio": "expense_to_revenue_ratio",
+        }
+        metric = alias_map.get(str(metric or "").strip().lower(), str(metric or "").strip().lower())
+
+        def _num(x: Any) -> float | None:
+            try:
+                if x is None:
+                    return None
+                if isinstance(x, (int, float)):
+                    return float(x)
+                return float(str(x).replace(",", "").strip())
+            except Exception:
+                return None
+
+        if metric == "expense_to_revenue_ratio":
+            exp = _num(row.get("expense_to_revenue_ratio"))
+            if exp is not None:
+                return exp
+            revenue = _num(row.get("revenue") if row.get("revenue") is not None else row.get("avg_revenue"))
+            total_expense = _num(
+                row.get("total_expense")
+                if row.get("total_expense") is not None
+                else row.get("avg_total_expense")
+            )
+            if revenue not in (None, 0) and total_expense is not None:
+                return float(total_expense) / float(revenue)
+            return None
+
+        if metric == "avg_pnl":
+            return _num(row.get("avg_pnl") if row.get("avg_pnl") is not None else row.get("pnl"))
+        if metric == "avg_revenue":
+            return _num(row.get("avg_revenue") if row.get("avg_revenue") is not None else row.get("revenue"))
+        if metric == "voyage_count":
+            return _num(
+                row.get("voyage_count")
+                if row.get("voyage_count") is not None
+                else (row.get("finance_voyage_count") if row.get("finance_voyage_count") is not None else row.get("ops_voyage_count"))
+            )
+        if metric == "variance":
+            for key in ("variance_diff", "pnl_variance", "tce_variance"):
+                val = _num(row.get(key))
+                if val is not None:
+                    return abs(val)
+            return None
+
+        return _num(row.get(metric))
+
+    @staticmethod
     def _classify_turn_type(*, session_ctx: Dict[str, Any], user_input: str) -> str:
         """
         Classify the incoming message as:
@@ -1260,6 +1505,9 @@ class GraphRouter:
         if explicit_rs_ref:
             return "followup"
 
+        if GraphRouter._looks_like_explicit_fresh_entity_request(ui):
+            return "new_question"
+
         # Detect explicit entity family mention in this turn.
         mentions_vessel = bool(re.search(r"\b(vessel|ship|imo)\b", ul))
         mentions_voyage = bool(re.search(r"\b(voyage|voyages)\b", ul))
@@ -1284,11 +1532,18 @@ class GraphRouter:
         has_result_set = isinstance(session_ctx, dict) and isinstance(session_ctx.get("last_result_set"), dict)
         if not isinstance(sess_slots, dict):
             sess_slots = {}
+        rs_rows = []
+        if has_result_set:
+            rs = session_ctx.get("last_result_set") if isinstance(session_ctx, dict) else {}
+            if isinstance(rs, dict) and isinstance(rs.get("rows"), list):
+                rs_rows = rs.get("rows") or []
 
         session_family = None
         if last_intent.startswith("voyage."):
             session_family = "voyage"
         elif last_intent.startswith("vessel."):
+            session_family = "vessel"
+        elif last_intent in ("ranking.vessels", "ranking.vessel_metadata"):
             session_family = "vessel"
         elif last_intent.startswith("ops.port_") or last_intent.startswith("port."):
             session_family = "port"
@@ -1298,6 +1553,13 @@ class GraphRouter:
             session_family = "voyage"
         elif sess_slots.get("port_name"):
             session_family = "port"
+        elif rs_rows:
+            first_row = rs_rows[0] if isinstance(rs_rows[0], dict) else {}
+            if isinstance(first_row, dict):
+                if first_row.get("voyage_number") not in (None, "", [], {}) or first_row.get("voyage_id") not in (None, "", [], {}):
+                    session_family = "voyage"
+                elif first_row.get("vessel_name") not in (None, "", [], {}) or first_row.get("imo") not in (None, "", [], {}) or first_row.get("vessel_imo") not in (None, "", [], {}):
+                    session_family = "vessel"
 
         # Topic switch guardrail between voyage/vessel families.
         # Port mentions can still be contextual follow-ups on a voyage/vessel thread.
@@ -1331,7 +1593,7 @@ class GraphRouter:
             return "followup"
 
         # If we already have a result set, allow concise refinement operations as follow-ups.
-        if has_result_set and len(words) <= 10 and any(k in ul for k in ("top", "bottom", "highest", "lowest", "best", "worst", "only", "just")):
+        if has_result_set and len(words) <= 10 and any(k in ul for k in ("top", "bottom", "highest", "lowest", "best", "worst", "better", "higher", "lower", "only", "just")):
             return "followup"
 
         # Generic operation asks over an existing result set should remain follow-ups
@@ -1383,9 +1645,43 @@ class GraphRouter:
 
         def _has_field(field: str) -> bool:
             for r in rows[:20]:
+                if isinstance(r, dict) and GraphRouter._result_row_metric_value(r, field) is not None:
+                    return True
                 if isinstance(r, dict) and r.get(field) not in (None, "", [], {}):
                     return True
             return False
+
+        if (
+            any(p in ul for p in ("that one", "this one", "that voyage", "this voyage", "that vessel", "this vessel", "top one", "first one", "bottom one", "last one"))
+            and any(k in ul for k in ("remark", "remarks", "cargo grade", "cargo grades", "key ports", "ports"))
+        ):
+            selector = "last_focus"
+            if any(p in ul for p in ("top one", "first one", "top result", "first result")):
+                selector = "first"
+            elif any(p in ul for p in ("bottom one", "last one", "last result", "lowest one", "worst one")):
+                selector = "last"
+            field = "remarks"
+            if "cargo" in ul and "grade" in ul:
+                field = "cargo_grades"
+            elif "port" in ul:
+                field = "key_ports"
+            return {"action": "project_selected_field", "field": field, "selector": selector}
+
+        if (
+            len(ul.split()) <= 6
+            and any(k in ul for k in ("remark", "remarks", "cargo grade", "cargo grades", "grade", "key ports", "ports"))
+            and any(k in ul for k in ("what about", "and ", "just", "only", "what ", "show "))
+            and not any(k in ul for k in ("for each", "of each", "every", "all ", "these", "them"))
+        ):
+            field = "remarks"
+            if "cargo" in ul or "grade" in ul:
+                field = "cargo_grades"
+            elif "port" in ul:
+                field = "key_ports"
+            return {"action": "project_selected_field", "field": field, "selector": "last_focus"}
+
+        if ("remarks" in ul or "remark" in ul) and any(p in ul for p in ("had remarks", "have remarks", "with remarks", "has remarks")):
+            return {"action": "filter_has_field", "field": "remarks"}
 
         # Per-row remarks projection ("remarks of each", "show/list/give remarks ...").
         if (
@@ -1421,15 +1717,27 @@ class GraphRouter:
             "pnl": "pnl",
             "tce": "tce",
             "revenue": "revenue",
+            "avg revenue": "avg_revenue",
+            "average revenue": "avg_revenue",
+            "avg pnl": "avg_pnl",
+            "average pnl": "avg_pnl",
             "expense": "total_expense",
             "cost": "total_expense",
+            "expense ratio": "expense_to_revenue_ratio",
+            "expense-to-revenue ratio": "expense_to_revenue_ratio",
+            "expense to revenue ratio": "expense_to_revenue_ratio",
             "commission": "total_commission",
             "offhire": "offhire_days",
             "off hire": "offhire_days",
             "offhire days": "offhire_days",
+            "voyage count": "voyage_count",
+            "count": "voyage_count",
+            "variance": "variance",
+            "pnl variance": "pnl_variance",
+            "tce variance": "tce_variance",
         }
         mth = re.search(
-            r"\b(pnl|tce|revenue|expense|cost|commission|off\s*hire|offhire(?:\s*days?)?)\b[^\n]*?(>=|<=|>|<|=)\s*(-?\d+(?:\.\d+)?)",
+            r"\b(pnl|tce|revenue|avg\s+revenue|average\s+revenue|avg\s+pnl|average\s+pnl|expense(?:\s*to\s*revenue\s*ratio)?|cost|commission|voyage\s+count|count|variance|pnl\s+variance|tce\s+variance|off\s*hire|offhire(?:\s*days?)?)\b[^\n]*?(>=|<=|>|<|=)\s*(-?\d+(?:\.\d+)?)",
             ul,
         )
         if mth:
@@ -1437,7 +1745,7 @@ class GraphRouter:
             metric = metric_alias.get(raw_metric, metric_alias.get(raw_metric.replace("  ", " "), raw_metric))
             return {"action": "filter_by_metric_threshold", "metric": metric, "operator": mth.group(2), "value": float(mth.group(3))}
         mth_words = re.search(
-            r"\b(pnl|tce|revenue|expense|cost|commission|off\s*hire|offhire(?:\s*days?)?)\b[^\n]*?\b(above|over|greater than|below|under|less than)\b\s*(-?\d+(?:\.\d+)?)",
+            r"\b(pnl|tce|revenue|avg\s+revenue|average\s+revenue|avg\s+pnl|average\s+pnl|expense(?:\s*to\s*revenue\s*ratio)?|cost|commission|voyage\s+count|count|variance|pnl\s+variance|tce\s+variance|off\s*hire|offhire(?:\s*days?)?)\b[^\n]*?\b(above|over|greater than|below|under|less than)\b\s*(-?\d+(?:\.\d+)?)",
             ul,
         )
         if mth_words:
@@ -1446,6 +1754,10 @@ class GraphRouter:
             op_word = str(mth_words.group(2) or "").strip()
             operator = ">" if op_word in ("above", "over", "greater than") else "<"
             return {"action": "filter_by_metric_threshold", "metric": metric, "operator": operator, "value": float(mth_words.group(3))}
+
+        if "changed the most" in ul:
+            metric = "pnl_variance" if _has_field("pnl_variance") else "variance"
+            return {"action": "compare_extremes", "metric": metric}
 
         # Top/bottom-N refinement.
         n = None
@@ -1469,6 +1781,13 @@ class GraphRouter:
             # Infer metric in a generic way from user wording + available fields.
             metric = None
             metric_hints = (
+                ("expense_to_revenue_ratio", ("expense ratio", "expense-to-revenue ratio", "expense to revenue ratio")),
+                ("pnl_variance", ("pnl variance",)),
+                ("tce_variance", ("tce variance",)),
+                ("variance", ("variance", "changed the most")),
+                ("voyage_count", ("voyage count", "count")),
+                ("avg_revenue", ("avg revenue", "average revenue")),
+                ("avg_pnl", ("avg pnl", "average pnl")),
                 ("offhire_days", ("offhire", "off hire")),
                 ("port_calls", ("port calls", "most called", "least called", "called voyages")),
                 ("total_commission", ("commission",)),
@@ -1485,14 +1804,22 @@ class GraphRouter:
                 preferred = str(rs_meta.get("primary_metric") or "").strip().lower()
                 if preferred and _has_field(preferred):
                     metric = preferred
+                elif _has_field("expense_to_revenue_ratio"):
+                    metric = "expense_to_revenue_ratio"
                 elif _has_field("offhire_days"):
                     metric = "offhire_days"
                 elif _has_field("port_calls"):
                     metric = "port_calls"
+                elif _has_field("avg_pnl"):
+                    metric = "avg_pnl"
                 elif _has_field("pnl"):
                     metric = "pnl"
+                elif _has_field("avg_revenue"):
+                    metric = "avg_revenue"
                 elif _has_field("revenue"):
                     metric = "revenue"
+                elif _has_field("voyage_count"):
+                    metric = "voyage_count"
                 elif _has_field("total_commission"):
                     metric = "total_commission"
                 else:
@@ -1500,6 +1827,26 @@ class GraphRouter:
 
             action = "bottom_n" if any(k in ul for k in ("bottom", "lowest", "least", "worst")) else "top_n"
             return {"action": action, "n": max(1, min(int(n), 20)), "metric": metric}
+
+        if any(k in ul for k in ("higher", "lower", "better", "worse", "best", "worst", "changed the most")):
+            metric = "pnl"
+            if "expense ratio" in ul or "expense-to-revenue ratio" in ul or "expense to revenue ratio" in ul:
+                metric = "expense_to_revenue_ratio"
+            elif "avg revenue" in ul or "average revenue" in ul:
+                metric = "avg_revenue"
+            elif "avg pnl" in ul or "average pnl" in ul:
+                metric = "avg_pnl"
+            elif "voyage count" in ul or re.search(r"\bcount\b", ul):
+                metric = "voyage_count"
+            elif "pnl variance" in ul or "changed the most" in ul:
+                metric = "pnl_variance" if _has_field("pnl_variance") else "variance"
+            elif "tce variance" in ul:
+                metric = "tce_variance"
+            elif "revenue" in ul:
+                metric = "revenue"
+            elif "expense" in ul or "cost" in ul:
+                metric = "total_expense"
+            return {"action": "compare_extremes", "metric": metric}
 
         return None
 
@@ -1562,6 +1909,31 @@ class GraphRouter:
         if isinstance(session_ctx, dict):
             # Prefer filtered persisted memory slots if present
             sess_slots = session_ctx.get("memory_slots") or session_ctx.get("slots") or {}
+            focus_slots = session_ctx.get("last_focus_slots") or {}
+            if isinstance(focus_slots, dict) and focus_slots:
+                if any(w in ul.split() for w in ("it", "this", "that", "these", "those", "them", "they")) or any(k in ul for k in ("remark", "remarks", "ports", "grade", "grades")):
+                    merged_focus = dict(sess_slots) if isinstance(sess_slots, dict) else {}
+                    merged_focus.update({k: v for k, v in focus_slots.items() if v not in (None, "", [], {})})
+                    sess_slots = merged_focus
+            if (not isinstance(sess_slots, dict) or not sess_slots or not any(sess_slots.get(k) for k in ("voyage_number", "voyage_id", "vessel_name", "imo", "port_name"))):
+                prev_q = str(session_ctx.get("last_user_input") or "").strip()
+                recovered: Dict[str, Any] = {}
+                if prev_q:
+                    m_voy = re.search(r"\bvoyage\s+(\d{3,5})\b", prev_q, flags=re.IGNORECASE)
+                    if m_voy:
+                        try:
+                            recovered["voyage_number"] = int(m_voy.group(1))
+                        except Exception:
+                            pass
+                    m_vessel = re.search(r"\b(?:vessel|ship)\s+([A-Za-z][A-Za-z0-9 .'\-]{1,60})\b", prev_q, flags=re.IGNORECASE)
+                    if m_vessel:
+                        cand = str(m_vessel.group(1) or "").strip().rstrip("?.!,")
+                        if cand:
+                            recovered["vessel_name"] = cand
+                    if recovered:
+                        merged_prev = dict(sess_slots) if isinstance(sess_slots, dict) else {}
+                        merged_prev.update(recovered)
+                        sess_slots = merged_prev
         if not isinstance(sess_slots, dict) or not sess_slots:
             return intent_key, slots, False
 
@@ -1595,7 +1967,11 @@ class GraphRouter:
             "any remarks",
             "remarks",
             "ports",
+            "port",
             "grades",
+            "grade",
+            "cargo grade",
+            "cargo grades",
             "expenses",
             "revenue",
             "pnl",
@@ -1617,6 +1993,11 @@ class GraphRouter:
             "loss-making", "loss making", "losing",
         ))
 
+        wants_entity_scope = (
+            has_coref
+            or any(k in ul for k in ("remarks", "remark", "ports", "port", "grades", "grade", "cargo grade", "cargo grades", "revenue", "expense", "expenses", "pnl", "profit", "tce", "commission"))
+        ) and not rankingish
+
         # If this is clearly a ranking question (and not a coreference like "this voyage"),
         # do NOT inject entity anchors. Ranking questions should be independent.
         if rankingish and not has_coref:
@@ -1635,6 +2016,7 @@ class GraphRouter:
         # These should run based on current query + param memory only.
         if (
             ((intent_key or "").startswith("ranking.") or (intent_key or "").startswith("analysis.") or (intent_key or "").startswith("ops."))
+            and not wants_entity_scope
             and (not has_coref or rankingish)
         ):
             return intent_key, slots, False
@@ -1650,11 +2032,6 @@ class GraphRouter:
         # If this looks like an entity-scoped follow-up, prefer staying in entity summary mode.
         # This prevents aggregate intents (aggregation.total, etc.) from dropping the injected anchors
         # during the slot-cleaning stage.
-        wants_entity_scope = (
-            has_coref
-            or any(k in ul for k in ("remarks", "remark", "ports", "grades", "revenue", "expense", "expenses", "pnl", "profit", "tce", "commission"))
-        ) and not rankingish
-
         if sess_slots.get("voyage_number") or sess_slots.get("voyage_id"):
             vn = sess_slots.get("voyage_number")
             vid = sess_slots.get("voyage_id")
@@ -1779,8 +2156,11 @@ class GraphRouter:
         )
         wants_route_like = ("route" in ul) or ("in the route" in ul) or ("visited" in ul) or ("called at" in ul) or ("calls at" in ul)
         wants_grades_or_remarks = any(k in ul for k in ("cargo grade", "cargo grades", "grades", "remarks", "remark", "offhire", "delay", "delayed"))
+        wants_metric_ranking = any(k in ul for k in (" rank ", "rank by", "top ", "highest", "lowest", "pnl", "revenue", "profit"))
 
         if port and wants_voyage_filter and wants_grades_or_remarks:
+            if wants_metric_ranking:
+                return intent_key, slots
             # Do NOT treat metric/finance phrases as port names (e.g. "delayed voyages with negative PnL" → stay loss_due_to_delay)
             pn = str(port).lower()
             if "pnl" in pn or "revenue" in pn or "expense" in pn or ("negative" in pn and "port" not in pn):
@@ -2244,20 +2624,105 @@ class GraphRouter:
                     prev_meta = (rs or {}).get("meta") if isinstance(rs, dict) and isinstance((rs or {}).get("meta"), dict) else {}
                     meta = dict(prev_meta)
                     if primary_metric:
+                        latest_source_intent = (rs or {}).get("source_intent") if isinstance(rs, dict) else None
+                        latest_rs = {
+                            "source_intent": latest_source_intent,
+                            "rows": new_rows[:50],
+                            "meta": meta,
+                        }
                         meta["primary_metric"] = primary_metric
+                    else:
+                        latest_source_intent = (rs or {}).get("source_intent") if isinstance(rs, dict) else None
+                        latest_rs = {
+                            "source_intent": latest_source_intent,
+                            "rows": new_rows[:50],
+                            "meta": meta,
+                        }
                     self.redis.save_session(
                         state["session_id"],
                         {
                             **(session_context or {}),
-                            "last_result_set": {
-                                "source_intent": (rs or {}).get("source_intent") if isinstance(rs, dict) else None,
-                                "rows": new_rows[:50],
-                                "meta": meta,
-                            },
+                            "last_result_set": latest_rs,
+                            "last_user_input": user_input,
                         },
                     )
+                    sctx = state.get("session_ctx") if isinstance(state.get("session_ctx"), dict) else {}
+                    state["session_ctx"] = {**(sctx or {}), "last_result_set": latest_rs, "last_user_input": user_input}
                 except Exception:
                     pass
+
+            def _persist_focus(row: dict | None) -> None:
+                if not isinstance(row, dict):
+                    return
+                focus_slots = self._row_focus_slots(row)
+                if not focus_slots:
+                    return
+                try:
+                    self.redis.save_session(
+                        state["session_id"],
+                        {
+                            **(session_context or {}),
+                            "last_focus_slots": focus_slots,
+                            "last_user_input": user_input,
+                        },
+                    )
+                    sctx = state.get("session_ctx") if isinstance(state.get("session_ctx"), dict) else {}
+                    state["session_ctx"] = {**(sctx or {}), "last_focus_slots": focus_slots, "last_user_input": user_input}
+                except Exception:
+                    pass
+
+            def _selected_row(selector: str | None = None) -> dict | None:
+                selector = str(selector or "").strip().lower()
+                if selector == "first":
+                    return rows[0] if rows else None
+                if selector == "last":
+                    return rows[-1] if rows else None
+                focus_slots = (session_context or {}).get("last_focus_slots") if isinstance(session_context, dict) else None
+                if isinstance(focus_slots, dict) and focus_slots:
+                    for r in rows:
+                        if not isinstance(r, dict):
+                            continue
+                        if focus_slots.get("voyage_number") and str(r.get("voyage_number")) == str(focus_slots.get("voyage_number")):
+                            return r
+                        if focus_slots.get("voyage_id") and str(r.get("voyage_id")) == str(focus_slots.get("voyage_id")):
+                            return r
+                        if focus_slots.get("vessel_name") and str(r.get("vessel_name")) == str(focus_slots.get("vessel_name")):
+                            return r
+                        if focus_slots.get("port_name") and str(r.get("port_name")) == str(focus_slots.get("port_name")):
+                            return r
+                prev_q = str((session_context or {}).get("last_user_input") or "").strip().lower()
+                if prev_q and rows:
+                    metric = "pnl"
+                    if "expense ratio" in prev_q or "expense-to-revenue ratio" in prev_q or "expense to revenue ratio" in prev_q:
+                        metric = "expense_to_revenue_ratio"
+                    elif "avg revenue" in prev_q or "average revenue" in prev_q:
+                        metric = "avg_revenue"
+                    elif "avg pnl" in prev_q or "average pnl" in prev_q:
+                        metric = "avg_pnl"
+                    elif "voyage count" in prev_q or re.search(r"\bcount\b", prev_q):
+                        metric = "voyage_count"
+                    elif "pnl variance" in prev_q or "changed the most" in prev_q:
+                        metric = "pnl_variance" if any(self._result_row_metric_value(r, "pnl_variance") is not None for r in rows if isinstance(r, dict)) else "variance"
+                    elif "tce variance" in prev_q:
+                        metric = "tce_variance"
+                    elif "revenue" in prev_q:
+                        metric = "revenue"
+                    elif "expense" in prev_q or "cost" in prev_q:
+                        metric = "total_expense"
+                    scored = []
+                    for r in rows:
+                        if not isinstance(r, dict):
+                            continue
+                        val = self._result_row_metric_value(r, metric)
+                        if val is None:
+                            continue
+                        scored.append((val, r))
+                    if scored:
+                        if any(k in prev_q for k in ("worst", "lowest", "least", "bottom")):
+                            return min(scored, key=lambda t: t[0])[1]
+                        if any(k in prev_q for k in ("best", "highest", "most", "top")):
+                            return max(scored, key=lambda t: t[0])[1]
+                return rows[0] if rows else None
 
             # Generic refinements: top/bottom N by a metric
             if action in ("top_n", "bottom_n"):
@@ -2272,11 +2737,10 @@ class GraphRouter:
                 for r in rows:
                     if not isinstance(r, dict):
                         continue
-                    vnum = r.get("voyage_number")
-                    if vnum in (None, ""):
+                    label = self._result_row_label(r)
+                    if label in (None, "", "N/A"):
                         continue
-                    val = _num(r.get(metric))
-                    # Derive port_calls if needed.
+                    val = self._result_row_metric_value(r, metric)
                     if val is None and metric == "port_calls":
                         ports = _extract_ports(r.get("key_ports"))
                         val = float(len(ports)) if ports else None
@@ -2294,11 +2758,12 @@ class GraphRouter:
 
                 lines = [f"### {'Top' if action == 'top_n' else 'Bottom'} {len(picked)} by {metric} (from previous results)"]
                 for i, r in enumerate(picked, start=1):
-                    v = _num(r.get(metric))
+                    v = self._result_row_metric_value(r, metric)
                     if v is None and metric == "port_calls":
                         v = float(len(_extract_ports(r.get("key_ports"))))
-                    label = r.get("voyage_number") or r.get("entity_id") or "N/A"
+                    label = self._result_row_label(r)
                     lines.append(f"- {i}. **{label}**: {v:,.2f}" if isinstance(v, float) else f"- {i}. **{label}**")
+                _persist_focus(picked[0] if picked else None)
                 state["answer"] = "\n".join(lines)
                 return state
 
@@ -2316,6 +2781,55 @@ class GraphRouter:
                     txt = str(rem).strip() if rem not in (None, "", [], {}) else "No remarks recorded."
                     lines.append(f"- **Voyage {vnum}**: {txt}")
                 state["answer"] = "\n".join(lines)
+                return state
+
+            if action == "filter_has_field":
+                field = str(slots.get("field") or "").strip()
+                filtered = [r for r in rows if isinstance(r, dict) and r.get(field) not in (None, "", [], {})]
+                if not filtered:
+                    state["answer"] = f"No rows in the previous result set had **{field}** populated."
+                    return state
+                _persist_result_set(filtered)
+                _persist_focus(filtered[0])
+                lines = [f"### Rows with {field.replace('_', ' ')} (from previous results)"]
+                for r in filtered[:20]:
+                    label = self._result_row_label(r)
+                    val = r.get(field)
+                    preview = str(val).strip() if val not in (None, "", [], {}) else "Not available"
+                    lines.append(f"- **{label}**: {preview}")
+                state["answer"] = "\n".join(lines)
+                return state
+
+            if action == "project_selected_field":
+                field = str(slots.get("field") or "").strip()
+                chosen = _selected_row(str(slots.get("selector") or "last_focus"))
+                if not isinstance(chosen, dict):
+                    state["answer"] = "I couldn’t identify which row you meant from the previous result set."
+                    return state
+                _persist_focus(chosen)
+                label = self._result_row_label(chosen)
+                if field == "remarks":
+                    rem = chosen.get("remarks")
+                    state["answer"] = (
+                        f"### Remarks for {label}\n"
+                        + (str(rem).strip() if rem not in (None, "", [], {}) else "No remarks were available in the previous result set.")
+                    )
+                    return state
+                if field == "cargo_grades":
+                    grades = _extract_grades(chosen.get("cargo_grades"))
+                    state["answer"] = (
+                        f"### Cargo grades for {label}\n"
+                        + (", ".join(grades[:20]) if grades else "No cargo grades were available in the previous result set.")
+                    )
+                    return state
+                if field == "key_ports":
+                    ports = _extract_ports(chosen.get("key_ports"))
+                    state["answer"] = (
+                        f"### Key ports for {label}\n"
+                        + (", ".join(ports[:20]) if ports else "No key ports were available in the previous result set.")
+                    )
+                    return state
+                state["answer"] = f"I couldn’t project **{field}** from the previous result set."
                 return state
 
             # Per-row ports projection from current result set.
@@ -2408,7 +2922,7 @@ class GraphRouter:
                 for r in rows:
                     if not isinstance(r, dict):
                         continue
-                    v = _num(r.get(metric))
+                    v = self._result_row_metric_value(r, metric)
                     if v is None:
                         continue
                     if _passes(v):
@@ -2421,45 +2935,72 @@ class GraphRouter:
                 _persist_result_set(filtered, primary_metric=metric)
                 lines = [f"### Filtered results ({metric} {operator} {threshold:g}) from previous results"]
                 for r in filtered[:20]:
-                    vnum = r.get("voyage_number") or r.get("entity_id") or "N/A"
-                    v = _num(r.get(metric))
-                    lines.append(f"- **{vnum}**: {metric}={v:,.2f}" if isinstance(v, float) else f"- **{vnum}**")
+                    label = self._result_row_label(r)
+                    v = self._result_row_metric_value(r, metric)
+                    lines.append(f"- **{label}**: {metric}={v:,.2f}" if isinstance(v, float) else f"- **{label}**")
                 if len(filtered) > 20:
                     lines.append(f"- ... and {len(filtered) - 20} more rows")
+                _persist_focus(filtered[0] if filtered else None)
                 state["answer"] = "\n".join(lines)
                 return state
 
             # If user asks for extremes (highest/lowest) among the last list.
             if action == "compare_extremes" or any(k in ul for k in ("highest", "lowest", "max", "min", "best", "worst")):
-                metric = "pnl"
-                if "revenue" in ul:
-                    metric = "revenue"
-                if "expense" in ul or "cost" in ul:
-                    metric = "total_expense"
-                if "tce" in ul:
-                    metric = "tce"
-                if "commission" in ul:
-                    metric = "total_commission"
+                metric = str(slots.get("metric") or "pnl").strip().lower()
+                if not metric or metric == "pnl":
+                    if "expense ratio" in ul or "expense-to-revenue ratio" in ul or "expense to revenue ratio" in ul:
+                        metric = "expense_to_revenue_ratio"
+                    elif "avg revenue" in ul or "average revenue" in ul:
+                        metric = "avg_revenue"
+                    elif "avg pnl" in ul or "average pnl" in ul:
+                        metric = "avg_pnl"
+                    elif "voyage count" in ul or re.search(r"\bcount\b", ul):
+                        metric = "voyage_count"
+                    elif "pnl variance" in ul or "changed the most" in ul:
+                        metric = "pnl_variance" if any(self._result_row_metric_value(r, "pnl_variance") is not None for r in rows if isinstance(r, dict)) else "variance"
+                    elif "tce variance" in ul:
+                        metric = "tce_variance"
+                    elif "revenue" in ul:
+                        metric = "revenue"
+                    elif "expense" in ul or "cost" in ul:
+                        metric = "total_expense"
+                    elif "tce" in ul:
+                        metric = "tce"
+                    elif "commission" in ul:
+                        metric = "total_commission"
 
                 scored = []
                 for r in rows:
                     if not isinstance(r, dict):
                         continue
-                    vnum = r.get("voyage_number")
-                    val = _num(r.get(metric))
-                    if vnum is None or val is None:
+                    label = self._result_row_label(r)
+                    val = self._result_row_metric_value(r, metric)
+                    if label in (None, "", "N/A") or val is None:
                         continue
-                    scored.append((val, vnum, r))
+                    scored.append((val, label, r))
                 if not scored:
                     state["answer"] = "I don’t have a previous result set to compare. Please run the list query again."
                     return state
                 lo = min(scored, key=lambda t: t[0])
                 hi = max(scored, key=lambda t: t[0])
-                state["answer"] = (
-                    "### Among the previous results\n"
-                    f"- **Highest {metric.upper()}**: Voyage **{hi[1]}** ({hi[0]:,.2f})\n"
-                    f"- **Lowest {metric.upper()}**: Voyage **{lo[1]}** ({lo[0]:,.2f})"
-                )
+                asks_high = any(k in ul for k in ("highest", "max", "best", "most", "better", "higher", "changed the most"))
+                asks_low = any(k in ul for k in ("lowest", "min", "worst", "least", "lower"))
+                if asks_high and not asks_low:
+                    _persist_result_set([hi[2]], primary_metric=metric)
+                    _persist_focus(hi[2])
+                    state["answer"] = f"The highest **{metric}** in the previous results was **{hi[1]}** at **{hi[0]:,.2f}**."
+                elif asks_low and not asks_high:
+                    _persist_result_set([lo[2]], primary_metric=metric)
+                    _persist_focus(lo[2])
+                    state["answer"] = f"The lowest **{metric}** in the previous results was **{lo[1]}** at **{lo[0]:,.2f}**."
+                else:
+                    _persist_result_set(rows, primary_metric=metric)
+                    _persist_focus(hi[2])
+                    state["answer"] = (
+                        "### Among the previous results\n"
+                        f"- **Highest {metric.upper()}**: **{hi[1]}** ({hi[0]:,.2f})\n"
+                        f"- **Lowest {metric.upper()}**: **{lo[1]}** ({lo[0]:,.2f})"
+                    )
                 return state
 
             # Explain remarks: require a voyage selection from the last result set.
@@ -2509,6 +3050,7 @@ class GraphRouter:
                         chosen = r
                         break
                 rem = (chosen or {}).get("remarks") if isinstance(chosen, dict) else None
+                _persist_focus(chosen if isinstance(chosen, dict) else None)
                 state["answer"] = (
                     f"### Remarks for voyage {vnum}\\n"
                     + (str(rem).strip() if rem not in (None, "", [], {}) else "No remarks were available in the previous result set.")
@@ -2572,11 +3114,20 @@ class GraphRouter:
             finance_safe = _json_safe(finance_data)
             finance_rows = finance_safe.get("rows") if isinstance(finance_safe, dict) else []
             finance_rows = finance_rows if isinstance(finance_rows, list) else []
+            finance_query_key = finance_safe.get("query_key") if isinstance(finance_safe, dict) else None
+            finance_sql = None
+            if finance_query_key in SQL_REGISTRY:
+                finance_sql = SQL_REGISTRY[finance_query_key].sql
             self._trace(state, {
                 "phase": "multi_step_result",
                 "step_index": 1,
                 "intent_key": "voyage.summary",
                 "agent": "finance",
+                "mode": finance_safe.get("mode") if isinstance(finance_safe, dict) else None,
+                "query_key": finance_query_key,
+                "params": finance_safe.get("params") if isinstance(finance_safe, dict) else None,
+                "sql_present": bool(finance_sql),
+                "sql": finance_sql,
                 "rows": len(finance_rows),
                 "ok": True,
             })
@@ -2606,7 +3157,9 @@ class GraphRouter:
                 "startDateUtc": 1,
             }
             doc = None
+            mongo_filter = None
             if slots.get("voyage_id") not in (None, ""):
+                mongo_filter = {"voyageId": str(slots.get("voyage_id"))}
                 try:
                     doc = self.mongo_agent.adapter.fetch_voyage(str(slots.get("voyage_id")), projection=projection)
                 except Exception:
@@ -2615,6 +3168,7 @@ class GraphRouter:
                 try:
                     vnum = slots.get("voyage_number")
                     if vnum not in (None, ""):
+                        mongo_filter = {"voyageNumber": str(int(vnum))}
                         doc = self.mongo_agent.adapter.get_voyage_by_number(int(vnum), projection=projection)
                 except Exception:
                     doc = None
@@ -2625,6 +3179,16 @@ class GraphRouter:
                 "step_index": 2,
                 "intent_key": "voyage.metadata",
                 "agent": "mongo",
+                "mode": "mongo_metadata",
+                "collection": "voyages",
+                "mongo_query": {
+                    "collection": "voyages",
+                    "filter": mongo_filter or {},
+                    "projection": self._mongo_projection_for_trace(projection),
+                    "sort": None,
+                    "limit": 1,
+                    "pipeline": None,
+                },
                 "rows": 1 if doc else 0,
                 "ok": True,
             })
@@ -3068,6 +3632,42 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
             
             # Save session immediately
             persisted_slots = self._build_persisted_slots(base=(session_context.get("slots") or {}), updates=slots)
+            fin_rows_now = finance_safe.get("rows") if isinstance(finance_safe, dict) else []
+            ops_rows_now = ops_safe.get("rows") if isinstance(ops_safe, dict) else []
+            fin_row = fin_rows_now[0] if isinstance(fin_rows_now, list) and fin_rows_now and isinstance(fin_rows_now[0], dict) else {}
+            ops_row = ops_rows_now[0] if isinstance(ops_rows_now, list) and ops_rows_now and isinstance(ops_rows_now[0], dict) else {}
+            mongo_row = (mongo_llm_like.get("rows") or [None])[0] if isinstance(mongo_llm_like, dict) else None
+            remarks_val = []
+            if isinstance(mongo_row, dict):
+                remarks_val = mongo_row.get("remarks") or []
+            remarks_text = None
+            if isinstance(remarks_val, list):
+                remarks_text = " | ".join([str(x).strip() for x in remarks_val[:4] if x not in (None, "", [], {})]) or None
+            elif remarks_val not in (None, "", [], {}):
+                remarks_text = str(remarks_val).strip()
+            single_result_row = {
+                "voyage_id": mongo_safe.get("voyage_id") or slots.get("voyage_id") or fin_row.get("voyage_id") or ops_row.get("voyage_id"),
+                "voyage_number": mongo_safe.get("voyage_number") or slots.get("voyage_number") or fin_row.get("voyage_number") or ops_row.get("voyage_number"),
+                "vessel_name": mongo_safe.get("vessel_name") or slots.get("vessel_name") or fin_row.get("vessel_name") or ops_row.get("vessel_name"),
+                "vessel_imo": mongo_safe.get("vessel_imo") or slots.get("imo") or slots.get("vessel_imo") or fin_row.get("vessel_imo") or ops_row.get("vessel_imo") or ops_row.get("imo"),
+                "pnl": fin_row.get("pnl"),
+                "revenue": fin_row.get("revenue"),
+                "total_expense": fin_row.get("total_expense"),
+                "tce": fin_row.get("tce"),
+                "total_commission": fin_row.get("total_commission"),
+                "offhire_days": ops_row.get("offhire_days"),
+                "delay_reason": ops_row.get("delay_reason") or ops_row.get("delay_reasons"),
+                "key_ports": ops_row.get("key_ports") or ops_row.get("ports") or ops_row.get("ports_json"),
+                "cargo_grades": ops_row.get("cargo_grades") or fin_row.get("cargo_grades"),
+                "port_calls": ops_row.get("port_calls") or fin_row.get("port_calls") or fin_row.get("port_count"),
+                "remarks": remarks_text,
+            }
+            single_result_row = {k: v for k, v in single_result_row.items() if v not in (None, "", [], {})}
+            single_result_set = {
+                "source_intent": intent_key,
+                "rows": [single_result_row] if single_result_row else [],
+                "meta": {"source_intent": intent_key, "available_metrics": [m for m in ("pnl", "revenue", "total_expense", "tce", "offhire_days", "port_calls") if single_result_row.get(m) not in (None, "", [], {})], "primary_metric": "pnl" if single_result_row.get("pnl") not in (None, "", [], {}) else None},
+            }
             self.redis.save_session(
                 state["session_id"],
                 {
@@ -3076,9 +3676,414 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                     "memory_slots": self._extract_memory_slots(persisted_slots),
                     "param_slots": self._extract_param_slots(persisted_slots),
                     "slots": persisted_slots,
+                    "last_result_set": single_result_set,
+                    "last_focus_slots": self._row_focus_slots(single_result_row),
                     "last_user_input": user_input,
                 },
             )
+            state["session_ctx"] = {
+                **(session_context or {}),
+                "last_intent": intent_key,
+                "memory_slots": self._extract_memory_slots(persisted_slots),
+                "param_slots": self._extract_param_slots(persisted_slots),
+                "slots": persisted_slots,
+                "last_result_set": single_result_set,
+                "last_focus_slots": self._row_focus_slots(single_result_row),
+                "last_user_input": user_input,
+            }
+            return state
+
+        # =========================================================
+        # Fleet-wide vessel metadata ranking/listing from Mongo
+        # =========================================================
+        if intent_key == "ranking.vessel_metadata":
+            def _extract_tag_pairs(doc: Dict[str, Any]) -> list[Dict[str, str]]:
+                out: list[Dict[str, str]] = []
+                raw_tags = doc.get("tags")
+                if not isinstance(raw_tags, list):
+                    return out
+                for tag in raw_tags:
+                    if not isinstance(tag, dict):
+                        continue
+                    cat = str(tag.get("category") or "").strip()
+                    val = str(tag.get("value") or "").strip()
+                    if cat or val:
+                        out.append({"category": cat, "value": val})
+                return out
+
+            def _pool_value(doc: Dict[str, Any]) -> str | None:
+                for tag in _extract_tag_pairs(doc):
+                    cat = tag.get("category", "").lower()
+                    val = tag.get("value")
+                    if "pool" in cat and val:
+                        return val
+                for tag in _extract_tag_pairs(doc):
+                    val = tag.get("value", "")
+                    if "pool" in val.lower():
+                        return val
+                return None
+
+            def _normalize_scrubber(val: Any, doc: Dict[str, Any]) -> str | None:
+                if val not in (None, ""):
+                    return str(val).strip()
+                for tag in _extract_tag_pairs(doc):
+                    txt = str(tag.get("value") or "").strip()
+                    if not txt:
+                        continue
+                    tl = txt.lower()
+                    if "scrubber" in tl:
+                        return txt
+                return None
+
+            def _default_speed(doc: Dict[str, Any], passage_type: str) -> float | None:
+                cps = doc.get("consumption_profiles")
+                if not isinstance(cps, list):
+                    return None
+                wanted = str(passage_type or "").strip().lower()
+                fallback: float | None = None
+                for cp in cps:
+                    if not isinstance(cp, dict):
+                        continue
+                    pp = cp.get("passageProfile")
+                    if not isinstance(pp, list):
+                        continue
+                    for p in pp:
+                        if not isinstance(p, dict):
+                            continue
+                        if str(p.get("passageType") or "").strip().lower() != wanted:
+                            continue
+                        cons = p.get("consumption")
+                        if not isinstance(cons, list):
+                            continue
+                        for c in cons:
+                            if not isinstance(c, dict):
+                                continue
+                            try:
+                                speed = float(c.get("speed"))
+                            except Exception:
+                                speed = None
+                            if speed is None:
+                                continue
+                            if c.get("isDefault") is True:
+                                return speed
+                            if fallback is None or speed > fallback:
+                                fallback = speed
+                return fallback
+
+            def _current_contract(doc: Dict[str, Any]) -> Dict[str, Any] | None:
+                history = (doc.get("contract_history") or {}).get("list")
+                if not isinstance(history, list):
+                    return None
+                for item in history:
+                    if isinstance(item, dict) and item.get("isCurrent") is True:
+                        return item
+                for item in history:
+                    if isinstance(item, dict):
+                        return item
+                return None
+
+            def _contract_duration_days(contract: Dict[str, Any] | None) -> float | None:
+                if not isinstance(contract, dict):
+                    return None
+                try:
+                    dur = float(contract.get("duration"))
+                except Exception:
+                    return None
+                dtype = str(contract.get("durationType") or "").strip().lower()
+                if "year" in dtype:
+                    return dur * 365.0
+                if "month" in dtype:
+                    return dur * 30.0
+                if "week" in dtype:
+                    return dur * 7.0
+                return dur
+
+            def _contract_duration_label(contract: Dict[str, Any] | None) -> str | None:
+                if not isinstance(contract, dict):
+                    return None
+                dur = contract.get("duration")
+                dtype = contract.get("durationType")
+                if dur in (None, ""):
+                    return None
+                return f"{dur} {dtype}".strip() if dtype not in (None, "") else str(dur)
+
+            def _fmt_num(v: Any, *, money: bool = False) -> str:
+                if v in (None, "", [], {}):
+                    return "Not available"
+                try:
+                    n = float(v)
+                    if money:
+                        return f"${n:,.2f}"
+                    if abs(n - int(n)) < 1e-9:
+                        return f"{int(n):,}"
+                    return f"{n:,.2f}"
+                except Exception:
+                    return str(v)
+
+            def _build_table(headers: list[str], body_rows: list[list[str]]) -> str:
+                out = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
+                for row in body_rows:
+                    out.append("| " + " | ".join(row) + " |")
+                return "\n".join(out)
+
+            projection = cfg.get("mongo_projection")
+            try:
+                res = self.mongo_agent.run(
+                    intent_key=cfg.get("mongo_intent", "vessel.list_all"),
+                    slots={},
+                    projection=projection,
+                    session_context=session_context,
+                )
+                mongo_safe = _json_safe(res)
+            except Exception as e:
+                _dprint(f"⚠️  Mongo failed (ranking.vessel_metadata): {e}")
+                mongo_safe = {}
+
+            vessel_docs = []
+            if isinstance(mongo_safe, dict):
+                doc = mongo_safe.get("document")
+                if isinstance(doc, dict) and isinstance(doc.get("vessels"), list):
+                    vessel_docs = [v for v in doc.get("vessels") if isinstance(v, dict)]
+
+            self._trace_single_mongo_query(
+                state,
+                intent_key=intent_key,
+                operation="fleet_metadata_lookup",
+                collection="vessels",
+                filt={},
+                projection=projection,
+                limit=200,
+                rows=len(vessel_docs),
+                summary="Mongo: fetched fleet-wide vessel metadata from the `vessels` collection for ranking/listing.",
+            )
+
+            ql = (user_input or "").lower()
+            wants_count = (
+                any(k in ql for k in ("how many", "count", "total how many", "total number"))
+                and not any(k in ql for k in ("highest", "lowest", "longest", "fastest", "top", "best", "worst", "least", "most"))
+            )
+            wants_operating = any(k in ql for k in ("operating", "operational", "active vessel", "active vessels"))
+            wants_hire_rate = any(k in ql for k in ("hire rate", "hirerate", "hire_rate", "hire-rate"))
+            wants_scrubber = "scrubber" in ql
+            wants_non_scrubber = any(k in ql for k in ("non-scrubber", "non scrubber", "without scrubber"))
+            wants_ballast_speed = ("ballast" in ql) and ("speed" in ql)
+            wants_laden_speed = ("laden" in ql) and ("speed" in ql)
+            wants_contract = "contract" in ql and any(k in ql for k in ("longest", "duration", "current", "owner", "delivery"))
+            wants_short_pool = "short pool" in ql
+            wants_long_pool = "long pool" in ql
+            wants_market_type = "market type" in ql
+
+            rows: list[Dict[str, Any]] = []
+            seen_vessel_keys: set[str] = set()
+            for doc in vessel_docs:
+                contract = _current_contract(doc)
+                pool = _pool_value(doc)
+                scrubber = _normalize_scrubber(doc.get("scrubber"), doc)
+                vessel_key = str(doc.get("imo") or doc.get("name") or "").strip().lower()
+                if not vessel_key:
+                    continue
+                if vessel_key in seen_vessel_keys:
+                    continue
+                seen_vessel_keys.add(vessel_key)
+                rows.append(
+                    {
+                        "vessel_name": doc.get("name"),
+                        "imo": doc.get("imo"),
+                        "hire_rate": doc.get("hireRate"),
+                        "scrubber": scrubber,
+                        "market_type": doc.get("marketType"),
+                        "is_operating": doc.get("isVesselOperating"),
+                        "pool": pool,
+                        "ballast_speed": _default_speed(doc, "ballast"),
+                        "laden_speed": _default_speed(doc, "laden"),
+                        "current_contract_duration_days": _contract_duration_days(contract),
+                        "current_contract_duration": _contract_duration_label(contract),
+                        "current_contract_owner": (contract or {}).get("owner") if isinstance(contract, dict) else None,
+                        "current_contract_delivery": (contract or {}).get("deliveryDatetime") if isinstance(contract, dict) else None,
+                    }
+                )
+
+            def _scrubber_bucket(val: Any) -> str:
+                txt = str(val or "").strip().lower()
+                if not txt:
+                    return ""
+                if "non" in txt and "scrubber" in txt:
+                    return "no"
+                if txt in ("no", "false", "0"):
+                    return "no"
+                if "yes" in txt or "scrubber" in txt:
+                    return "yes"
+                return txt
+
+            filtered = list(rows)
+            if wants_operating:
+                filtered = [r for r in filtered if r.get("is_operating") is True]
+            if wants_non_scrubber:
+                filtered = [r for r in filtered if _scrubber_bucket(r.get("scrubber")) == "no"]
+            elif wants_scrubber and not wants_hire_rate:
+                filtered = [r for r in filtered if _scrubber_bucket(r.get("scrubber")) == "yes"]
+            if wants_short_pool:
+                filtered = [r for r in filtered if "short pool" in str(r.get("pool") or "").lower()]
+            if wants_long_pool:
+                filtered = [r for r in filtered if "long pool" in str(r.get("pool") or "").lower()]
+
+            metric = None
+            if wants_hire_rate:
+                metric = "hire_rate"
+            elif wants_ballast_speed:
+                metric = "ballast_speed"
+            elif wants_laden_speed:
+                metric = "laden_speed"
+            elif wants_contract:
+                metric = "current_contract_duration_days"
+
+            descending = any(k in ql for k in ("highest", "top", "most", "best", "longest", "fastest"))
+            ascending = any(k in ql for k in ("lowest", "least", "worst"))
+            if metric:
+                filtered = sorted(
+                    filtered,
+                    key=lambda r: (
+                        r.get(metric) is None,
+                        -(float(r.get(metric))) if (descending and r.get(metric) is not None) else (float(r.get(metric)) if r.get(metric) is not None else float("inf")),
+                    ),
+                )
+                if ascending and not descending:
+                    filtered = sorted(
+                        filtered,
+                        key=lambda r: (r.get(metric) is None, float(r.get(metric)) if r.get(metric) is not None else float("inf")),
+                    )
+            else:
+                filtered = sorted(filtered, key=lambda r: str(r.get("vessel_name") or ""))
+
+            limit = max(1, min(int(slots.get("limit") or 10), 25))
+            shown = filtered[:limit]
+
+            if not rows:
+                answer = (
+                    "### Summary\n"
+                    "- No vessel metadata was available from MongoDB.\n"
+                    "- These queries require vessel-level metadata from the `vessels` collection.\n"
+                )
+            elif wants_count:
+                if wants_operating:
+                    answer = f"There are **{len(filtered)}** vessels currently operating."
+                elif wants_non_scrubber:
+                    answer = f"There are **{len(filtered)}** non-scrubber vessels."
+                elif wants_scrubber:
+                    answer = f"There are **{len(filtered)}** scrubber-fitted vessels."
+                elif wants_short_pool:
+                    answer = f"There are **{len(filtered)}** vessels in the short pool."
+                elif wants_long_pool:
+                    answer = f"There are **{len(filtered)}** vessels in the long pool."
+                else:
+                    answer = f"There are **{len(filtered)}** matching vessels."
+            else:
+                headers = ["Vessel Name", "Vessel IMO"]
+                body_rows: list[list[str]] = []
+                if wants_hire_rate:
+                    headers.append("Hire Rate")
+                    for r in shown:
+                        body_rows.append([str(r.get("vessel_name") or "Not available"), str(r.get("imo") or "Not available"), _fmt_num(r.get("hire_rate"), money=True)])
+                elif wants_ballast_speed:
+                    headers.append("Default Ballast Speed")
+                    for r in shown:
+                        body_rows.append([str(r.get("vessel_name") or "Not available"), str(r.get("imo") or "Not available"), _fmt_num(r.get("ballast_speed"))])
+                elif wants_laden_speed:
+                    headers.append("Default Laden Speed")
+                    for r in shown:
+                        body_rows.append([str(r.get("vessel_name") or "Not available"), str(r.get("imo") or "Not available"), _fmt_num(r.get("laden_speed"))])
+                elif wants_contract:
+                    headers.extend(["Current Contract Duration", "Owner", "Delivery"])
+                    for r in shown:
+                        body_rows.append([
+                            str(r.get("vessel_name") or "Not available"),
+                            str(r.get("imo") or "Not available"),
+                            str(r.get("current_contract_duration") or "Not available"),
+                            str(r.get("current_contract_owner") or "Not available"),
+                            str(r.get("current_contract_delivery") or "Not available"),
+                        ])
+                elif wants_scrubber or wants_non_scrubber:
+                    headers.append("Scrubber")
+                    for r in shown:
+                        body_rows.append([str(r.get("vessel_name") or "Not available"), str(r.get("imo") or "Not available"), str(r.get("scrubber") or "Not available")])
+                elif wants_short_pool or wants_long_pool:
+                    headers.append("Pool")
+                    if wants_market_type:
+                        headers.append("Market Type")
+                    for r in shown:
+                        row = [str(r.get("vessel_name") or "Not available"), str(r.get("imo") or "Not available"), str(r.get("pool") or "Not available")]
+                        if wants_market_type:
+                            row.append(str(r.get("market_type") or "Not available"))
+                        body_rows.append(row)
+                elif wants_operating:
+                    headers.extend(["Operating", "Market Type"])
+                    for r in shown:
+                        body_rows.append([
+                            str(r.get("vessel_name") or "Not available"),
+                            str(r.get("imo") or "Not available"),
+                            "Yes" if r.get("is_operating") is True else ("No" if r.get("is_operating") is False else "Not available"),
+                            str(r.get("market_type") or "Not available"),
+                        ])
+                else:
+                    headers.extend(["Operating", "Scrubber", "Hire Rate"])
+                    for r in shown:
+                        body_rows.append([
+                            str(r.get("vessel_name") or "Not available"),
+                            str(r.get("imo") or "Not available"),
+                            "Yes" if r.get("is_operating") is True else ("No" if r.get("is_operating") is False else "Not available"),
+                            str(r.get("scrubber") or "Not available"),
+                            _fmt_num(r.get("hire_rate"), money=True),
+                        ])
+
+                if not shown:
+                    answer = "No vessels matched the requested metadata filter."
+                else:
+                    if wants_hire_rate and shown:
+                        lead = f"The vessel with the {'highest' if descending and not ascending else 'lowest'} hire rate is **{shown[0].get('vessel_name') or 'Not available'}**."
+                    elif wants_ballast_speed and shown:
+                        lead = f"The vessel with the highest default ballast speed is **{shown[0].get('vessel_name') or 'Not available'}**."
+                    elif wants_laden_speed and shown:
+                        lead = f"The vessel with the highest default laden speed is **{shown[0].get('vessel_name') or 'Not available'}**."
+                    elif wants_contract and shown:
+                        lead = f"The vessel with the longest current contract duration is **{shown[0].get('vessel_name') or 'Not available'}**."
+                    elif wants_operating:
+                        lead = f"There are **{len(filtered)}** vessels currently operating; showing the first {len(shown)}."
+                    elif wants_non_scrubber:
+                        lead = f"There are **{len(filtered)}** non-scrubber vessels; showing the first {len(shown)}."
+                    elif wants_scrubber:
+                        lead = f"There are **{len(filtered)}** scrubber-fitted vessels; showing the first {len(shown)}."
+                    elif wants_short_pool:
+                        lead = f"There are **{len(filtered)}** vessels in the short pool; showing the first {len(shown)}."
+                    elif wants_long_pool:
+                        lead = f"There are **{len(filtered)}** vessels in the long pool; showing the first {len(shown)}."
+                    else:
+                        lead = f"Showing **{len(shown)}** vessels that match the requested metadata view."
+                    answer = lead + "\n\n" + _build_table(headers, body_rows)
+
+            current_trace = []
+            if isinstance(state.get("artifacts"), dict) and isinstance((state.get("artifacts") or {}).get("trace"), list):
+                current_trace = (state.get("artifacts") or {}).get("trace") or []
+
+            merged_rows = shown if shown else filtered[:limit]
+            merged = {
+                "finance": {"mode": None, "rows": []},
+                "ops": {"mode": None, "rows": []},
+                "mongo": mongo_safe if isinstance(mongo_safe, dict) else {},
+                "artifacts": {"intent_key": intent_key, "slots": slots, "merged_rows": merged_rows, "trace": current_trace},
+                "dynamic_sql_used": False,
+                "dynamic_sql_agents": [],
+            }
+
+            state["merged"] = merged
+            state["answer"] = answer
+            state["slots"] = slots
+            state["mongo"] = mongo_safe
+            state["finance"] = {"mode": None, "rows": []}
+            state["ops"] = {"mode": None, "rows": []}
+            state["data"]["mongo"] = mongo_safe
+            state["data"]["finance"] = {"mode": None, "rows": []}
+            state["data"]["ops"] = {"mode": None, "rows": []}
+            state["data"]["artifacts"] = {"intent_key": intent_key, "slots": slots, "merged_rows": merged_rows, "trace": current_trace}
             return state
 
         # =========================================================
@@ -3176,6 +4181,7 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
 
             records: list[Dict[str, Any]] = []
             projection = cfg.get("mongo_projection")
+            trace_queries: list[Dict[str, Any]] = []
 
             # Path A: direct vessel anchor (name/imo)
             if slots.get("vessel_name") or slots.get("imo"):
@@ -3192,6 +4198,8 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                     mongo_safe = {}
 
                 doc = (mongo_safe or {}).get("document") if isinstance(mongo_safe, dict) else {}
+                if not isinstance(doc, dict):
+                    doc = {}
                 if isinstance(doc, dict) and doc:
                     records.append({
                         "voyage_number": slots.get("voyage_number"),
@@ -3199,6 +4207,21 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                         "imo": doc.get("imo") or slots.get("imo"),
                         "doc": doc,
                     })
+                resolved_imo = (
+                    (mongo_safe or {}).get("anchor_id")
+                    if isinstance(mongo_safe, dict)
+                    else None
+                ) or doc.get("imo") or slots.get("imo")
+                trace_queries.append(
+                    {
+                        "collection": "vessels",
+                        "filter": {"imo": str(resolved_imo)} if resolved_imo not in (None, "") else {},
+                        "projection": self._mongo_projection_for_trace(projection),
+                        "sort": None,
+                        "limit": 1,
+                        "pipeline": None,
+                    }
+                )
             else:
                 # Path B: small voyage-number list (1..3) -> resolve vessel(s) via Mongo voyages
                 mongo_safe = {"mode": "mongo_metadata", "ok": True, "rows": []}
@@ -3248,6 +4271,40 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                         "doc": mdoc,
                     })
                     mongo_safe["rows"].append(vdoc)
+
+                voyage_filters = [str(v) for v in unique_vnums if v not in (None, "")]
+                if voyage_filters:
+                    trace_queries.append(
+                        {
+                            "collection": "voyages",
+                            "filter": {"voyageNumber": {"$in": voyage_filters}},
+                            "projection": self._mongo_projection_for_trace(
+                                {"_id": 0, "voyageNumber": 1, "voyageId": 1, "vesselName": 1, "vesselImo": 1}
+                            ),
+                            "sort": None,
+                            "limit": len(voyage_filters),
+                            "pipeline": None,
+                        }
+                    )
+                vessel_imos = []
+                for rec in records:
+                    imo = rec.get("imo")
+                    if imo in (None, ""):
+                        continue
+                    imo_s = str(imo)
+                    if imo_s not in vessel_imos:
+                        vessel_imos.append(imo_s)
+                if vessel_imos:
+                    trace_queries.append(
+                        {
+                            "collection": "vessels",
+                            "filter": {"imo": {"$in": vessel_imos}},
+                            "projection": self._mongo_projection_for_trace(projection),
+                            "sort": None,
+                            "limit": len(vessel_imos),
+                            "pipeline": None,
+                        }
+                    )
 
             ql = (user_input or "").lower()
             ask_identity = any(k in ql for k in ("identity", "imo", "vessel id", "account code", "who is vessel", "vessel details", "name"))
@@ -3486,14 +4543,32 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                     answer_lines.append(prefix + (" - " + "; ".join(details) if details else ""))
                 answer = "\n".join(answer_lines)
 
+            current_trace = []
+            if isinstance(state.get("artifacts"), dict) and isinstance((state.get("artifacts") or {}).get("trace"), list):
+                current_trace = (state.get("artifacts") or {}).get("trace") or []
+
             merged = {
                 "finance": {"mode": None, "rows": []},
                 "ops": {"mode": None, "rows": []},
                 "mongo": mongo_safe if isinstance(mongo_safe, dict) else {},
-                "artifacts": {"intent_key": intent_key, "slots": slots},
+                "artifacts": {"intent_key": intent_key, "slots": slots, "trace": current_trace},
                 "dynamic_sql_used": False,
                 "dynamic_sql_agents": [],
             }
+
+            if trace_queries:
+                self._trace_single_mongo_query(
+                    state,
+                    intent_key=intent_key,
+                    operation="metadata_lookup",
+                    collection=str(trace_queries[0].get("collection") or "vessels"),
+                    filt=trace_queries[0].get("filter") if isinstance(trace_queries[0].get("filter"), dict) else {},
+                    projection=trace_queries[0].get("projection") if isinstance(trace_queries[0].get("projection"), dict) else projection,
+                    limit=trace_queries[0].get("limit") if isinstance(trace_queries[0].get("limit"), int) else None,
+                    rows=len(records),
+                    mongo_queries=trace_queries,
+                    summary="Mongo: resolved vessel metadata from voyage/vessel anchors and fetched the requested vessel fields.",
+                )
 
             state["merged"] = merged
             state["answer"] = answer
@@ -3504,7 +4579,7 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
             state["data"]["mongo"] = mongo_safe
             state["data"]["finance"] = {"mode": None, "rows": []}
             state["data"]["ops"] = {"mode": None, "rows": []}
-            state["data"]["artifacts"] = {"intent_key": intent_key, "slots": slots}
+            state["data"]["artifacts"] = {"intent_key": intent_key, "slots": slots, "trace": current_trace}
             return state
 
         # =========================================================
@@ -3531,11 +4606,23 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
             }
             records: list[Dict[str, Any]] = []
             mongo_rows: list[Dict[str, Any]] = []
+            trace_queries: list[Dict[str, Any]] = []
 
             # Primary anchors: voyage_id / voyage_number(s)
             if slots.get("voyage_id") not in (None, ""):
+                voyage_id = str(slots.get("voyage_id"))
+                trace_queries.append(
+                    {
+                        "collection": "voyages",
+                        "filter": {"voyageId": voyage_id},
+                        "projection": self._mongo_projection_for_trace(projection),
+                        "sort": None,
+                        "limit": 1,
+                        "pipeline": None,
+                    }
+                )
                 try:
-                    doc = self.mongo_agent.adapter.fetch_voyage(str(slots.get("voyage_id")), projection=projection)
+                    doc = self.mongo_agent.adapter.fetch_voyage(voyage_id, projection=projection)
                 except Exception:
                     doc = None
                 if isinstance(doc, dict) and doc:
@@ -3555,6 +4642,17 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                 except Exception:
                     continue
             unique_vnums = unique_vnums[:3]
+            if unique_vnums:
+                trace_queries.append(
+                    {
+                        "collection": "voyages",
+                        "filter": {"voyageNumber": {"$in": [str(v) for v in unique_vnums]}},
+                        "projection": self._mongo_projection_for_trace(projection),
+                        "sort": None,
+                        "limit": len(unique_vnums),
+                        "pipeline": None,
+                    }
+                )
             for vnum in unique_vnums:
                 try:
                     doc = self.mongo_agent.adapter.get_voyage_by_number(vnum, projection=projection)
@@ -3593,7 +4691,9 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                 context_json = json.dumps(sections, default=str, indent=2)
                 system_prompt = """You are a voyage data analyst.
 Answer the user's question using ONLY the data provided in the JSON context below.
-Format currency with $ and commas. Format dates as YYYY-MM-DD.
+Format money fields (revenue/expense/pnl/tce/commission/freight/demurrage) with $ and commas.
+Do NOT use currency formatting for non-monetary metrics (CO2, AER, EEOI, percentages, counts, speeds).
+Format dates as YYYY-MM-DD.
 If a value is null, say "not recorded". Never invent values."""
                 user_prompt = f"""Voyage Data:
 {context_json}
@@ -3612,14 +4712,31 @@ Question: {user_input}"""
                     answer = "### Summary\n- Voyage metadata is available but I could not generate a formatted response right now."
 
             mongo_safe = {"mode": "mongo_metadata", "ok": True, "rows": mongo_rows}
+            current_trace = []
+            if isinstance(state.get("artifacts"), dict) and isinstance((state.get("artifacts") or {}).get("trace"), list):
+                current_trace = (state.get("artifacts") or {}).get("trace") or []
+
             merged = {
                 "finance": {"mode": None, "rows": []},
                 "ops": {"mode": None, "rows": []},
                 "mongo": mongo_safe,
-                "artifacts": {"intent_key": intent_key, "slots": slots},
+                "artifacts": {"intent_key": intent_key, "slots": slots, "trace": current_trace},
                 "dynamic_sql_used": False,
                 "dynamic_sql_agents": [],
             }
+            if trace_queries:
+                self._trace_single_mongo_query(
+                    state,
+                    intent_key=intent_key,
+                    operation="voyage_metadata_lookup",
+                    collection=str(trace_queries[0].get("collection") or "voyages"),
+                    filt=trace_queries[0].get("filter") if isinstance(trace_queries[0].get("filter"), dict) else {},
+                    projection=trace_queries[0].get("projection") if isinstance(trace_queries[0].get("projection"), dict) else projection,
+                    limit=trace_queries[0].get("limit") if isinstance(trace_queries[0].get("limit"), int) else None,
+                    rows=len(records),
+                    mongo_queries=trace_queries,
+                    summary="Mongo: fetched voyage metadata from the `voyages` collection using the resolved voyage anchors.",
+                )
             state["merged"] = merged
             state["answer"] = answer
             state["slots"] = slots
@@ -3629,7 +4746,7 @@ Question: {user_input}"""
             state["data"]["mongo"] = mongo_safe
             state["data"]["finance"] = {"mode": None, "rows": []}
             state["data"]["ops"] = {"mode": None, "rows": []}
-            state["data"]["artifacts"] = {"intent_key": intent_key, "slots": slots}
+            state["data"]["artifacts"] = {"intent_key": intent_key, "slots": slots, "trace": current_trace}
             return state
 
         # ---- Standard Execution for generic single intents ----
@@ -3901,7 +5018,6 @@ Question: {user_input}"""
 
         return state
 
-    # =========================================================
     # Composite Step Execution
     # =========================================================
 
@@ -3995,17 +5111,156 @@ Question: {user_input}"""
                     slots = {**slots, k: v}
             # Intent from state or plan (plan is authoritative after build_plan)
             intent_key = state.get("intent_key") or (state.get("plan") or {}).get("intent_key") or "composite.query"
+            user_q_lower = str(state.get("user_input") or "").strip().lower()
+            cargo_frequency_ops_only = (
+                intent_key == "ranking.cargo"
+                and any(
+                    phrase in user_q_lower
+                    for phrase in (
+                        "appears most frequently across all voyages",
+                        "appears most frequently",
+                        "most frequent cargo grade",
+                        "most common cargo grade",
+                        "most commonly carried cargo grade",
+                    )
+                )
+                and not any(
+                    phrase in user_q_lower
+                    for phrase in (
+                        "profitable",
+                        "profitability",
+                        "average pnl",
+                        "avg pnl",
+                        "revenue",
+                        "margin",
+                        "variance",
+                        "when fixed",
+                        "when-fixed",
+                    )
+                )
+            )
+            if cargo_frequency_ops_only and op == "dynamic_sql":
+                safe = {
+                    "mode": "skipped",
+                    "rows": [],
+                    "skipped_reason": "cargo_frequency_ops_only",
+                }
+                artifacts["finance_rows"] = []
+                artifacts["voyage_ids"] = []
+                state["finance"] = safe
+                state["data"]["finance"] = safe
+                self._trace(
+                    state,
+                    {
+                        "phase": "composite_step_result",
+                        "step_index": idx + 1,
+                        "agent": agent,
+                        "operation": op,
+                        "ok": True,
+                        "skipped": True,
+                        "mode": "skipped",
+                        "rows": 0,
+                        "voyage_ids": 0,
+                        "reason": (
+                            "Cargo-frequency ranking is ops-only for this phrasing; "
+                            "finance step skipped to avoid irrelevant SQL generation."
+                        ),
+                        "summary": "Finance step skipped - cargo frequency is sourced from ops cargo grades.",
+                    },
+                )
+                state["artifacts"] = artifacts
+                state["slots"] = slots
+                state["step_index"] = idx + 1
+                return state
             # Composite always uses dynamic SQL for finance; registry only when plan explicitly says registry_sql (e.g. single-query path)
             use_registry = op == "registry_sql"
             try:
-                if use_registry:
+                if (
+                    intent_key == "ranking.vessels"
+                    and any(
+                        phrase in user_q_lower
+                        for phrase in (
+                            "above-average pnl",
+                            "above average pnl",
+                        )
+                    )
+                    and any(
+                        phrase in user_q_lower
+                        for phrase in (
+                            "most common cargo grade",
+                            "most common cargo grades",
+                            "common cargo grade",
+                            "common cargo grades",
+                        )
+                    )
+                ):
+                    sql = """
+                        SELECT
+                          REPLACE(f.vessel_imo::TEXT, '.0', '') AS vessel_imo,
+                          MAX(o.vessel_name)                   AS vessel_name,
+                          COUNT(DISTINCT f.voyage_id)          AS voyage_count,
+                          AVG(f.pnl)                           AS avg_pnl
+                        FROM finance_voyage_kpi f
+                        JOIN ops_voyage_summary o
+                          ON f.voyage_number = o.voyage_number
+                          AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+                        WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
+                        GROUP BY REPLACE(f.vessel_imo::TEXT, '.0', '')
+                        HAVING AVG(f.pnl) > (
+                          SELECT AVG(pnl)
+                          FROM finance_voyage_kpi
+                          WHERE scenario = COALESCE(%(scenario)s, 'ACTUAL')
+                        )
+                        ORDER BY voyage_count DESC, avg_pnl DESC NULLS LAST
+                        LIMIT %(limit)s
+                    """
+                    params = {
+                        "scenario": slots.get("scenario") or "ACTUAL",
+                        "limit": min(int(slots.get("limit") or 10), 50),
+                    }
+                    rows = self.finance_agent.pg.execute_dynamic_select(sql, params)
+                    result = {
+                        "mode": "dynamic_sql",
+                        "intent_key": intent_key,
+                        "query_key": "narrow.ranking_vessels_above_avg_pnl",
+                        "params": params,
+                        "rows": rows,
+                        "sql": sql,
+                    }
+                elif use_registry:
                     result = self.finance_agent.run(
                         intent_key=intent_key,
                         slots=slots,
                     )
                 else:
+                    finance_question = state["user_input"]
+                    if intent_key == "ranking.vessels" and any(
+                        phrase in user_q_lower
+                        for phrase in (
+                            "most common cargo grade",
+                            "most common cargo grades",
+                            "common cargo grade",
+                            "common cargo grades",
+                        )
+                    ):
+                        finance_question = re.sub(
+                            r"(?i)\s*(?:,?\s*and\s+)?most common cargo grades?\b",
+                            "",
+                            str(finance_question or ""),
+                        ).strip(" ,.")
+                        if "above-average pnl" in user_q_lower or "above average pnl" in user_q_lower:
+                            finance_question = (
+                                finance_question.rstrip(" ?.") + "?\n\n"
+                                "IMPORTANT: interpret 'above-average PnL' at the vessel aggregate level, "
+                                "not at the individual voyage row level. "
+                                "Use HAVING AVG(f.pnl) > (SELECT AVG(pnl) FROM finance_voyage_kpi WHERE scenario = COALESCE(%(scenario)s, 'ACTUAL')). "
+                                "Do NOT filter voyages with WHERE f.pnl > average. "
+                                "Do NOT join or reference cargo grades in the finance SQL."
+                            )
+                        if finance_question and not finance_question.endswith("?"):
+                            finance_question = finance_question + "?"
                     result = self.finance_agent.run_dynamic(
-                        question=state["user_input"],
+                        question=finance_question,
                         intent_key=intent_key,
                         slots=slots
                     )
@@ -4241,8 +5496,22 @@ Question: {user_input}"""
                 artifacts.get("voyage_ids") or
                 (state.get("finance") or {}).get("voyage_ids")
             )
+            _intent_key_ops = state.get("intent_key") or (state.get("plan") or {}).get("intent_key") or "composite.query"
+            _user_q_lower = str(state.get("user_input") or "").strip().lower()
+            _needs_vessel_grade_enrichment = (
+                _intent_key_ops == "ranking.vessels"
+                and any(
+                    phrase in _user_q_lower
+                    for phrase in (
+                        "most common cargo grade",
+                        "most common cargo grades",
+                        "common cargo grade",
+                        "common cargo grades",
+                    )
+                )
+            )
 
-            if (not _voyage_ids_available) and _finance_rows:
+            if (not _voyage_ids_available) and _finance_rows and not _needs_vessel_grade_enrichment:
                 self._trace(state, {
                     "phase": "composite_step_result",
                     "step_index": idx + 1,
@@ -4289,8 +5558,23 @@ Question: {user_input}"""
             intent_key_ops = state.get("intent_key") or (state.get("plan") or {}).get("intent_key") or "composite.query"
             if intent_key_ops in ("analysis.cargo_profitability", "analysis.cargoprofitability") and (artifacts.get("cargo_grades") or []):
                 slots["cargo_grades"] = artifacts["cargo_grades"]
-            if intent_key_ops == "ranking.vessels" and not voyage_ids and (artifacts.get("vessel_imos") or []):
-                slots["vessel_imos"] = artifacts["vessel_imos"]
+            if intent_key_ops == "ranking.vessels" and not voyage_ids:
+                vessel_imos = artifacts.get("vessel_imos") or []
+                if not vessel_imos and isinstance(_finance_rows, list):
+                    vessel_imos = []
+                    for r in _finance_rows:
+                        if not isinstance(r, dict):
+                            continue
+                        imo = r.get("vessel_imo")
+                        if imo in (None, "", [], {}):
+                            continue
+                        imo_s = str(imo)
+                        if imo_s not in vessel_imos:
+                            vessel_imos.append(imo_s)
+                    if vessel_imos:
+                        artifacts["vessel_imos"] = vessel_imos[:50]
+                if vessel_imos:
+                    slots["vessel_imos"] = vessel_imos[:50]
 
             # Trace resolved inputs (plan "inputs" are placeholders; these are what we actually pass to the agent)
             _resolved_vids = len(slots.get("voyage_ids") or []) if isinstance(slots.get("voyage_ids"), list) else 0
@@ -4855,11 +6139,18 @@ Question: {user_input}"""
                             "vessel_imo": imo_str,
                             "vessel_name": fr.get("vessel_name"),
                             "voyage_count": fr.get("voyage_count"),
+                            "is_operating": fr.get("is_operating"),
+                            "scrubber": fr.get("scrubber"),
+                            "market_type": fr.get("market_type"),
+                            "ballast_speed": _n(fr.get("ballast_speed")),
+                            "laden_speed": _n(fr.get("laden_speed")),
+                            "contract_duration_days": _n(fr.get("contract_duration_days")),
                             "avg_pnl": _n(fr.get("avg_pnl") or fr.get("total_pnl") or fr.get("pnl")),
                             "total_pnl": _n(fr.get("total_pnl") or fr.get("pnl")),
                             "pnl": _n(fr.get("avg_pnl") or fr.get("pnl") or fr.get("total_pnl")),
-                            "revenue": _n(fr.get("revenue") or fr.get("total_revenue")),
-                            "total_expense": _n(fr.get("total_expense")),
+                            "revenue": _n(fr.get("revenue") or fr.get("total_revenue") or fr.get("avg_revenue")),
+                            "total_expense": _n(fr.get("total_expense") or fr.get("avg_total_expense")),
+                            "bunker_cost": _n(fr.get("bunker_cost") or fr.get("total_bunker_cost") or fr.get("avg_bunker_cost")),
                             "tce": _n(fr.get("tce") or fr.get("avg_tce")),
                             "total_commission": _n(fr.get("total_commission")),
                             "cargo_grades": cargo_grades[:15],
@@ -4956,6 +6247,9 @@ Question: {user_input}"""
                             "has_commission": False,
                             "voyage_count": 0.0,
                             "has_voyage_count": False,
+                            "actual_avg_pnl": None,
+                            "when_fixed_avg_pnl": None,
+                            "variance_diff": None,
                         }
                         finance_by_grade[gk] = b
 
@@ -4990,6 +6284,12 @@ Question: {user_input}"""
                     if isinstance(com_v, (int, float)):
                         b["commission_wsum"] += float(com_v) * w
                         b["has_commission"] = True
+                    if b.get("actual_avg_pnl") in (None, "") and fr.get("actual_avg_pnl") not in (None, ""):
+                        b["actual_avg_pnl"] = _num(fr.get("actual_avg_pnl"))
+                    if b.get("when_fixed_avg_pnl") in (None, "") and fr.get("when_fixed_avg_pnl") not in (None, ""):
+                        b["when_fixed_avg_pnl"] = _num(fr.get("when_fixed_avg_pnl"))
+                    if b.get("variance_diff") in (None, "") and fr.get("variance_diff") not in (None, ""):
+                        b["variance_diff"] = _num(fr.get("variance_diff"))
 
                 for gk, b in finance_by_grade.items():
                     w = float(b.get("weight") or 0.0)
@@ -5056,6 +6356,9 @@ Question: {user_input}"""
                         "finance_voyage_count": (int(b["voyage_count"]) if b.get("has_voyage_count") else None),
                         "ops_voyage_count": octx.get("ops_voyage_count"),
                         "voyage_count": (int(b["voyage_count"]) if b.get("has_voyage_count") else None),
+                        "actual_avg_pnl": b.get("actual_avg_pnl"),
+                        "when_fixed_avg_pnl": b.get("when_fixed_avg_pnl"),
+                        "variance_diff": b.get("variance_diff"),
                     })
 
             # Deduplicated merge (by voyage_id)
@@ -5081,6 +6384,9 @@ Question: {user_input}"""
                 total_expense = _num(fr.get("total_expense") or fr.get("Total_expense") or fr.get("total expense"))
                 tce = _num(fr.get("tce") or fr.get("TCE"))
                 total_commission = _num(fr.get("total_commission") or fr.get("Total_commission") or fr.get("total commission"))
+                co2 = _num(fr.get("co2") or fr.get("voyageCO2"))
+                eeoi = _num(fr.get("eeoi") or fr.get("voyageEEOI"))
+                aer = _num(fr.get("aer") or fr.get("voyageAER"))
                 # Scenario comparison: use registry columns when present so table shows actual vs when-fixed and variance
                 if intent_key_merge == "analysis.scenario_comparison":
                     pnl = _num(fr.get("pnl_actual") or pnl)
@@ -5208,12 +6514,22 @@ Question: {user_input}"""
                     "total_expense": total_expense,
                     "tce": tce,
                     "total_commission": total_commission,
+                    "co2": co2,
+                    "eeoi": eeoi,
+                    "aer": aer,
                     "finance": fr,
                     "ops": ops_for_vid,
                     "cargo_grades": cargo_grades,
                     "key_ports": key_ports,
                     "remarks": remark_val,
                     "commissions": commissions_by.get(str(vid), []),
+                    "is_delayed": (
+                        fr.get("is_delayed")
+                        if fr.get("is_delayed") is not None
+                        else (
+                            (ops_for_vid[0].get("is_delayed") if isinstance(ops_for_vid, list) and ops_for_vid and isinstance(ops_for_vid[0], dict) else None)
+                        )
+                    ),
                 }
                 if intent_key_merge == "analysis.scenario_comparison":
                     row["pnl_actual"] = _num(fr.get("pnl_actual"))
@@ -5373,7 +6689,7 @@ Question: {user_input}"""
                 fin_by_vid = {}
                 for r in finance_rows:
                     if isinstance(r, dict) and r.get("voyage_id"):
-                        fin_by_vid[str(r["voyage_id"])] = r
+                        fin_by_vid[str(r["voyage_id"]).strip().upper()] = r
                 def _norm_num(v):
                     if v in (None, "", "Not available", "not available", "N/A", "n/a", "NA", "na"):
                         return None
@@ -5387,7 +6703,7 @@ Question: {user_input}"""
                     vid = mr.get("voyage_id")
                     fin = mr.get("finance") if isinstance(mr.get("finance"), dict) else {}
                     if not fin and vid is not None:
-                        fin = fin_by_vid.get(str(vid)) or {}
+                        fin = fin_by_vid.get(str(vid).strip().upper()) or {}
                     if (_norm_num(mr.get("pnl")) is None) and fin:
                         mr["pnl"] = _norm_num(fin.get("pnl") or fin.get("PnL"))
                     else:
@@ -5488,7 +6804,18 @@ Question: {user_input}"""
             
             # Validate answer quality
             if not answer or len(answer) < 20 or answer.startswith("Intent="):
-                raise ValueError("Generated answer is too short or malformed")
+                if merged_rows and (
+                    str(intent_key).startswith("ranking.")
+                    or str(intent_key).startswith("comparison.")
+                    or str(intent_key).startswith("aggregation.")
+                ):
+                    answer = self._fallback_tabular_answer(
+                        question=state.get("user_input") or "",
+                        intent_key=str(intent_key or ""),
+                        rows=merged_rows,
+                    )
+                else:
+                    raise ValueError("Generated answer is too short or malformed")
                 
         except Exception as e:
             # Improved fallback with data context
@@ -5497,11 +6824,22 @@ Question: {user_input}"""
             _dprint(f"Error trace: {error_trace}")
             
             if has_data:
-                answer = (
-                    f"I found {len(finance_rows)} finance records and {len(ops_rows)} ops records "
-                    f"for your query, but encountered an error generating the summary. "
-                    f"Intent: {intent_key}. Error: {str(e)}"
-                )
+                if merged_rows and (
+                    str(intent_key).startswith("ranking.")
+                    or str(intent_key).startswith("comparison.")
+                    or str(intent_key).startswith("aggregation.")
+                ):
+                    answer = self._fallback_tabular_answer(
+                        question=state.get("user_input") or "",
+                        intent_key=str(intent_key or ""),
+                        rows=merged_rows,
+                    )
+                else:
+                    answer = (
+                        f"I found {len(finance_rows)} finance records and {len(ops_rows)} ops records "
+                        f"for your query, but encountered an error generating the summary. "
+                        f"Intent: {intent_key}. Error: {str(e)}"
+                    )
             else:
                 answer = (
                     f"No data available for this query (Intent: {intent_key}). "
@@ -5564,22 +6902,83 @@ Question: {user_input}"""
                     return None
 
             def _infer_result_set_meta(rows_in: list[dict], *, source_intent: str | None) -> Dict[str, Any]:
-                metrics = ("offhire_days", "port_calls", "pnl", "revenue", "total_expense", "tce", "total_commission")
+                metrics = (
+                    "expense_to_revenue_ratio",
+                    "offhire_days",
+                    "port_calls",
+                    "voyage_count",
+                    "avg_pnl",
+                    "pnl",
+                    "avg_revenue",
+                    "revenue",
+                    "total_expense",
+                    "avg_total_expense",
+                    "tce",
+                    "total_commission",
+                    "pnl_variance",
+                    "tce_variance",
+                    "variance_diff",
+                    "actual_avg_pnl",
+                    "when_fixed_avg_pnl",
+                )
                 available = []
                 for m in metrics:
                     ok = False
                     for rr in rows_in[:50]:
-                        if isinstance(rr, dict) and rr.get(m) not in (None, "", [], {}):
+                        if isinstance(rr, dict) and (
+                            rr.get(m) not in (None, "", [], {})
+                            or GraphRouter._result_row_metric_value(rr, m) is not None
+                        ):
                             ok = True
                             break
                     if ok:
                         available.append(m)
-                primary = available[0] if available else None
+                primary = None
+                source_intent = str(source_intent or "")
+                preferred_by_intent = [
+                    ("ranking.port_calls", "port_calls"),
+                    ("ops.offhire_ranking", "offhire_days"),
+                    ("ranking.vessels", "voyage_count"),
+                    ("analysis.by_module_type", "avg_pnl"),
+                    ("analysis.scenario_comparison", "pnl_variance"),
+                    ("analysis.high_revenue_low_pnl", "expense_to_revenue_ratio"),
+                ]
+                for prefix, metric in preferred_by_intent:
+                    if source_intent.startswith(prefix) and metric in available:
+                        primary = metric
+                        break
+                if primary is None:
+                    primary = available[0] if available else None
                 return {
                     "source_intent": source_intent,
                     "available_metrics": available,
                     "primary_metric": primary,
                 }
+
+            def _compact_result_row(raw_row: Dict[str, Any]) -> Dict[str, Any]:
+                if not isinstance(raw_row, dict):
+                    return {}
+                out: Dict[str, Any] = {}
+                for key, val in list(raw_row.items())[:60]:
+                    if key in {"finance", "ops", "mongo", "artifacts", "commissions"}:
+                        continue
+                    out[str(key)] = _json_primitive(val)
+                for nested_key in ("finance", "ops"):
+                    nested = raw_row.get(nested_key)
+                    if isinstance(nested, dict):
+                        for key, val in list(nested.items())[:60]:
+                            out.setdefault(str(key), _json_primitive(val))
+                if out.get("remarks") in (None, "", [], {}):
+                    out["remarks"] = _compact_remarks(raw_row.get("remarks"))
+                else:
+                    out["remarks"] = _compact_remarks(out.get("remarks"))
+                if out.get("delay_reason") in (None, "", [], {}):
+                    out["delay_reason"] = _json_primitive(raw_row.get("delay_reason") or raw_row.get("delay_reasons"))
+                revenue = GraphRouter._result_row_metric_value(out, "revenue")
+                total_expense = GraphRouter._result_row_metric_value(out, "total_expense")
+                if out.get("expense_to_revenue_ratio") in (None, "", [], {}) and revenue not in (None, 0) and total_expense is not None:
+                    out["expense_to_revenue_ratio"] = float(total_expense) / float(revenue)
+                return {k: v for k, v in out.items() if v not in (None, "", [], {})}
 
             sess = state.get("session_ctx") or {}
             art = state.get("artifacts") or {}
@@ -5589,24 +6988,9 @@ Question: {user_input}"""
                 for r in mrs[:20]:
                     if not isinstance(r, dict):
                         continue
-                    fr = r.get("finance") if isinstance(r.get("finance"), dict) else {}
-                    compact_rows.append({
-                        "voyage_id": _json_primitive(r.get("voyage_id")),
-                        "voyage_number": _json_primitive(r.get("voyage_number") or fr.get("voyage_number")),
-                        "vessel_name": _json_primitive(r.get("vessel_name")),
-                        "vessel_imo": _json_primitive(r.get("vessel_imo")),
-                        "pnl": _json_primitive(fr.get("pnl")),
-                        "revenue": _json_primitive(fr.get("revenue")),
-                        "total_expense": _json_primitive(fr.get("total_expense")),
-                        "tce": _json_primitive(fr.get("tce")),
-                        "total_commission": _json_primitive(fr.get("total_commission")),
-                        "offhire_days": _json_primitive(r.get("offhire_days")),
-                        "delay_reason": _json_primitive(r.get("delay_reason")),
-                        "key_ports": _json_primitive(r.get("key_ports")),
-                        "cargo_grades": _json_primitive(r.get("cargo_grades")),
-                        "port_calls": _json_primitive(r.get("port_calls")),
-                        "remarks": _compact_remarks(r.get("remarks")),
-                    })
+                    compact = _compact_result_row(r)
+                    if compact:
+                        compact_rows.append(compact)
                 latest_result_set = {
                     "source_intent": state.get("intent_key"),
                     "rows": compact_rows,
@@ -5629,23 +7013,9 @@ Question: {user_input}"""
                     for r in fin_rows[:20]:
                         if not isinstance(r, dict):
                             continue
-                        compact_rows.append({
-                            "voyage_id": _json_primitive(r.get("voyage_id")),
-                            "voyage_number": _json_primitive(r.get("voyage_number")),
-                            "vessel_name": _json_primitive(r.get("vessel_name")),
-                            "vessel_imo": _json_primitive(r.get("vessel_imo") or r.get("imo")),
-                            "pnl": _json_primitive(r.get("pnl")),
-                            "revenue": _json_primitive(r.get("revenue")),
-                            "total_expense": _json_primitive(r.get("total_expense")),
-                            "tce": _json_primitive(r.get("tce")),
-                            "total_commission": _json_primitive(r.get("total_commission")),
-                            "offhire_days": _json_primitive(r.get("offhire_days")),
-                            "delay_reason": _json_primitive(r.get("delay_reason")),
-                            "key_ports": _json_primitive(r.get("key_ports")),
-                            "cargo_grades": _json_primitive(r.get("cargo_grades")),
-                            "port_calls": _json_primitive(r.get("port_calls")),
-                            "remarks": None,
-                        })
+                        compact = _compact_result_row(r)
+                        if compact:
+                            compact_rows.append(compact)
                     latest_result_set = {
                         "source_intent": state.get("intent_key"),
                         "rows": compact_rows,
@@ -5667,23 +7037,9 @@ Question: {user_input}"""
                         for r in ops_rows[:20]:
                             if not isinstance(r, dict):
                                 continue
-                            compact_rows.append({
-                                "voyage_id": _json_primitive(r.get("voyage_id")),
-                                "voyage_number": _json_primitive(r.get("voyage_number")),
-                                "vessel_name": _json_primitive(r.get("vessel_name")),
-                                "vessel_imo": _json_primitive(r.get("vessel_imo") or r.get("imo")),
-                                "pnl": _json_primitive(r.get("pnl")),
-                                "revenue": _json_primitive(r.get("revenue")),
-                                "total_expense": _json_primitive(r.get("total_expense")),
-                                "tce": _json_primitive(r.get("tce")),
-                                "total_commission": _json_primitive(r.get("total_commission")),
-                                "offhire_days": _json_primitive(r.get("offhire_days")),
-                                "delay_reason": _json_primitive(r.get("delay_reason") or r.get("delay_reasons")),
-                                "key_ports": _json_primitive(r.get("key_ports") or r.get("ports") or r.get("ports_json")),
-                                "cargo_grades": _json_primitive(r.get("cargo_grades") or r.get("grades_json")),
-                                "port_calls": _json_primitive(r.get("port_calls")),
-                                "remarks": _compact_remarks(r.get("remarks") or r.get("remarks_json")),
-                            })
+                            compact = _compact_result_row(r)
+                            if compact:
+                                compact_rows.append(compact)
                         latest_result_set = {
                             "source_intent": state.get("intent_key"),
                             "rows": compact_rows,
@@ -5745,6 +7101,103 @@ Question: {user_input}"""
         )
 
         return state
+
+    # =========================================================
+    # Deterministic ranking/comparison fallback
+    # =========================================================
+
+    @staticmethod
+    def _fallback_tabular_answer(*, question: str, intent_key: str, rows: list[Dict[str, Any]]) -> str:
+        if not isinstance(rows, list) or not rows:
+            return "Not available in dataset."
+
+        ql = (question or "").lower()
+        top = rows[:10]
+
+        def _fmt_num(v: Any, *, money: bool = False) -> str:
+            if v in (None, "", "Not available"):
+                return "Not available"
+            try:
+                n = float(v)
+                if money:
+                    return f"${n:,.2f}"
+                if abs(n - int(n)) < 1e-9:
+                    return f"{int(n):,}"
+                return f"{n:,.2f}"
+            except Exception:
+                return str(v)
+
+        # Choose primary metric from question wording.
+        metric = "pnl"
+        if any(k in ql for k in ("revenue", "freight")):
+            metric = "revenue"
+        elif any(k in ql for k in ("expense", "cost", "bunker", "demurrage")):
+            metric = "total_expense"
+        elif "tce" in ql:
+            metric = "tce"
+        elif any(k in ql for k in ("commission",)):
+            metric = "total_commission"
+        elif any(k in ql for k in ("co2", "emission", "eeoi", "aer")):
+            metric = "co2"
+
+        # Build rows sorted by chosen metric when present.
+        def _metric_value(r: Dict[str, Any]) -> float:
+            try:
+                return float(r.get(metric))
+            except Exception:
+                return float("-inf")
+
+        ranked = sorted([r for r in top if isinstance(r, dict)], key=_metric_value, reverse=True)
+        if not ranked:
+            ranked = [r for r in top if isinstance(r, dict)]
+
+        winner = ranked[0] if ranked else {}
+        winner_voy = winner.get("voyage_number") or "Not available"
+        winner_vessel = winner.get("vessel_name") or "Not available"
+        winner_metric = _fmt_num(winner.get(metric), money=(metric in ("pnl", "revenue", "total_expense", "total_commission")))
+
+        include_emissions = metric in ("co2", "eeoi", "aer") or any(
+            isinstance(r, dict) and (
+                r.get("co2") not in (None, "")
+                or r.get("eeoi") not in (None, "")
+                or r.get("aer") not in (None, "")
+            )
+            for r in ranked[:10]
+        )
+        if include_emissions:
+            out = [
+                "### Summary",
+                f"- **Top result**: Voyage {winner_voy} ({winner_vessel}) with {metric} = {winner_metric}",
+                "",
+                "### Results",
+                "| Voyage # | Vessel | CO2 | EEOI | AER | PnL | Revenue | Total expense |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        else:
+            out = [
+                "### Summary",
+                f"- **Top result**: Voyage {winner_voy} ({winner_vessel}) with {metric} = {winner_metric}",
+                "",
+                "### Results",
+                "| Voyage # | Vessel | PnL | Revenue | Total expense | TCE | Total commission |",
+                "| --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        for r in ranked[:10]:
+            if include_emissions:
+                out.append(
+                    f"| {r.get('voyage_number') or 'Not available'} | {r.get('vessel_name') or 'Not available'} | "
+                    f"{_fmt_num(r.get('co2'))} | {_fmt_num(r.get('eeoi'))} | {_fmt_num(r.get('aer'))} | "
+                    f"{_fmt_num(r.get('pnl'), money=True)} | {_fmt_num(r.get('revenue'), money=True)} | "
+                    f"{_fmt_num(r.get('total_expense'), money=True)} |"
+                )
+            else:
+                out.append(
+                    f"| {r.get('voyage_number') or 'Not available'} | {r.get('vessel_name') or 'Not available'} | "
+                    f"{_fmt_num(r.get('pnl'), money=True)} | {_fmt_num(r.get('revenue'), money=True)} | "
+                    f"{_fmt_num(r.get('total_expense'), money=True)} | {_fmt_num(r.get('tce'))} | "
+                    f"{_fmt_num(r.get('total_commission'), money=True)} |"
+                )
+        return "\n".join(out)
 
     # =========================================================
     # Smart slot merging

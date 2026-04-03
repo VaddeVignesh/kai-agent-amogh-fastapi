@@ -282,9 +282,12 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
         required_params=["vessel_imos"],
         sql="""
             WITH expanded AS (
-              SELECT o.vessel_imo, o.vessel_name, jsonb_array_elements_text(o.grades_json) AS grade
+              SELECT
+                REPLACE(o.vessel_imo::TEXT, '.0', '') AS vessel_imo,
+                o.vessel_name,
+                jsonb_array_elements_text(o.grades_json) AS grade
               FROM ops_voyage_summary o
-              WHERE o.vessel_imo = ANY(%(vessel_imos)s)
+              WHERE REPLACE(o.vessel_imo::TEXT, '.0', '') = ANY(%(vessel_imos)s)
                 AND o.grades_json IS NOT NULL AND o.grades_json::text != '[]'
             ),
             counted AS (
@@ -543,6 +546,40 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
             FROM per_pair
             GROUP BY voyage_number
             ORDER BY voyage_number;
+        """,
+    ),
+
+    "finance.compare_voyages": QuerySpec(
+        description="Compare specific voyages side-by-side by voyage numbers",
+        required_params=["voyage_numbers", "limit"],
+        sql="""
+            SELECT
+              f.voyage_id,
+              f.voyage_number,
+              f.vessel_imo,
+              f.revenue,
+              f.total_expense,
+              f.pnl,
+              f.tce,
+              f.total_commission,
+              f.voyage_start_date,
+              f.voyage_end_date,
+              o.vessel_name,
+              o.module_type,
+              o.is_delayed,
+              o.offhire_days,
+              o.delay_reason,
+              o.ports_json,
+              o.grades_json,
+              o.remarks_json
+            FROM finance_voyage_kpi f
+            LEFT JOIN ops_voyage_summary o
+              ON f.voyage_number = o.voyage_number
+              AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+            WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
+              AND f.voyage_number = ANY(%(voyage_numbers)s::INT[])
+            ORDER BY f.voyage_number ASC
+            LIMIT %(limit)s;
         """,
     ),
 }

@@ -97,6 +97,13 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
         total_expense = _k("total_expense", "Total_expense", "total expense")
         tce = _k("tce", "TCE")
         total_commission = _k("total_commission", "Total_commission", "total commission")
+        total_pnl = _k("total_pnl")
+        avg_tce = _k("avg_tce")
+        avg_total_expense = _k("avg_total_expense")
+        total_revenue = _k("total_revenue")
+        actual_avg_pnl = _k("actual_avg_pnl")
+        when_fixed_avg_pnl = _k("when_fixed_avg_pnl")
+        variance_diff = _k("variance_diff")
         # Aggregate intents may use avg_* fields instead of top-level KPI names.
         if pnl in (None, ""):
             pnl = _k("avg_pnl")
@@ -111,6 +118,13 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
             "total_expense": total_expense,
             "tce": tce,
             "total_commission": total_commission,
+            "total_pnl": total_pnl,
+            "avg_tce": avg_tce,
+            "avg_total_expense": avg_total_expense,
+            "total_revenue": total_revenue,
+            "actual_avg_pnl": actual_avg_pnl,
+            "when_fixed_avg_pnl": when_fixed_avg_pnl,
+            "variance_diff": variance_diff,
             "port_calls": (
                 r.get("port_calls")
                 if r.get("port_calls") not in (None, "")
@@ -124,7 +138,10 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
                 if r.get("voyage_count") not in (None, "")
                 else fin.get("voyage_count")
             ),
+            "is_delayed": r.get("is_delayed"),
         }
+        if isinstance(r.get("commissions"), list) and r.get("commissions"):
+            out_row["commissions"] = r.get("commissions")
         # Vessel-level rows (e.g. ranking.vessels) have vessel_imo, vessel_name, voyage_count
         if r.get("vessel_imo") is not None or r.get("vessel_name") is not None:
             out_row["vessel_imo"] = r.get("vessel_imo")

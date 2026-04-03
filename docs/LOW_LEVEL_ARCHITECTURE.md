@@ -1,11 +1,11 @@
 # KAI Agent Low-Level Architecture
 
 ## Scope
-This document describes the implemented low-level architecture of the request pipeline, data flow, agent behavior, session model, and answer generation stack.
+This document describes the current low-level runtime architecture after the recent routing, metadata, follow-up, and dynamic SQL fixes.
 
-It focuses on the code paths that actually run in production and references the concrete files where behavior lives.
+It focuses on the code paths that actually execute in production and maps the implementation to the main runtime files.
 
-## Repository Structure Relevant to Runtime
+## Runtime File Map
 ```text
 app/
   main.py
@@ -36,45 +36,41 @@ app/
 
 ## Entry Points
 ### `app/main.py`
-The API is initialized in `app/main.py`.
+The FastAPI backend is initialized in `app/main.py`.
 
-Key responsibilities:
+Responsibilities:
 - load environment variables
-- create `LLMClient`
-- create Mongo, Postgres, and Redis dependencies
+- build `LLMClient`
+- build Mongo, Postgres, and Redis dependencies
 - create `GraphRouter`
 - expose:
   - `GET /`
   - `POST /query`
   - `POST /session/clear`
 
-Main request and response models:
-- `QueryRequest`
-  - `query`
-  - `session_id`
-- `QueryResponse`
-  - `session_id`
-  - `answer`
-  - `clarification`
-  - `trace`
-  - `intent_key`
-  - `slots`
-  - `dynamic_sql_used`
-  - `dynamic_sql_agents`
+Response payload from `/query` includes:
+- `session_id`
+- `answer`
+- `clarification`
+- `trace`
+- `intent_key`
+- `slots`
+- `dynamic_sql_used`
+- `dynamic_sql_agents`
 
 ### `app/UI/UX/streamlit_app.py`
-The Streamlit client is a thin UI around the API.
+The Streamlit client is a thin frontend over the API.
 
-Important implementation details:
-- `call_api(query, session_id)` posts to `KAI_API_URL`
-- `clear_session_cache(session_id)` posts to `/session/clear`
-- `st.session_state["session_id"]` is the client-side conversation identifier
-- execution trace is rendered from `trace`
-- SQL is reformatted for readability through `_format_sql_for_trace`
+Important behavior:
+- stores `session_id` in session state
+- calls `/query`
+- renders final answer and trace
+- renders SQL snippets from trace
+- can clear backend session state via `/session/clear`
 
 ## Runtime State Model
-### `GraphState` in `app/orchestration/graph_router.py`
-The router passes a typed state object through the graph.
+### `GraphState`
+Defined in `app/orchestration/graph_router.py`.
 
 Important fields:
 - `session_id`
@@ -96,15 +92,15 @@ Important fields:
 - `answer`
 - `artifacts`
 
-`artifacts` is especially important because it carries:
+`artifacts` is the main transient execution container and carries:
 - `trace`
-- merged intermediate rows
-- coverage hints
-- voyage ids
+- `merged_rows`
+- `coverage`
+- extracted `voyage_ids`
 - dynamic SQL metadata
+- result-set memory candidates
 
 ## Orchestration Graph
-### Node sequence
 The graph is assembled in `GraphRouter._build_graph()`.
 
 Core nodes:
@@ -118,69 +114,73 @@ Core nodes:
 - `merge` -> `n_merge`
 - `summarize` -> `n_summarize`
 
-### Routing decisions
-Conditional routers determine the next stage:
+Conditional routing:
 - after validation:
-  - clarify if required slots are missing
-  - summarize immediately for unsupported intents
-  - otherwise plan
+  - `clarify`
+  - `plan`
+  - or early `summarize` for unsupported edge cases
 - after planning:
-  - run `single`
-  - or loop through `composite`
+  - `single`
+  - or `composite`
 - after single:
-  - finish
-  - clarify
-  - or escalate to composite
-- after composite steps:
+  - `done`
+  - `merge`
+  - or `escalate` into composite after zero-row escalation
+- after composite step execution:
   - continue next step
-  - or merge
+  - or move to merge
 
 ## Detailed Request Lifecycle
 ### 1. Session load
 `n_load_session` calls `RedisStore.load_session(session_id)`.
 
-Loaded session data may include:
-- prior slots
-- prior intent
-- result-set memory
-- clarification state
-- turn metadata
+Loaded session context may contain:
+- previous slots
+- previous intent
+- `last_result_set`
+- `last_focus_slots`
+- pending clarification state
+- previous user input
 
 ### 2. Turn classification and intent extraction
-`n_extract_intent` does much more than plain LLM classification.
+`n_extract_intent` is now more than plain LLM classification.
 
-It includes:
-- clarification follow-up handling
-- follow-up result-set fast paths
+Current behavior includes:
+- clarification-follow-up resolution
+- result-set follow-up fast paths
 - placeholder slot cleanup
-- deterministic overrides for voyage, vessel, and port patterns
+- deterministic overrides for common intent families
 - session-aware slot carry-forward
-- optional LLM intent extraction via `LLMClient.extract_intent_slots`
+- optional LLM intent extraction through `LLMClient.extract_intent_slots`
 
-This node is the main place where conversational behavior is normalized before planning.
+Important recent runtime improvements reflected here:
+- stronger fresh-question vs follow-up detection
+- explicit result-set follow-up handling
+- voyage-linked vessel metadata recovery
+- metadata-first routing for correct source selection
 
 ### 3. Slot validation
 `n_validate_slots` checks `INTENT_REGISTRY[intent]["required_slots"]`.
 
 Special handling includes:
-- treating placeholders like `vessel`, `port`, or `voyage` as effectively missing
-- skipping clarification for composite intents
-- preserving better behavior for incomplete entity-style questions
+- treating placeholders such as `vessel`, `voyage`, and `port` as missing
+- skipping clarification for fleet-wide composite intents
+- preserving clarification behavior for incomplete entity-style questions
 
 ### 4. Clarification generation
 If required slots are missing, `n_make_clarification`:
-- builds a clarification message
-- persists pending clarification context to Redis
-- returns immediately without continuing to execution
+- builds the clarification message
+- persists clarification context to Redis
+- stops execution for this turn
 
 ### 5. Planning
-`Planner.build_plan()` in `app/orchestration/planner.py` converts:
+`Planner.build_plan()` converts:
 - `intent_key`
 - `slots`
-- `text`
+- `user_input`
 - `force_composite`
 
-into `ExecutionPlan`.
+into an `ExecutionPlan`.
 
 Plan models:
 - `ExecutionStep`
@@ -194,71 +194,95 @@ Plan models:
   - `confidence`
   - `steps`
 
-### 6. Execution
-Execution splits into two modes.
+### 6. Execution modes
+The system executes in one of three practical patterns:
+- `single`
+- `composite`
+- `single -> escalate -> composite`
 
 #### Single mode
-`n_run_single` is used when the planner believes the question is entity-scoped or simple enough for direct execution.
+`n_run_single` is used for:
+- anchored voyage questions
+- anchored vessel questions
+- metadata requests
+- some follow-up actions
 
 Typical characteristics:
-- registry SQL preferred
-- direct Mongo lookup for vessel/voyage metadata
+- registry SQL preferred where applicable
+- direct Mongo fetch for metadata-heavy intents
 - lower latency
 - simpler merge path
 
 #### Composite mode
-`n_execute_step` runs the step list one-by-one.
+`n_execute_step` runs plan steps one at a time.
 
-Typical step sequence:
+Typical composite sequence:
 1. optional `mongo.resolveAnchor`
 2. `finance.dynamicSQL`
 3. `ops.dynamicSQL`
 4. optional `mongo.fetchRemarks`
-5. deterministic `llm.merge`
+5. deterministic merge step
 
-Even though one step is named `llm.merge`, the join itself is deterministic orchestration logic rather than a generative merge done by the LLM.
+Even when one step is named `llm.merge`, the row joining itself is deterministic orchestration logic.
+
+#### Zero-row escalation
+If a question is misclassified as `single` and returns no rows without an entity anchor:
+- router flips plan type to `composite`
+- planner remaps certain entity intents to fleet-wide equivalents
+- execution retries through the composite path
+
+This is the current recovery path for misclassified fleet-wide questions.
 
 ## Planner Internals
 ### `app/orchestration/planner.py`
 The planner is deterministic.
 
-Important behaviors:
-- resolves aliases through `resolve_intent`
-- supports `force_composite` escalation
+Important behavior:
+- resolves aliases via `resolve_intent`
 - keeps strongly entity-anchored questions on `single`
-- routes registry-declared `composite` intents to dynamic execution
-- uses textual hints like `trend`, `over time`, `offhire + pnl`, and `cargo + port`
+- routes registry-declared composite intents to `composite`
+- supports `force_composite` zero-row escalation
+- recognizes textual composite triggers such as:
+  - `trend`
+  - `over time`
+  - `offhire + pnl`
+  - `delayed + expense`
+  - `cargo + port`
 
-Composite plans are built by `_build_composite()` and usually include:
+Composite plans are built in `_build_composite()` and generally include:
 - finance first
 - ops second
-- Mongo enrichment
+- Mongo enrichment when allowed
 - merge last
+
+Important current behavior:
+- finance composite queries use dynamic SQL
+- ops enrichment is skipped for some scenario-comparison paths
+- Mongo enrichment is disabled for some aggregate-only intents
 
 ## Data Access Layer
 ### PostgreSQL
 #### `app/adapters/postgres_adapter.py`
 Responsibilities:
-- connection pooling through `SimpleConnectionPool`
-- registry query execution via `fetch_all` / `fetch_one`
-- dynamic SQL execution via `execute_dynamic_select`
+- connection pooling
+- registry query execution
+- dynamic SQL execution
 
-Important behaviors:
+Important behavior:
 - lazy pool initialization
-- connection backoff when Postgres is unavailable
-- allows only `SELECT` or `WITH ... SELECT`
-- blocks write statements
-- rejects positional parameters like `$1`
-- normalizes `:param` to `%(param)s`
-- injects `LIMIT` when missing
-- filters params to only those referenced in SQL
+- SELECT-only enforcement
+- write statement rejection
+- `:param` normalization to `%(param)s`
+- `LIMIT` injection if missing
+- params filtered to only those referenced in SQL
 
 ### MongoDB
 #### `app/adapters/mongo_adapter.py`
 Responsibilities:
-- fetch vessel or voyage by identifier
+- fetch voyage or vessel by identifier
 - resolve vessel name to IMO
 - resolve voyage number to voyage id
+- fetch voyage by number
 - apply projections
 - normalize remarks shape
 - run safe `find_many` queries
@@ -267,24 +291,23 @@ Responsibilities:
 #### `app/adapters/redis_store.py`
 Responsibilities:
 - session memory
-- optional idempotency cache
-- optional distributed lock
+- clarification state persistence
+- result-set memory persistence
 - session clearing
 
-Key persisted session fields:
+Important persisted fields:
 - `slots`
 - `last_intent_key`
+- `last_user_input`
+- `last_result_set`
+- `last_focus_slots`
 - `anchor_type`
 - `anchor_id`
-- `last_user_input`
-- `turn`
-- `updated_at`
-- `last_updated_ts`
 
-Important low-level behavior:
-- `STICKY_SLOTS` retain safe preferences such as `scenario` and `limit`
-- `VOLATILE_SLOTS` are cleared on intent change to avoid stale anchor pollution
-- in-memory fallback is used if Redis is disabled or unavailable
+Important behavior:
+- sticky slots such as `scenario` and `limit` can persist safely
+- volatile entity anchors are cleared when conversation family changes
+- in-memory fallback exists when Redis is unavailable
 
 ## Agent Layer
 ### FinanceAgent
@@ -293,40 +316,38 @@ Modes:
 - `run()` -> registry SQL
 - `run_dynamic()` -> generated SQL
 
-`run_dynamic()` performs:
-1. SQL generation through `SQLGenerator.generate(...)`
-2. agent-specific parameter injection
-3. allowlist/guard validation through `validate_and_prepare_sql`
+`run_dynamic()` pipeline:
+1. `SQLGenerator.generate(...)`
+2. agent-level parameter injection
+3. validation through `validate_and_prepare_sql`
 4. execution through `PostgresAdapter.execute_dynamic_select`
-5. retry/repair loop for repairable SQL errors
+5. repair loop for recoverable SQL problems
 6. intent-specific post-checks and fallback repairs
 
-Guardrail examples:
+Common guardrails:
 - `finance_no_ops_join`
 - `require_kpi_columns`
 - `verify_scenario_variance_columns`
-- `segment_performance_fallback`
 - `inject_voyage_numbers_param`
 - `inject_filter_port_param`
-
-This makes `FinanceAgent` the main defensive layer for dynamic finance SQL.
 
 ### OpsAgent
 #### `app/agents/ops_agent.py`
 Modes:
 - `run()` -> registry SQL
-- `run_dynamic()` -> generated SQL plus several deterministic shortcuts
+- `run_dynamic()` -> canonical shortcuts plus guarded dynamic SQL
 
 Important deterministic branches in `run_dynamic()`:
 - canonical fetch by `voyage_ids`
-- cargo profitability support using `cargo_grades`
-- deterministic vessel summary lookup
+- cargo-grade profitability support
+- voyage-number lookup to voyage-id path
+- deterministic vessel-summary support
 
 Important low-level behavior:
-- protects against bad placeholder list inputs
+- protects against placeholder inputs
 - normalizes cargo grades
-- removes null/JSON-like grade values via `_clean_grade_name`
-- uses ops-only SQL discipline
+- strips noisy/null grade values
+- enforces ops-only SQL discipline
 
 ### MongoAgent
 #### `app/agents/mongo_agent.py`
@@ -336,9 +357,10 @@ Responsibilities:
 - fetch full voyage context
 - optionally execute safe dynamic Mongo find
 
-Mongo is primarily used for:
-- anchor resolution
-- metadata answers
+Mongo is now central for:
+- `vessel.metadata`
+- `voyage.metadata`
+- `ranking.vessel_metadata`
 - rich remarks and nested voyage context
 
 ## Registry Layer
@@ -351,56 +373,55 @@ Each intent can define:
 - `required_slots`
 - `optional_slots`
 - `needs`
+- `mongo_intent`
 - `mongo_projection`
 - `sql_hints`
 - `guardrails`
 
 This powers:
 - planner routing
-- classifier prompt context
+- classifier context
 - SQL generation hints
 - execution constraints
 
-### `app/registries/sql_registry.py`
-This file defines `QuerySpec` entries for static SQL.
+Notable updated intent families:
+- `ranking.vessel_metadata`
+- `vessel.metadata`
+- cargo profitability and variance intents
+- ranking and aggregation families used in composite mode
 
-Typical contents:
-- description
-- required parameters
-- parameterized SQL string
+### `app/registries/sql_registry.py`
+Defines `QuerySpec` entries for static SQL.
 
 Used by:
-- `PostgresAdapter.fetch_all()`
 - `FinanceAgent.run()`
 - `OpsAgent.run()`
+- registry-based single-path execution
 
-## SQL Generation and Validation
+## SQL Generation And Validation
 ### `app/sql/sql_generator.py`
 Responsibilities:
 - create schema hints by agent
-- inject aggregate patterns for composite intents
-- append intent-specific SQL hints from registry
+- append intent-specific SQL hints from the registry
+- enforce aggregate-pattern guidance
 - call `LLMClient.generate_sql()`
 
-Important low-level prompt behavior:
+Important prompt behavior:
 - schema-aware prompt
-- PostgreSQL-only
-- strict param format
+- PostgreSQL-only discipline
+- strict parameter format
 - hard rules for JSONB access
-- aggregate pattern guidance
 - no invented columns
-- explicit table/column notes for finance and ops schema
+- current guidance for `NULLS LAST` ordering on ranked numeric metrics
 
 ### `app/sql/sql_guard.py`
 Responsibilities:
-- validate generated SQL against allowlist
+- validate generated SQL against the allowlist
 - reject forbidden patterns
 - enforce select-only behavior
-- clean unsupported table or column references
-- normalize list params for `ANY(...)`
-- add `LIMIT` when needed
-
-This is the main structural SQL safety layer after prompt generation.
+- normalize params for `ANY(...)`
+- inject `LIMIT` when needed
+- reject unsupported tables or columns
 
 ### `app/sql/sql_allowlist.py`
 Responsibilities:
@@ -408,13 +429,13 @@ Responsibilities:
 - define allowed columns per table
 - define forbidden patterns
 
-The allowlist constrains dynamic SQL to the intended schema subset.
+This constrains dynamic SQL to the intended schema subset.
 
-## Merge and Summarization
+## Merge And Summarization
 ### Merge in `GraphRouter`
 The router performs the main cross-source merge.
 
-Outputs usually include:
+Typical merged outputs include:
 - `finance`
 - `ops`
 - `mongo`
@@ -425,67 +446,53 @@ Outputs usually include:
 
 ### Payload compaction
 #### `app/services/response_merger.py`
-`compact_payload()` is not the primary merge algorithm.
-It is a post-merge compactor for summarization.
+`compact_payload()` is a post-merge compactor for summarization.
 
 Responsibilities:
 - flatten merged rows
-- extract top-level KPIs
+- keep relevant top-level KPIs
 - compact ports, grades, and remarks
-- dedupe some repeated grade values
-- fallback to nested finance fields
-- reduce token load for final summarization
-
-Important low-level result shape:
-- `voyage_number`
-- `pnl`
-- `revenue`
-- `total_expense`
-- `tce`
-- `total_commission`
-- `key_ports`
-- `cargo_grades`
-- `remarks`
-- vessel-level fields when applicable
+- reduce token load
+- preserve important aggregate metrics for final narration
 
 ### Final answer generation
 #### `app/llm/llm_client.py`
-`summarize_answer()` is the final answer composer.
+Important entry points:
+- `extract_intent_slots(...)`
+- `summarize_answer(...)`
 
-Its pipeline:
+Current answer generation pipeline:
 1. identify `intent_key`
-2. handle `out_of_scope` cases gracefully
-3. truncate merged data
-4. convert payload to JSON-safe shape
-5. build a strict system prompt
-6. ask the LLM for final narrative/table answer
-7. apply deterministic post-processing and table cleanup
+2. prepare JSON-safe compact payload
+3. build strict summarization prompt
+4. ask the LLM for the narrative/table answer
+5. apply deterministic output guards and markdown cleanup
 
-Important answer constraints implemented in prompt + code:
-- verdict-first responses
-- archetype-specific structure
-- remarks classification
-- no raw UUID exposure as identifiers
-- ambiguity handling for same voyage number across multiple vessels
-- table hygiene and empty-column dropping
+Current deterministic answer guards include:
+- `_ensure_ranking_voyages_answer(...)`
+- `_ensure_ranking_vessels_answer(...)`
+- `_ensure_cargo_profitability_answer(...)`
 
-## Follow-Up and Session Logic
+These exist to stabilize ranking and aggregate responses when the raw LLM answer is too generic or misses available metrics.
+
+## Follow-Up And Session Logic
 ### Result-set follow-ups
-The router supports follow-up actions over prior results, such as:
+The router supports follow-up actions over prior results such as:
 - top/bottom filters
 - compare extremes
-- explain remarks
-- project ports or grades
+- select one row from a prior result set
+- project remarks, ports, or grades from the selected row
 
 This is powered by:
-- `last_result_set` in Redis session
+- `last_result_set`
+- `last_focus_slots`
 - turn classification
-- fast-path follow-up parsing
+- result-set follow-up parsing
 
 ### Clarification persistence
 Pending clarification state is saved so the next user message can be interpreted as:
 - a slot answer
-- or a fresh question that should cancel the clarification path
+- or a fresh question that cancels the clarification
 
 ## Execution Trace Model
 The router emits a compact trace into `artifacts.trace`.
@@ -497,75 +504,61 @@ Trace events include:
 - `composite_step_result`
 - `token_usage`
 
-The UI renders this trace inside expandable sections and shows:
+The UI renders:
 - agent
 - operation
 - inputs
-- SQL when available
+- SQL where available
 - row counts
 - extracted voyage ids
+- skip/escalation reasons
 
 ## Important Design Constraints
-### 1. LLMs do not query the database directly
-All DB access goes through adapters and agents.
+### 1. LLMs do not access databases directly
+All database access goes through adapters and agents.
 
-### 2. Dynamic SQL is allowed only within a guarded path
-Prompting alone is never trusted.
-Generated SQL still passes through validation and, in finance, additional repair logic.
+### 2. Dynamic SQL exists only inside a guarded path
+Prompting alone is not trusted.
+Generated SQL must pass validation and, for finance paths, may also go through repair/fallback logic.
 
-### 3. Composite answers are intentionally staged
-The system does not ask one monolithic prompt to answer everything.
-It first resolves data, then merges, then summarizes.
+### 3. Composite answers are staged
+The system first retrieves and merges data, then narrates it.
+It does not ask one monolithic prompt to both query and answer.
 
-### 4. Session memory is intentionally selective
-Only useful conversational context is kept.
-High-risk entity anchors are cleared when the intent family changes.
+### 4. Session memory is selective
+Useful follow-up context is kept.
+High-risk entity anchors are cleared when the conversation family changes.
 
-## Known Complexity Concentration Points
-These files carry most of the behavioral complexity:
+## Updated Complexity Concentration Points
+The highest behavioral complexity remains in:
 - `app/orchestration/graph_router.py`
 - `app/llm/llm_client.py`
 - `app/registries/intent_registry.py`
 - `app/agents/finance_agent.py`
 
 Reasons:
-- orchestration combines intent, follow-up, planning, execution, and merge
-- answer generation mixes prompt rules with deterministic repairs
-- registry centralizes domain semantics and guardrails
-- finance dynamic SQL needs the most repair and fallback logic
+- orchestration now includes clarification, follow-up, planning, execution, merge, and escalation
+- answer generation mixes prompt rules with deterministic post-processing
+- registry centralizes semantics and source constraints
+- finance dynamic SQL remains the heaviest guarded generation path
 
-## Extension Points
-If the system is expanded later, the safest extension points are:
-- add new intent definitions in `INTENT_REGISTRY`
+## Recommended Extension Pattern
+When extending the system:
+- add new intent definitions to `INTENT_REGISTRY`
 - add new static queries to `SQL_REGISTRY`
-- add new SQL hints in `INTENT_REGISTRY` rather than hardcoding in agents
-- add new post-merge formatting rules in `response_merger.py`
-- keep new dynamic SQL within `sql_generator.py` + `sql_guard.py` + agent guardrails
-
-## Practical Reading Path for Engineers
-For implementation-level onboarding:
-
-1. `app/main.py`
-2. `app/orchestration/graph_router.py`
-3. `app/orchestration/planner.py`
-4. `app/registries/intent_registry.py`
-5. `app/agents/finance_agent.py`
-6. `app/agents/ops_agent.py`
-7. `app/adapters/postgres_adapter.py`
-8. `app/services/response_merger.py`
-9. `app/llm/llm_client.py`
-10. `app/sql/sql_generator.py`
-11. `app/sql/sql_guard.py`
+- prefer intent-specific SQL hints over agent-local hardcoded behavior
+- keep new dynamic SQL inside `sql_generator.py` + `sql_guard.py` + agent guardrails
+- add new deterministic answer guards only where repeated failure patterns justify them
 
 ## Summary
-The low-level architecture is a controlled execution pipeline:
+The updated low-level architecture is a controlled execution pipeline:
 - API receives a query
-- router restores conversational state
-- intent and slots are extracted with deterministic and LLM-assisted logic
-- planner selects single or composite execution
+- router restores session state
+- turn type, intent, and slots are normalized
+- planner selects `single` or `composite`
 - agents query Postgres and Mongo through adapters
-- the router merges data deterministically
-- the summarizer formats the final answer under strict prompt and code rules
-- Redis stores session memory for the next turn
+- router merges results deterministically
+- summarizer formats the final answer under strict prompt and code rules
+- Redis stores memory for the next turn
 
-This design gives the project enough flexibility for complex business analytics while still remaining debuggable through traces, registries, and guardrails.
+This design keeps the system flexible enough for complex analytics while still remaining debuggable through traces, registries, validation, and explicit orchestration.
