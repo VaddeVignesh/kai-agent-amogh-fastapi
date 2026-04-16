@@ -12,8 +12,14 @@ import streamlit as st
 from dotenv import load_dotenv
  
 import requests
- 
-API_URL = os.getenv("KAI_API_URL", "http://127.0.0.1:8000/query")
+
+# Repo root + .env must load before reading KAI_API_URL (otherwise UI ignores .env).
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+load_dotenv(dotenv_path=_PROJECT_ROOT / ".env")
+
+API_URL = os.getenv("KAI_API_URL", "http://127.0.0.1:8010/query")
 API_BASE_URL = os.getenv("KAI_API_BASE_URL", API_URL.rsplit("/", 1)[0])
 SESSION_CLEAR_URL = f"{API_BASE_URL}/session/clear"
 API_TIMEOUT_SEC = int(os.getenv("KAI_API_TIMEOUT_SEC", "300"))
@@ -89,14 +95,6 @@ def _format_sql_for_trace(sql: str) -> str:
  
 APP_TITLE    = "Digital Sales Agent"
 APP_SUBTITLE = "Maritime finance + operations analytics chatbot"
- 
-# Ensure repo root is importable (so `import app.*` works even when this file lives under app/UI/UX/).
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
- 
-# Always load environment from repo root.
-load_dotenv(dotenv_path=_PROJECT_ROOT / ".env")
  
  
 def _inject_global_css(*, theme: str) -> None:

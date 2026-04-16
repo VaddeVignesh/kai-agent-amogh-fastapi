@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Literal
 
-from app.adapters.mongo_adapter import MongoAdapter
+from app.adapters.mongo_adapter import MongoAdapter, narrow_voyage_rows_by_entity_slots
 from app.llm.mongo_query_builder import MongoQueryBuilder
 from app.mongo.mongo_guard import validate_mongo_spec
 from app.orchestration.mongo_schema import mongo_schema_hint
@@ -46,26 +46,54 @@ class MongoAgent:
         *,
         voyage_number: Optional[int] = None,
         voyage_id: Optional[str] = None,
+        entity_slots: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
 
         doc = None
 
-        if voyage_number:
-            doc = self.adapter.get_voyage_by_number(
-                voyage_number,
-                projection={
-                    "voyageId": 1,
-                    "voyageNumber": 1,
-                    "vesselName": 1,
-                    "vesselImo": 1,
-                    "remarks": 1,
-                    "remarkList": 1,
-                    "fixtures": 1,
-                    "legs": 1,
-                    "revenues": 1,
-                    "expenses": 1,
-                },
-            )
+        if voyage_number is not None:
+            try:
+                vn_int = int(float(voyage_number))
+            except Exception:
+                vn_int = None
+        else:
+            vn_int = None
+
+        if vn_int is not None:
+            proj = {
+                "voyageId": 1,
+                "voyageNumber": 1,
+                "vesselName": 1,
+                "vesselImo": 1,
+                "startDateUtc": 1,
+                "extracted_at": 1,
+                "remarks": 1,
+                "remarkList": 1,
+                "fixtures": 1,
+                "legs": 1,
+                "revenues": 1,
+                "expenses": 1,
+            }
+            doc = self.adapter.get_voyage_by_number(vn_int, projection=proj)
+            if not doc:
+                batch = self.adapter.list_voyages_by_number(
+                    vn_int, projection=proj, limit=40
+                )
+                narrowed = narrow_voyage_rows_by_entity_slots(batch, entity_slots or {})
+                if len(narrowed) == 1:
+                    doc = narrowed[0]
+                elif narrowed:
+                    # Ambiguous voyageNumber: pick a single coherent doc by anchor completeness.
+                    def _score(d: Dict[str, Any]) -> tuple[str, int, int, str]:
+                        if not isinstance(d, dict):
+                            return ("", -1, -1, "")
+                        # Prefer more recent voyage snapshots first (ISO-8601 strings are lex-sortable).
+                        recency = str(d.get("startDateUtc") or d.get("extracted_at") or "")
+                        anchor = int(bool(str(d.get("vesselImo") or "").strip())) + int(bool(str(d.get("vesselName") or "").strip()))
+                        payload = int(bool(d.get("fixtures"))) + int(bool(d.get("legs"))) + int(bool(d.get("expenses"))) + int(bool(d.get("revenues")))
+                        vid = str(d.get("voyageId") or "")
+                        return (recency, anchor, payload, vid)
+                    doc = sorted(narrowed, key=_score, reverse=True)[0]
 
         elif voyage_id:
             doc = self.adapter.fetch_voyage(
@@ -287,11 +315,14 @@ class MongoAgent:
                 return "VOYAGE", voyage_id
             raise ValueError("Missing voyage identifier (voyage_id or voyage_number).")
 
-        # ---- Explicit vessel intent ----
-        if intent_key.startswith("vessel."):
+        # ---- Explicit vessel intent (registry uses entity.vessel as well as vessel.*) ----
+        if intent_key == "entity.vessel" or intent_key.startswith("vessel."):
             imo = self._resolve_vessel_imo(slots)
-            if imo:
-                return "VESSEL", imo
+            if imo and str(imo).strip():
+                return "VESSEL", str(imo).strip()
+            vn = slots.get("vessel_name")
+            if vn and str(vn).strip():
+                return "VESSEL", str(vn).strip()
             raise ValueError("Missing vessel identifier (imo or vessel_name).")
 
         # ---- AUTO detection ----
@@ -300,8 +331,8 @@ class MongoAgent:
             return "VOYAGE", voyage_id
 
         imo = self._resolve_vessel_imo(slots)
-        if imo:
-            return "VESSEL", imo
+        if imo and str(imo).strip():
+            return "VESSEL", str(imo).strip()
 
         # ---- Follow-up: use session context ----
         if (
@@ -321,8 +352,9 @@ class MongoAgent:
     def _resolve_vessel_imo(self, slots: Dict[str, Any]) -> Optional[str]:
         """Resolve vessel IMO from slots"""
         # Direct IMO
-        if slots.get("imo"):
-            return str(slots["imo"])
+        raw_imo = slots.get("imo")
+        if raw_imo is not None and str(raw_imo).strip():
+            return str(raw_imo).strip()
 
         # Resolve via vessel name
         if slots.get("vessel_name"):
@@ -404,14 +436,22 @@ class MongoAgent:
             self._safe_print(f"   ✅ Fetched {len(vessels)} vessels")
             return {"vessels": vessels, "count": len(vessels)}
 
-        # Handle vessel-based voyage query
-        if anchor_type == "VESSEL" and not anchor_id.isdigit():
-            voyages = list(self.mongo.voyages.find(
-                {"vesselName": {"$regex": anchor_id, "$options": "i"}},
-                proj
-            ).limit(50))
-            self._safe_print(f"   ✅ Fetched {len(voyages)} voyages for vessel {anchor_id}")
-            return {"voyages": voyages, "vessel_name": anchor_id, "count": len(voyages)}
+        # Handle vessel-based voyage query (name anchor, not IMO)
+        if anchor_type == "VESSEL" and not str(anchor_id).isdigit():
+            if intent_key == "voyage.by_vessel":
+                voyages = list(
+                    self.mongo.voyages.find(
+                        {"vesselName": {"$regex": anchor_id, "$options": "i"}},
+                        proj,
+                    ).limit(50)
+                )
+                self._safe_print(f"   ✅ Fetched {len(voyages)} voyages for vessel {anchor_id}")
+                return {"voyages": voyages, "vessel_name": anchor_id, "count": len(voyages)}
+            doc = self.mongo.fetch_vessel_by_name(str(anchor_id), projection=proj)
+            if doc:
+                self._safe_print(f"   ✅ Vessel doc (by name): {anchor_id}")
+                return doc
+            raise ValueError(f"Vessel not found for name={anchor_id}")
 
         # Fetch single vessel
         if anchor_type == "VESSEL":

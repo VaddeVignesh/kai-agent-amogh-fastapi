@@ -1,17 +1,35 @@
 # Python
 __pycache__/
 *.py[cod]
-*.pyc
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
 
 # Virtual environments
 .venv/
 venv/
+
+# Environment / secrets (never commit)
 .env
 .env.*
 
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
 
 # Local artifacts
 test_validation_log.json
 
-
-.venv/
+# Generated smoke outputs (regenerate with scripts/smoke_*.py)
+scripts/smoke_results*.json
+scripts/smoke_*_review.md
+scripts/smoke_analytical_suite_8010.json
+scripts/smoke_presales_vessel_8010.json

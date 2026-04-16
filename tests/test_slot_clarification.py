@@ -116,7 +116,14 @@ def test_rankingish_followup_is_salvaged_and_does_not_inherit_entity_anchor() ->
     voyage.summary by inheriting the last voyage anchor.
     """
     llm = SimpleNamespace(
-        extract_intent_slots=lambda **kwargs: {"intent_key": "out_of_scope", "slots": {}},
+        extract_intent_slots=lambda **kwargs: {
+            "intent_key": "ranking.voyages_by_pnl",
+            "slots": {},
+            "is_followup": False,
+            "inherit_slots_from_session": [],
+            "backward_reference": False,
+            "followup_confidence": "low",
+        },
         summarize_answer=lambda **kwargs: "ok",
     )
 

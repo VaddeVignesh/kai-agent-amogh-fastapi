@@ -332,6 +332,120 @@ class LLMClient:
 
         return None
 
+    @staticmethod
+    def _compact_context_slots(slots: Any) -> Dict[str, Any]:
+        if not isinstance(slots, dict):
+            return {}
+        keep = (
+            "voyage_number", "voyage_numbers", "voyage_id",
+            "vessel_name", "imo", "port_name",
+            "scenario", "limit", "metric", "group_by",
+            "cargo_grade", "cargo_grades",
+        )
+        out: Dict[str, Any] = {}
+        for key in keep:
+            value = slots.get(key)
+            if value in (None, "", [], {}):
+                continue
+            out[key] = value
+        return out
+
+    def _recent_turns_for_context(self, session_context: Optional[Dict[str, Any]], *, limit: int = 3) -> List[Dict[str, Any]]:
+        if not isinstance(session_context, dict):
+            return []
+        history = session_context.get("turn_history")
+        if not isinstance(history, list):
+            return []
+        compact: List[Dict[str, Any]] = []
+        for item in history[-limit:]:
+            if not isinstance(item, dict):
+                continue
+            row: Dict[str, Any] = {}
+            query = str(item.get("query") or "").strip()
+            if query:
+                row["query"] = query
+            intent_key = str(item.get("intent_key") or "").strip()
+            if intent_key:
+                row["intent_key"] = intent_key
+            slots = self._compact_context_slots(item.get("slots"))
+            if slots:
+                row["slots"] = slots
+            headline = str(item.get("answer_headline") or "").strip()
+            if headline:
+                row["answer_headline"] = headline
+            if row:
+                compact.append(row)
+        return compact
+
+    def _conversation_memory_windows(self, session_context: Optional[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        turns = self._recent_turns_for_context(session_context, limit=5)
+        if not turns:
+            return {"hot": [], "warm": []}
+
+        hot = turns[-3:]
+        warm_rows: List[Dict[str, Any]] = []
+        for item in turns[:-3]:
+            row: Dict[str, Any] = {}
+            intent_key = str(item.get("intent_key") or "").strip()
+            if intent_key:
+                row["intent_key"] = intent_key
+            slots = self._compact_context_slots(item.get("slots"))
+            if slots:
+                row["slots"] = slots
+            if row:
+                warm_rows.append(row)
+        return {"hot": hot, "warm": warm_rows}
+
+    def _memory_windows_prompt(self, session_context: Optional[Dict[str, Any]]) -> str:
+        windows = self._conversation_memory_windows(session_context)
+        hot_turns = windows.get("hot") or []
+        warm_turns = windows.get("warm") or []
+
+        lines: List[str] = []
+        if hot_turns:
+            lines.append("HOT CONTEXT (last 2-3 turns; use for immediate follow-up resolution):")
+            for idx, item in enumerate(hot_turns, start=1):
+                lines.append(f"Hot Turn {idx}:")
+                lines.append(f"- User: {item.get('query')}")
+                if item.get("intent_key"):
+                    lines.append(f"- Intent: {item.get('intent_key')}")
+                if item.get("slots"):
+                    lines.append(f"- Anchors/Slots: {json.dumps(item.get('slots'), ensure_ascii=True)}")
+                if item.get("answer_headline"):
+                    lines.append(f"- Prior answer summary: {item.get('answer_headline')}")
+        else:
+            lines.append("HOT CONTEXT: none")
+
+        lines.append("")
+        if warm_turns:
+            lines.append("WARM CONTEXT (older turns; anchors only for backward references):")
+            for idx, item in enumerate(warm_turns, start=1):
+                lines.append(f"Warm Turn {idx}:")
+                if item.get("intent_key"):
+                    lines.append(f"- Intent: {item.get('intent_key')}")
+                if item.get("slots"):
+                    lines.append(f"- Anchors: {json.dumps(item.get('slots'), ensure_ascii=True)}")
+        else:
+            lines.append("WARM CONTEXT: none")
+
+        return "\n".join(lines)
+
+    def _recent_turns_prompt(self, session_context: Optional[Dict[str, Any]], *, limit: int = 3) -> str:
+        turns = self._recent_turns_for_context(session_context, limit=limit)
+        if not turns:
+            return "No recent conversational context."
+        lines = []
+        for idx, item in enumerate(turns, start=1):
+            lines.append(f"Turn {idx}:")
+            lines.append(f"- User: {item.get('query')}")
+            if item.get("intent_key"):
+                lines.append(f"- Intent: {item.get('intent_key')}")
+            if item.get("slots"):
+                lines.append(f"- Slots: {json.dumps(item.get('slots'), ensure_ascii=True)}")
+            if item.get("answer_headline"):
+                lines.append(f"- Prior answer summary: {item.get('answer_headline')}")
+        return "\n".join(lines)
+
     # =========================================================
     # Extract intent and slots
     # =========================================================
@@ -342,6 +456,7 @@ class LLMClient:
         text: str,
         supported_intents: List[str],
         schema_hint: Optional[Dict[str, Any]] = None,
+        session_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
 
         # Normalize common apostrophe variants (incl. mojibake) to improve regex reliability.
@@ -594,6 +709,10 @@ class LLMClient:
             return {
                 "intent_key": intent_key,
                 "slots": self._sanitize_slots(slots),
+                "is_followup": False,
+                "inherit_slots_from_session": [],
+                "backward_reference": False,
+                "followup_confidence": "low",
             }
 
         # =========================================================
@@ -619,10 +738,14 @@ class LLMClient:
             intent_lines.append(line)
 
         intents_formatted = "\n".join(intent_lines)
+        recent_context = self._memory_windows_prompt(session_context)
 
         system = f"""
 You are a maritime finance intent classifier.
-Return ONLY valid JSON with keys: intent_key, slots.
+Return ONLY valid JSON with keys: intent_key, slots, is_followup, inherit_slots_from_session, backward_reference, followup_confidence.
+
+RECENT CONVERSATION CONTEXT:
+{recent_context}
 
 SUPPORTED INTENTS (read descriptions carefully before classifying):
 {intents_formatted}
@@ -644,6 +767,12 @@ CLASSIFICATION RULES:
 - voyage_numbers must be int list
 - limit must be int (default 10 if user says "top N" without specifying N)
 - If no intent clearly fits → out_of_scope (use sparingly — always prefer the closest matching intent over out_of_scope)
+- Decide whether the current message is a follow-up using the hot/warm context above.
+- Set is_followup=true only when the user is continuing or referring back to prior context.
+- inherit_slots_from_session must be a list of slot KEYS ONLY, such as ["voyage_number"] or ["vessel_name", "imo"].
+- Set backward_reference=true only when the user is referring to older context beyond the immediate last turn.
+- followup_confidence must be one of: high, medium, low.
+- If the current message is a fresh query with an explicitly named new entity, use is_followup=false and inherit_slots_from_session=[].
 - Ranking aliases (allowed):
   - ranking.pnl: Rank voyages/entities by PnL (e.g., "top 10 voyages by PnL", "highest profit voyages")
   - ranking.revenue: Rank voyages/entities by revenue
@@ -668,10 +797,25 @@ SLOT EXTRACTION:
         )
 
         if not result or not isinstance(result, dict):
-            return {"intent_key": "out_of_scope", "slots": slots}
+            return {
+                "intent_key": "out_of_scope",
+                "slots": slots,
+                "is_followup": False,
+                "inherit_slots_from_session": [],
+                "backward_reference": False,
+                "followup_confidence": "low",
+            }
 
         intent = result.get("intent_key", "out_of_scope")
         llm_slots = result.get("slots", {}) or {}
+        is_followup = bool(result.get("is_followup"))
+        inherit_slots = result.get("inherit_slots_from_session")
+        inherit_slots = inherit_slots if isinstance(inherit_slots, list) else []
+        inherit_slots = [str(k).strip() for k in inherit_slots if str(k).strip()]
+        backward_reference = bool(result.get("backward_reference"))
+        followup_confidence = str(result.get("followup_confidence") or "").strip().lower()
+        if followup_confidence not in ("high", "medium", "low"):
+            followup_confidence = "low"
 
         # Merge regex + llm slots (regex wins)
         llm_slots.update({k: v for k, v in slots.items()})
@@ -789,6 +933,10 @@ SLOT EXTRACTION:
         return {
             "intent_key": intent_key,
             "slots": clean_slots,
+            "is_followup": is_followup,
+            "inherit_slots_from_session": inherit_slots,
+            "backward_reference": backward_reference,
+            "followup_confidence": followup_confidence,
         }
 
     # =========================================================
@@ -1005,12 +1153,14 @@ SLOT EXTRACTION:
         *,
         question: str,
         merged_data: Dict[str, Any],
+        session_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Alias function designed specifically for the voyage.summary override logic."""
         return self.summarize_answer(
             question=question,
             plan={"plan_type": "single", "intent_key": "voyage.summary"},
-            merged=merged_data
+            merged=merged_data,
+            session_context=session_context,
         )
 
     def summarize_answer(
@@ -1019,6 +1169,7 @@ SLOT EXTRACTION:
         question: str,
         plan: Dict[str, Any],
         merged: Dict[str, Any],
+        session_context: Optional[Dict[str, Any]] = None,
     ) -> str:
 
         intent_key = ""
@@ -1101,6 +1252,8 @@ SLOT EXTRACTION:
             ranking_hint = "Each object in merged_rows has numeric fields pnl, revenue, total_expense at the top level. You MUST include PnL and Revenue (and Total expense when present) as columns in the Results table. Do NOT say financial metrics are not available."
 
         style = self._derive_answer_style(question=question, intent_key=intent_key)
+        recent_context_turns = self._recent_turns_for_context(session_context, limit=2)
+        recent_context_text = self._recent_turns_prompt(session_context, limit=2)
 
         system = """
 You are a flagship-quality maritime analytics assistant (finance + operations).
@@ -1252,6 +1405,8 @@ FAILSAFE:
                     "question": question,
                     "plan": plan,
                     "intent_key": intent_key,
+                    "recent_context": recent_context_turns,
+                    "recent_context_text": recent_context_text,
                     "data": {**(merged_safe if isinstance(merged_safe, dict) else {}), "style": style},
                     "merged_rows": merged_rows,
                     **({("instruction"): ranking_hint} if ranking_hint else {}),
@@ -2084,12 +2239,18 @@ FAILSAFE:
         # Fix compacted numeric ranges.
         s = re.sub(r"(?<=\d)\s*to\s*(?=\$?\d)", " to ", s, flags=re.IGNORECASE)
 
-        # Fix compacted number-word boundaries in narrative text.
-        s = re.sub(r"(?<=\d)(?=[A-Za-z])", " ", s)
-        s = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", s)
+        def _fix_line_for_digit_letter_spacing(line: str) -> str:
+            st = line.strip()
+            if st.startswith("|") and st.endswith("|") and "|" in st[1:-1]:
+                return line
+            t = line
+            t = re.sub(r"(?<=\d)(?=[A-Za-z])", " ", t)
+            t = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", t)
+            t = re.sub(r"[ \t]+", " ", t)
+            return t
 
-        # Normalize whitespace but keep markdown line breaks.
-        s = re.sub(r"[ \t]+", " ", s)
+        s = "\n".join(_fix_line_for_digit_letter_spacing(L) for L in s.splitlines())
+
         s = re.sub(r"\n{3,}", "\n\n", s)
         return s.strip()
 

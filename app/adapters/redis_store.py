@@ -19,6 +19,7 @@ VOLATILE_SLOTS = {
 }
 
 SESSION_MAX_AGE_SECONDS = 1800  # 30 minutes
+TURN_HISTORY_MAX_ENTRIES = 5
 
 
 def _json_safe(value: Any) -> Any:
@@ -32,6 +33,62 @@ def _json_safe(value: Any) -> Any:
    if isinstance(value, (list, tuple)):
        return [_json_safe(v) for v in value]
    return value
+
+
+def _intent_family(intent_key: Any) -> Optional[str]:
+   text = str(intent_key or "").strip().lower()
+   if not text:
+       return None
+   if text.startswith("voyage."):
+       return "voyage"
+   if text.startswith("vessel.") or text == "ranking.vessel_metadata":
+       return "vessel"
+   if text.startswith("port.") or text.startswith("ops.port_"):
+       return "port"
+   if text.startswith("ranking.") or text.startswith("analysis.") or text.startswith("aggregation.") or text.startswith("comparison."):
+       return "fleet"
+   return None
+
+
+def _same_turn(session: Dict[str, Any], session_patch: Dict[str, Any]) -> bool:
+   marker = (session_patch or {}).get("_turn_marker")
+   if marker and marker == session.get("_last_turn_marker"):
+       return True
+   return False
+
+
+def _compact_turn_history_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+   if not isinstance(entry, dict):
+       return {}
+   out: Dict[str, Any] = {}
+   turn = entry.get("turn")
+   if isinstance(turn, int):
+       out["turn"] = turn
+   query = entry.get("query")
+   if isinstance(query, str) and query.strip():
+       out["query"] = query.strip()[:300]
+   raw_user_input = entry.get("raw_user_input")
+   if isinstance(raw_user_input, str) and raw_user_input.strip():
+       out["raw_user_input"] = raw_user_input.strip()[:160]
+   intent_key = entry.get("intent_key")
+   if isinstance(intent_key, str) and intent_key.strip():
+       out["intent_key"] = intent_key.strip()
+   plan_type = entry.get("plan_type")
+   if isinstance(plan_type, str) and plan_type.strip():
+       out["plan_type"] = plan_type.strip()
+   slots = entry.get("slots")
+   if isinstance(slots, dict):
+       compact_slots = {
+           str(k): _json_safe(v)
+           for k, v in slots.items()
+           if v not in (None, "", [], {})
+       }
+       if compact_slots:
+           out["slots"] = compact_slots
+   answer_headline = entry.get("answer_headline")
+   if isinstance(answer_headline, str) and answer_headline.strip():
+       out["answer_headline"] = answer_headline.strip()[:240]
+   return out
 
 # -----------------------------
 # Config
@@ -80,9 +137,11 @@ class RedisStore:
        return {
            "slots": {},
           "last_intent_key": None,
+           "last_intent": None,
            "anchor_type": None,
            "anchor_id": None,
            "last_user_input": None,
+           "turn_history": [],
            "turn": 0,
            "updated_at": int(time.time()),
        }
@@ -127,6 +186,8 @@ class RedisStore:
            # In-memory fallback if Redis is down / disabled.
            cached = self._fallback_sessions.get(session_id)
            session = dict(cached) if isinstance(cached, dict) else self._default_session()
+           if not isinstance(session.get("turn_history"), list):
+               session["turn_history"] = []
            last_updated = session.get("last_updated_ts")
            if last_updated:
                if time.time() - float(last_updated) > SESSION_MAX_AGE_SECONDS:
@@ -134,6 +195,10 @@ class RedisStore:
            return session
        try:
            session = json.loads(raw)
+           if not isinstance(session.get("turn_history"), list):
+               session["turn_history"] = []
+           if "last_intent" not in session and session.get("last_intent_key"):
+               session["last_intent"] = session.get("last_intent_key")
            last_updated = session.get("last_updated_ts")
            if last_updated:
                if time.time() - float(last_updated) > SESSION_MAX_AGE_SECONDS:
@@ -147,29 +212,50 @@ class RedisStore:
        Merge patch into existing session and refresh TTL.
        """
        session = self.load_session(session_id)
+       patch = dict(session_patch or {})
        slots = session.get("slots")
        if not isinstance(slots, dict):
            slots = {}
            session["slots"] = slots
 
        intent_key = (
-           (session_patch or {}).get("intent_key")
-           or (session_patch or {}).get("last_intent_key")
+           patch.get("intent_key")
+           or patch.get("last_intent_key")
+           or patch.get("last_intent")
        )
-       # If intent has changed, clear volatile slots to prevent context poisoning
-       if session.get("last_intent_key") and intent_key and session.get("last_intent_key") != intent_key:
+       prev_intent_key = session.get("last_intent") or session.get("last_intent_key")
+       prev_family = _intent_family(prev_intent_key)
+       next_family = _intent_family(intent_key)
+       # If the entity family changed, clear volatile slots to prevent context poisoning.
+       if prev_family and next_family and prev_family != next_family:
            for k in VOLATILE_SLOTS:
                slots.pop(k, None)
            session.pop("last_result_set", None)
            session.pop("voyage_ids", None)
+           session.pop("last_focus_slots", None)
+
+       record_turn = patch.pop("_record_turn", None)
+       turn_marker = patch.pop("_turn_marker", None)
 
        # merge patch (shallow merge)
-       for k, v in (session_patch or {}).items():
+       for k, v in patch.items():
            session[k] = v
        if intent_key:
            session["last_intent_key"] = intent_key
-       # increment turn
-       session["turn"] = int(session.get("turn", 0)) + 1
+           session["last_intent"] = intent_key
+
+       if record_turn and not _same_turn(session, {"_turn_marker": turn_marker}):
+           next_turn = int(session.get("turn", 0)) + 1
+           session["turn"] = next_turn
+           session["_last_turn_marker"] = turn_marker or f"turn-{next_turn}"
+           history = session.get("turn_history")
+           if not isinstance(history, list):
+               history = []
+           entry = _compact_turn_history_entry({**record_turn, "turn": next_turn})
+           if entry:
+               history.append(entry)
+               session["turn_history"] = history[-TURN_HISTORY_MAX_ENTRIES:]
+
        session["updated_at"] = int(time.time())
        session["last_updated_ts"] = time.time()
 
