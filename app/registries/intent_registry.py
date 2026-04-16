@@ -195,7 +195,7 @@ INTENT-SPECIFIC RULES (finance voyage.summary):
     "vessel.summary": {
         "description": (
             "Full performance summary of a SPECIFIC vessel already identified by name or IMO. "
-            "Use ONLY when the user names a specific vessel (e.g. 'Stena Superior', IMO 9667485). "
+            "Use ONLY when the user names a specific vessel (e.g. 'Vessel-001', IMO 9667485). "
             "Fetches all voyages for that vessel with finance + ops + Mongo context. "
             "Do NOT use when the user is asking which vessel ranks best/worst across the fleet — "
             "use ranking.vessels for that."
@@ -1559,6 +1559,11 @@ INTENT-SPECIFIC RULES (finance composite.query):
 # Intent aliases
 # =========================================================
 
+# INTENT_ALIASES — maps legacy, shorthand, or natural language variants
+# to canonical intent keys. These exist for backward compatibility and
+# to handle common user phrasings without requiring exact intent key matches.
+# Long-form English aliases (e.g. full sentence keys) should be kept minimal
+# and are candidates for replacement by LLM normalisation in future.
 INTENT_ALIASES = {
     # Analysis aliases
     "analysis.highrevenuelowpnl":               "analysis.high_revenue_low_pnl",

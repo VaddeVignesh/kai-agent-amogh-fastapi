@@ -45,6 +45,8 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
             LEFT JOIN ops_voyage_summary o
               ON f.voyage_number = o.voyage_number
               AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+            -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+            -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
             WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
               AND (
                 (%(voyage_number)s IS NOT NULL AND f.voyage_number::TEXT = %(voyage_number)s::TEXT)
@@ -84,6 +86,8 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
             LEFT JOIN ops_voyage_summary o
               ON f.voyage_number = o.voyage_number
               AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+            -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+            -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
             WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
               AND (%(voyage_number)s IS NULL OR f.voyage_number = %(voyage_number)s)
               AND (%(port_name)s IS NULL OR o.ports_json::text ILIKE '%%' || %(port_name)s || '%%')
@@ -119,6 +123,8 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
               voyage_start_date,
               voyage_end_date
             FROM finance_voyage_kpi
+            -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+            -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
             WHERE scenario = COALESCE(%(scenario)s, 'ACTUAL')
               AND revenue IS NOT NULL
               AND pnl IS NOT NULL
@@ -146,6 +152,8 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
               voyage_start_date,
               voyage_end_date
             FROM finance_voyage_kpi
+            -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+            -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
             WHERE scenario = COALESCE(%(scenario)s, 'ACTUAL')
               AND pnl IS NOT NULL
             ORDER BY
@@ -203,6 +211,8 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
             LEFT JOIN ops_voyage_summary o
               ON f.voyage_number = o.voyage_number
               AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+            -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+            -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
             WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
               AND o.grades_json IS NOT NULL
               AND o.grades_json::text ILIKE '%%' || %(cargo_grade)s || '%%'
@@ -240,6 +250,8 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
             LEFT JOIN ops_voyage_summary o
               ON f.voyage_number = o.voyage_number
               AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+            -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+            -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
             WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
               AND (
                 o.vessel_name ILIKE '%%' || %(vessel_ref)s || '%%'
@@ -268,6 +280,8 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
             LEFT JOIN ops_voyage_summary o
               ON f.voyage_number = o.voyage_number
               AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+            -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+            -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
             WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
               AND f.pnl IS NOT NULL
             GROUP BY f.vessel_imo
@@ -334,6 +348,8 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
                     AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
                   )
                 )
+              -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+              -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
               WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
                 AND o.grades_json IS NOT NULL
                 AND o.grades_json::text != '[]'
@@ -375,6 +391,8 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
             JOIN ops_voyage_summary o
               ON f.voyage_number = o.voyage_number
               AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+            -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+            -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
             WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
               AND o.module_type IS NOT NULL
             GROUP BY o.module_type
@@ -405,6 +423,8 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
             JOIN ops_voyage_summary o
               ON f.voyage_number = o.voyage_number
               AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+            -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+            -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
             WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
               AND o.ports_json::text ILIKE '%%' || %(port_name)s || '%%'
             ORDER BY f.pnl DESC NULLS LAST
@@ -465,6 +485,8 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
             JOIN ops_voyage_summary o
               ON f.voyage_number = o.voyage_number
               AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+            -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+            -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
             WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
               AND o.is_delayed = TRUE
               AND (%(min_offhire)s IS NULL OR o.offhire_days >= %(min_offhire)s::NUMERIC)
@@ -496,6 +518,8 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
             JOIN ops_voyage_summary o
               ON f.voyage_number = o.voyage_number
               AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+            -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+            -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
             WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
             ORDER BY o.offhire_days DESC NULLS LAST, f.voyage_number DESC
             LIMIT %(limit)s;
@@ -507,6 +531,8 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
     # =====================================================
 
     "finance.compare_scenarios": QuerySpec(
+        # TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+        # Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
         description="Compare ACTUAL vs WHEN_FIXED for specific voyages",
         required_params=["voyage_numbers"],
         sql="""
@@ -518,16 +544,30 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
                   f.voyage_number,
                   REPLACE(f.vessel_imo::TEXT, '.0', '') AS vessel_imo_key,
                   MAX(f.voyage_id) AS voyage_id,
+                  -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+                  -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
                   MAX(CASE WHEN f.scenario = COALESCE(%(scenario_actual)s, 'ACTUAL') THEN f.pnl END) AS pnl_actual_by_pair,
+                  -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+                  -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
                   MAX(CASE WHEN f.scenario = 'WHEN_FIXED' THEN f.pnl END) AS pnl_when_fixed_by_pair,
+                  -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+                  -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
                   MAX(CASE WHEN f.scenario = COALESCE(%(scenario_actual)s, 'ACTUAL') THEN f.tce END) AS tce_actual_by_pair,
+                  -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+                  -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
                   MAX(CASE WHEN f.scenario = 'WHEN_FIXED' THEN f.tce END) AS tce_when_fixed_by_pair,
+                  -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+                  -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
                   MAX(CASE WHEN f.scenario = COALESCE(%(scenario_actual)s, 'ACTUAL') THEN f.revenue END) AS revenue_actual_by_pair,
                   MAX(f.voyage_end_date) AS voyage_end_date
                 FROM finance_voyage_kpi f
                 INNER JOIN voyage_nums vn ON f.voyage_number = vn.vnum
                 WHERE f.scenario IN (
+                  -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+                  -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
                   COALESCE(%(scenario_actual)s, 'ACTUAL'),
+                  -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+                  -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
                   COALESCE(%(scenario_when_fixed)s, 'WHEN_FIXED')
                 )
                 GROUP BY f.voyage_number, REPLACE(f.vessel_imo::TEXT, '.0', '')
@@ -576,6 +616,8 @@ SQL_REGISTRY: Dict[str, QuerySpec] = {
             LEFT JOIN ops_voyage_summary o
               ON f.voyage_number = o.voyage_number
               AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+            -- TODO: Read scenario values from config/entity_catalog.yaml via schema_loader
+            -- Hardcoded here temporarily — scheduled for config-driven replacement in Phase 2
             WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
               AND f.voyage_number = ANY(%(voyage_numbers)s::INT[])
             ORDER BY f.voyage_number ASC

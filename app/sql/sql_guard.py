@@ -125,6 +125,11 @@ def _sanitize_params(params: Dict[str, Any]) -> Dict[str, Any]:
 # =========================================================
 
 def _apply_simple_fixes(sql: str) -> str:
+    # WARNING: This function applies post-hoc regex rewrites to generated SQL.
+    # Risk: Can silently mask SQL generation errors and may over-rewrite valid expressions.
+    # Preferred fix: Improve sql_generator.py prompts so SQL is correct before reaching here.
+    # This function is a safety net — not a permanent solution.
+    # Scheduled for removal once sql_generator prompt quality is verified stable.
     fixed = sql
 
     # Column renames

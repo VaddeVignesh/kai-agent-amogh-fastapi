@@ -1,0 +1,19 @@
+# Tunable thresholds and data quality settings.
+# Change values here — no code changes needed.
+
+query_defaults:
+  default_limit: 10
+  default_scenario: "ACTUAL"
+
+analytics_thresholds:
+  min_voyage_count: 3
+  min_voyage_count_fallback: 1
+
+data_quality_filters:
+  # String values treated as null/empty in cargo/grade data
+  null_equivalents:
+    - "none"
+    - "null"
+    - "n/a"
+    - ""
+    - "-"

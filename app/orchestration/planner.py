@@ -7,17 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from app.registries.intent_registry import (
     INTENT_REGISTRY,
-    SUPPORTED_INTENTS,
     resolve_intent,
-)
-
-AGGREGATE_INTENT_PREFIXES = (
-    "ranking.",
-    "analysis.",
-    "aggregation.",
-    "summary.by_",
-    "breakdown.",
-    "distribution.",
 )
 
 FINANCE_KEYWORDS = frozenset([
@@ -70,6 +60,17 @@ class ExecutionPlan:
 # =========================================================
 
 class Planner:
+    """
+    Execution planner for multi-agent query routing.
+
+    Determines which agents to invoke (finance, ops, mongo) and in what
+    configuration (single, composite, registry, dynamic) based on the
+    classified intent and query context.
+
+    Note: Contains keyword-based heuristics for source selection and
+    composite query detection. These are scheduled for replacement with
+    schema-driven config routing in a future refactor.
+    """
 
     def __init__(self, llm_client):
         self.llm = llm_client
