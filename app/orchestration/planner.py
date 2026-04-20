@@ -29,8 +29,18 @@ MONGO_KEYWORDS = frozenset([
 logger = logging.getLogger(__name__)
 
 
-def _is_mixed_voyage_query(user_input: str) -> bool:
-    """Returns True if query needs both PostgreSQL and MongoDB sources."""
+def _is_mixed_voyage_query(user_input: str, session_context: dict = None) -> bool:
+    """Returns True if query needs both PostgreSQL and MongoDB sources.
+    
+    PRIMARY: Uses structured intent required_sources if available and confident.
+    FALLBACK: Uses keyword matching when structured intent is absent.
+    """
+    # PRIMARY: structured intent required_sources
+    _si = (session_context or {}).get("_structured_intent")
+    if _si and _si.get("required_sources") and _si.get("confidence") in ("high", "medium"):
+        sources = _si["required_sources"]
+        return "postgres" in sources and "mongo" in sources
+    # FALLBACK: keyword matching only when structured intent absent
     text = (user_input or "").lower()
     needs_finance = any(kw in text for kw in FINANCE_KEYWORDS)
     needs_mongo = any(kw in text for kw in MONGO_KEYWORDS)
@@ -100,6 +110,17 @@ class Planner:
         """
         text_lower = text.lower()
         session_context = session_context if isinstance(session_context, dict) else {}
+
+        # Phase 5C Slice 1: structured intent owns source decision
+        _si = session_context.get("_structured_intent")
+        _sources_resolved = False
+        if _si and _si.get("required_sources") and _si.get("confidence") in ("high", "medium"):
+            _resolved_sources = _si["required_sources"]
+            _sources_resolved = True
+            logger.info(
+                f"[planner] sources from structured intent: {_resolved_sources} | "
+                f"confidence={_si.get('confidence')}"
+            )
 
         intent_key = resolve_intent(intent_key or "out_of_scope")
         slots = slots or {}
@@ -198,7 +219,7 @@ class Planner:
                 or slots.get("voyage_number")
                 or slots.get("voyage_id")
             )
-            and _is_mixed_voyage_query(text)
+            and _is_mixed_voyage_query(text, session_context)
         ):
             return _with_plan_log(ExecutionPlan(
                 plan_type="multi",
@@ -295,25 +316,25 @@ class Planner:
             )
 
         # Text-based composite overrides
-        if "offhire" in text_lower and ("pnl" in text_lower or "tce" in text_lower):
+        if not _sources_resolved and "offhire" in text_lower and ("pnl" in text_lower or "tce" in text_lower):
             return _with_plan_log(
                 self._build_composite(intent_key, text, slots, confidence=0.95),
                 "text_offhire_composite",
             )
 
-        if "delayed" in text_lower and ("pnl" in text_lower or "expense" in text_lower):
+        if not _sources_resolved and "delayed" in text_lower and ("pnl" in text_lower or "expense" in text_lower):
             return _with_plan_log(
                 self._build_composite(intent_key, text, slots, confidence=0.95),
                 "text_delayed_composite",
             )
 
-        if "over time" in text_lower or "trend" in text_lower:
+        if not _sources_resolved and ("over time" in text_lower or "trend" in text_lower):
             return _with_plan_log(
                 self._build_composite(intent_key, text, slots, confidence=0.92),
                 "text_trend_composite",
             )
 
-        if "cargo" in text_lower and "port" in text_lower:
+        if not _sources_resolved and "cargo" in text_lower and "port" in text_lower:
             return _with_plan_log(
                 self._build_composite(intent_key, text, slots, confidence=0.92),
                 "text_cargo_port_composite",

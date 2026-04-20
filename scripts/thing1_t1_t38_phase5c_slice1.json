@@ -1,0 +1,372 @@
+[
+  {
+    "t_number": "T1",
+    "query": "show hire rate and scrubber for voyages 2301 2302 2303",
+    "session_id": "thing1-t1",
+    "status_code": 200,
+    "intent_key": "vessel.metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T2",
+    "query": "show vessel id, IMO, and account code for vessel Elka Delphi",
+    "session_id": "thing1-t2",
+    "status_code": 200,
+    "intent_key": "vessel.metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T3",
+    "query": "what is the hire rate, scrubber status, and market type of vessel Elka Delphi",
+    "session_id": "thing1-t3",
+    "status_code": 200,
+    "intent_key": "vessel.metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T4",
+    "query": "list all passage types for vessel Elka Delphi",
+    "session_id": "thing1-t4",
+    "status_code": 200,
+    "intent_key": "vessel.metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T5",
+    "query": "show passage consumption profile for vessel Elka Delphi",
+    "session_id": "thing1-t5",
+    "status_code": 200,
+    "intent_key": "vessel.metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T6",
+    "query": "for vessel Elka Delphi show Ballast default speed, IFO, and MGO",
+    "session_id": "thing1-t6",
+    "status_code": 200,
+    "intent_key": "vessel.metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T7",
+    "query": "show contract history for vessel Elka Delphi",
+    "session_id": "thing1-t7",
+    "status_code": 200,
+    "intent_key": "vessel.metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T8",
+    "query": "for voyages 2301 and 2302 show account code and market type",
+    "session_id": "thing1-t8",
+    "status_code": 200,
+    "intent_key": "vessel.metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T9",
+    "query": "what is the charterer, broker, and commission rates for voyage 2306",
+    "session_id": "thing1-t9",
+    "status_code": 200,
+    "intent_key": "voyage.summary",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T10",
+    "query": "show the CP date, CP quantity, demurrage rate, and laytime for voyage 2306",
+    "session_id": "thing1-t10",
+    "status_code": 200,
+    "intent_key": "voyage.metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T11",
+    "query": "what cargo was carried on voyage 2306",
+    "session_id": "thing1-t11",
+    "status_code": 200,
+    "intent_key": "voyage.metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T12",
+    "query": "show the full route for voyage 2306",
+    "session_id": "thing1-t12",
+    "status_code": 200,
+    "intent_key": "voyage.metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T13",
+    "query": "break down the revenue lines for voyage 2306",
+    "session_id": "thing1-t13",
+    "status_code": 200,
+    "intent_key": "voyage.metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T14",
+    "query": "what are the expense items for voyage 2306",
+    "session_id": "thing1-t14",
+    "status_code": 200,
+    "intent_key": "voyage.summary",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T15",
+    "query": "show bunker consumption and cost for voyage 2306",
+    "session_id": "thing1-t15",
+    "status_code": 200,
+    "intent_key": "voyage.summary",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T16",
+    "query": "what remarks are on record for voyage 2306",
+    "session_id": "thing1-t16",
+    "status_code": 200,
+    "intent_key": "voyage.metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T17",
+    "query": "for voyage 1901 give me the financial summary",
+    "session_id": "thing1-t17",
+    "status_code": 200,
+    "intent_key": "voyage.summary",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T18",
+    "query": "show me the top 5 most profitable voyages",
+    "session_id": "thing1-t18-seq",
+    "status_code": 200,
+    "intent_key": "ranking.voyages_by_pnl",
+    "dynamic_sql_used": true,
+    "dynamic_sql_agents": [
+      "finance",
+      "ops"
+    ]
+  },
+  {
+    "t_number": "T19",
+    "query": "which voyages had high revenue but negative PnL",
+    "session_id": "thing1-t19",
+    "status_code": 200,
+    "intent_key": "analysis.high_revenue_low_pnl",
+    "dynamic_sql_used": true,
+    "dynamic_sql_agents": [
+      "finance",
+      "ops"
+    ]
+  },
+  {
+    "t_number": "T20",
+    "query": "compare actual vs when-fixed for voyages 1901 1902 2301",
+    "session_id": "thing1-t20",
+    "status_code": 200,
+    "intent_key": "analysis.scenario_comparison",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T21",
+    "query": "for voyage 2306 give an executive summary",
+    "session_id": "thing1-t21",
+    "status_code": 200,
+    "intent_key": "voyage.summary",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T22",
+    "query": "show the top loss-making voyages",
+    "session_id": "thing1-t22",
+    "status_code": 200,
+    "intent_key": "analysis.segment_performance",
+    "dynamic_sql_used": true,
+    "dynamic_sql_agents": [
+      "finance",
+      "ops"
+    ]
+  },
+  {
+    "t_number": "T23",
+    "query": "for voyages flagged as delayed with negative PnL show offhire days",
+    "session_id": "thing1-t23",
+    "status_code": 200,
+    "intent_key": "finance.loss_due_to_delay",
+    "dynamic_sql_used": true,
+    "dynamic_sql_agents": [
+      "finance",
+      "ops"
+    ]
+  },
+  {
+    "t_number": "T24",
+    "query": "which vessel has earned the highest total PnL",
+    "session_id": "thing1-t24",
+    "status_code": 200,
+    "intent_key": "ranking.vessels",
+    "dynamic_sql_used": true,
+    "dynamic_sql_agents": [
+      "finance"
+    ]
+  },
+  {
+    "t_number": "T25",
+    "query": "what is the average TCE per vessel",
+    "session_id": "thing1-t25",
+    "status_code": 200,
+    "intent_key": "ranking.vessels",
+    "dynamic_sql_used": true,
+    "dynamic_sql_agents": [
+      "finance"
+    ]
+  },
+  {
+    "t_number": "T26",
+    "query": "which cargo grade appears most frequently",
+    "session_id": "thing1-t26-seq",
+    "status_code": 200,
+    "intent_key": "ranking.cargo",
+    "dynamic_sql_used": true,
+    "dynamic_sql_agents": [
+      "ops"
+    ]
+  },
+  {
+    "t_number": "T27",
+    "query": "how many voyages does each vessel have",
+    "session_id": "thing1-t27-seq",
+    "status_code": 200,
+    "intent_key": "aggregation.count",
+    "dynamic_sql_used": true,
+    "dynamic_sql_agents": [
+      "finance"
+    ]
+  },
+  {
+    "t_number": "T28",
+    "query": "which vessel has carried the most diverse set of cargo grades",
+    "session_id": "thing1-t28",
+    "status_code": 200,
+    "intent_key": "ranking.vessels",
+    "dynamic_sql_used": true,
+    "dynamic_sql_agents": [
+      "finance"
+    ]
+  },
+  {
+    "t_number": "T29",
+    "query": "cargo grades with highest variance between ACTUAL and WHEN_FIXED PnL",
+    "session_id": "thing1-t29",
+    "status_code": 200,
+    "intent_key": "analysis.cargo_profitability",
+    "dynamic_sql_used": true,
+    "dynamic_sql_agents": [
+      "finance"
+    ]
+  },
+  {
+    "t_number": "T30",
+    "query": "show average PnL trend month by month",
+    "session_id": "thing1-t30",
+    "status_code": 200,
+    "intent_key": "aggregation.trends",
+    "dynamic_sql_used": true,
+    "dynamic_sql_agents": [
+      "finance"
+    ]
+  },
+  {
+    "t_number": "T31",
+    "query": "which vessels are currently operating",
+    "session_id": "thing1-t31",
+    "status_code": 200,
+    "intent_key": "ranking.vessel_metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T32",
+    "query": "which vessels have the highest hire rate",
+    "session_id": "thing1-t32",
+    "status_code": 200,
+    "intent_key": "ranking.vessel_metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T33",
+    "query": "which vessels have scrubbers",
+    "session_id": "thing1-t33",
+    "status_code": 200,
+    "intent_key": "ranking.vessel_metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T34",
+    "query": "which vessel has the highest default ballast speed",
+    "session_id": "thing1-t34",
+    "status_code": 200,
+    "intent_key": "ranking.vessel_metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T35",
+    "query": "which vessels are in the short pool",
+    "session_id": "thing1-t35",
+    "status_code": 200,
+    "intent_key": "ranking.vessel_metadata",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T36",
+    "query": "which had the second highest",
+    "session_id": "thing1-t26-seq",
+    "status_code": 200,
+    "intent_key": "followup.result_set",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T37",
+    "query": "show only the top 3",
+    "session_id": "thing1-t18-seq",
+    "status_code": 200,
+    "intent_key": "followup.result_set",
+    "dynamic_sql_used": false,
+    "dynamic_sql_agents": []
+  },
+  {
+    "t_number": "T38",
+    "query": "which vessel has the most",
+    "session_id": "thing1-t27-seq",
+    "status_code": 200,
+    "intent_key": "ranking.vessels",
+    "dynamic_sql_used": true,
+    "dynamic_sql_agents": [
+      "finance"
+    ]
+  }
+]
