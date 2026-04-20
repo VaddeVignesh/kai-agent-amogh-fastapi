@@ -1,0 +1,358 @@
+# config/schema.yaml
+# Single source of truth for all queryable schema.
+# Field names must exactly match database column/field names.
+# Injected into LLM prompts at runtime.
+
+postgres:
+  tables:
+    finance_voyage_kpi:
+      primary_key: voyage_id
+      composite_key: [voyage_id, scenario]
+      description: "Voyage-level financial KPIs. One row per voyage per scenario."
+      join_to: "ops_voyage_summary via voyage_id = voyage_id"
+      fields:
+        voyage_id:
+          type: character varying
+          description: "Voyage identifier UUID string. Cross-source key to Mongo voyages.voyageId"
+        voyage_number:
+          type: integer
+          description: "Human-readable voyage number users refer to"
+        vessel_imo:
+          type: character varying
+          description: "Vessel IMO number. May have trailing .0 — use TRIM or CAST when joining"
+        scenario:
+          type: character varying
+          enum: [ACTUAL, WHEN_FIXED]
+          description: "Scenario type. Always filter by scenario when fetching financials"
+        revenue:
+          type: numeric
+          description: "Total voyage revenue"
+        total_expense:
+          type: numeric
+          description: "Total voyage expenses"
+        pnl:
+          type: numeric
+          description: "Profit and loss (revenue minus expenses)"
+        tce:
+          type: numeric
+          description: "Time charter equivalent per day"
+        total_commission:
+          type: numeric
+          description: "Total commission amount"
+        bunker_cost:
+          type: numeric
+          description: "Bunker fuel cost"
+        port_cost:
+          type: numeric
+          description: "Port cost"
+        voyage_days:
+          type: numeric
+          description: "Total voyage duration in days"
+        voyage_start_date:
+          type: date
+          description: "Voyage start date"
+        voyage_end_date:
+          type: date
+          description: "Voyage end date"
+        modified_by:
+          type: character varying
+          description: "Name of last person to modify this record"
+        modified_date:
+          type: timestamp
+          description: "Timestamp of last modification"
+        extracted_at:
+          type: timestamp
+          description: "ETL extraction timestamp"
+
+    ops_voyage_summary:
+      primary_key: voyage_id
+      description: "Voyage-level operational summary with denormalized JSON details."
+      join_to: "finance_voyage_kpi via voyage_id = voyage_id"
+      fields:
+        voyage_id:
+          type: character varying
+          description: "Voyage identifier UUID string"
+        voyage_number:
+          type: integer
+          description: "Human-readable voyage number"
+        vessel_id:
+          type: character varying
+          description: "Vessel identifier (Mongo-style ID). Maps to vessels.vesselId"
+        vessel_imo:
+          type: character varying
+          description: "Vessel IMO number. May have trailing .0"
+        vessel_name:
+          type: character varying
+          description: "Vessel name"
+        module_type:
+          type: character varying
+          enum: [LTTC, Spot, TC Voyage]
+          description: "Contract/module type for this voyage"
+        fixture_count:
+          type: integer
+          description: "Number of fixtures on this voyage"
+        offhire_days:
+          type: numeric
+          description: "Number of offhire days"
+        is_delayed:
+          type: boolean
+          enum: [true, false]
+          description: "Whether voyage was delayed"
+        delay_reason:
+          type: text
+          description: "Reason for delay if applicable"
+        voyage_start_date:
+          type: date
+          description: "Voyage start date"
+        voyage_end_date:
+          type: date
+          description: "Voyage end date"
+        ports_json:
+          type: jsonb
+          array: true
+          description: "List of ports with port_name, activity_type, display_order"
+        grades_json:
+          type: jsonb
+          array: true
+          description: "List of cargo grades with grade_name, display_order"
+        activities_json:
+          type: jsonb
+          description: "Activity details — may be null"
+        remarks_json:
+          type: jsonb
+          array: true
+          description: "List of voyage remarks"
+        tags:
+          type: text
+          description: "Tags summary string"
+        url:
+          type: text
+          description: "Voyage application URL"
+        extracted_at:
+          type: timestamp
+          description: "ETL extraction timestamp"
+
+mongo:
+  collections:
+    vessels:
+      lookup_key: vesselId
+      anchor_field: imo
+      anchor_to: voyages.vesselImo
+      description: "Master vessel metadata including commercial tags, contracts, and consumption profiles."
+      fields:
+        vesselId:
+          type: string
+          description: "Primary vessel identifier"
+        name:
+          type: string
+          description: "Vessel name"
+        imo:
+          type: string
+          description: "IMO number. Cross-source key to Postgres vessel_imo (note: Postgres may have .0 suffix)"
+        accountCode:
+          type: string
+          description: "Account code for the vessel"
+        hireRate:
+          type: number
+          description: "Hire rate in USD per day"
+        scrubber:
+          type: string
+          description: "Scrubber installation status"
+        marketType:
+          type: string
+          description: "Market segment (e.g. short pool, long pool)"
+        isVesselOperating:
+          type: boolean
+          description: "Whether vessel is currently operating"
+        consumption_profiles:
+          type: array
+          description: "List of consumption profiles by passage type"
+          nested_fields:
+            profileName: string
+            passageProfile:
+              type: array
+              nested_fields:
+                passageType: string
+                consumption: array
+            nonPassageProfile:
+              type: array
+              nested_fields:
+                consumption: array
+        contract_history:
+          type: nested
+          description: "TC-in contract history"
+          nested_fields:
+            list:
+              type: array
+              nested_fields:
+                tcInIdEncrypted: string
+                displayOrder: integer
+                contractNumber: string
+                owner: string
+                cpDate: string
+                deliveryDatetime: string
+                duration: integer
+                durationType: string
+                option: string
+                isCurrent: boolean
+        tags:
+          type: array
+          description: "Vessel tags by category and value"
+          nested_fields:
+            category: string
+            value: string
+
+    voyages:
+      lookup_key: voyageId
+      anchor_field: vesselImo
+      anchor_to: vessels.imo
+      description: "Voyage-level operational, fixture, leg, and financial projection details."
+      fields:
+        voyageId:
+          type: string
+          description: "Voyage identifier. Cross-source key to Postgres voyage_id"
+        voyageNumber:
+          type: string
+          description: "Voyage number as string. Users refer to voyages by this number"
+        vesselName:
+          type: string
+          description: "Vessel name"
+        vesselImo:
+          type: string
+          description: "Vessel IMO number. Links to vessels.imo"
+        tags:
+          type: string
+          description: "Voyage tags summary"
+        url:
+          type: string
+          description: "Voyage application URL"
+        startDateUtc:
+          type: string
+          description: "Voyage start datetime in UTC"
+        fixtures:
+          type: array
+          description: "Fixture details including cargo, ports, commissions, revenue lines"
+          nested_fields:
+            cpDate: string
+            cpQuantity: string
+            demurrage: string
+            fixtureNumber: string
+            fixtureRemark: string
+            layCanDateStart: string
+            layCanDateEnd: string
+            laytime: string
+            grades:
+              type: array
+              nested_fields:
+                gradeName: string
+            fixtureCommissions:
+              type: array
+              nested_fields:
+                commissionType: string
+                organizationName: string
+                rate: string
+            fixtureGrades:
+              type: array
+              nested_fields:
+                gradeName: string
+                displayOrder: integer
+            fixturePorts:
+              type: array
+              nested_fields:
+                portName: string
+                activityType: string
+                displayOrder: integer
+            fixtureRevenueList:
+              type: array
+              nested_fields:
+                name: string
+                total: number
+                quantity: number
+                flatRate: number
+                isCommission: boolean
+            fixtureExpenseList:
+              type: array
+              nested_fields:
+                name: string
+                amount: number
+                total: number
+            fixtureBillsOfLading:
+              type: array
+              nested_fields:
+                portName: string
+                fixtureGradeName: string
+                quantityMT: number
+                quantityBBLS: number
+                billOfLadingDate: string
+            tagList:
+              type: array
+              nested_fields:
+                category: string
+                value: string
+        legs:
+          type: array
+          description: "Voyage legs with port calls, bunker data, and passage details"
+          nested_fields:
+            portName: string
+            portShortName: string
+            type: string
+            arriveUtc: string
+            departUtc: string
+            passageDays: number
+            speed: number
+            distanceTotal: number
+            bunkerROBList:
+              type: array
+              nested_fields:
+                bunkerGradeName: string
+                arrivalROBQuantity: number
+                departureROBQuantity: number
+            bunkerStemsList:
+              type: array
+              nested_fields:
+                bunkerGradeName: string
+                qtyReceived: number
+                perTonPrice: number
+                stemTotalCost: number
+        revenues:
+          type: array
+          description: "Voyage-level revenue lines"
+          nested_fields:
+            name: string
+            total: number
+            quantity: number
+            flatRate: number
+            isCommission: boolean
+        expenses:
+          type: array
+          description: "Voyage-level expense lines"
+          nested_fields:
+            name: string
+            amount: number
+            total: number
+        bunkers:
+          type: array
+          description: "Voyage bunker summary by grade"
+          nested_fields:
+            bunkerGradeName: string
+            consTotal: number
+            totalCost: number
+            averageConsumptionCost: number
+        emissions:
+          type: nested
+          description: "Voyage emissions data including CII, CO2, SOx, NOx, EU ETS"
+          nested_fields:
+            voyageCIIBand: string
+            voyageCO2: number
+            voyageEEOI: number
+            voyageAER: number
+            voyageSOxMt: number
+            voyageNOxMt: number
+            euEtsDetails:
+              type: nested
+              nested_fields:
+                eua: number
+                euaBalance: number
+                euaCostUSD: number
+                euaPurchased: number
+                euaVerified: number

@@ -1,0 +1,77 @@
+# config/source_map.yaml
+# Maps every queryable field to its data source.
+# Used by source_router.py via field-set intersection.
+# If required fields span postgres and mongo groups → composite query.
+
+financial_kpis:
+  source: postgres
+  table: finance_voyage_kpi
+  fields:
+    - revenue
+    - total_expense
+    - pnl
+    - tce
+    - total_commission
+    - bunker_cost
+    - port_cost
+    - voyage_days
+    - scenario
+
+operational_summary:
+  source: postgres
+  table: ops_voyage_summary
+  fields:
+    - vessel_name
+    - vessel_id
+    - module_type
+    - fixture_count
+    - offhire_days
+    - is_delayed
+    - delay_reason
+    - ports_json
+    - grades_json
+    - remarks_json
+    - tags
+    - url
+
+voyage_identifiers:
+  source: postgres
+  table: finance_voyage_kpi
+  fields:
+    - voyage_id
+    - voyage_number
+    - vessel_imo
+    - voyage_start_date
+    - voyage_end_date
+
+vessel_metadata:
+  source: mongo
+  collection: vessels
+  fields:
+    - vesselId
+    - name
+    - imo
+    - accountCode
+    - hireRate
+    - scrubber
+    - marketType
+    - isVesselOperating
+    - consumption_profiles
+    - contract_history
+    - tags
+
+voyage_fixtures:
+  source: mongo
+  collection: voyages
+  fields:
+    - voyageId
+    - voyageNumber
+    - vesselName
+    - vesselImo
+    - fixtures
+    - revenues
+    - expenses
+    - bunkers
+    - emissions
+    - startDateUtc
+    - legs

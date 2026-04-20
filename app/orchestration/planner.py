@@ -10,6 +10,7 @@ from app.registries.intent_registry import (
     resolve_intent,
 )
 
+# DEPRECATED Phase 5C — active only as fallback. Remove after 2-week stability window.
 FINANCE_KEYWORDS = frozenset([
     "pnl", "p&l", "profit", "loss", "revenue", "expense", "expenses",
     "tce", "time charter equivalent", "commission", "financial",
@@ -17,6 +18,7 @@ FINANCE_KEYWORDS = frozenset([
     "executive summary", "earnings", "cost", "costs",
 ])
 
+# DEPRECATED Phase 5C — active only as fallback. Remove after 2-week stability window.
 MONGO_KEYWORDS = frozenset([
     "remark", "remarks", "cargo", "grade", "port", "ports", "route",
     "fixture", "charterer", "broker", "bunker", "bunkers", "cii",
@@ -97,6 +99,7 @@ class Planner:
         zero rows with no entity anchor (fleet-wide query misclassified as single).
         """
         text_lower = text.lower()
+        session_context = session_context if isinstance(session_context, dict) else {}
 
         intent_key = resolve_intent(intent_key or "out_of_scope")
         slots = slots or {}

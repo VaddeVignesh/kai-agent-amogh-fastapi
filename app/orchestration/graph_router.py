@@ -7,7 +7,7 @@ import os
 import traceback
 import uuid
 from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, TypedDict
+from typing import Any, Dict, Optional, TypedDict
 
 from langgraph.graph import StateGraph, END
 import re
@@ -18,6 +18,19 @@ from app.registries.intent_registry import INTENT_REGISTRY, SUPPORTED_INTENTS, r
 from app.registries.sql_registry import SQL_REGISTRY
 from app.services.response_merger import compact_payload
 from app.adapters.mongo_adapter import narrow_voyage_rows_by_entity_slots
+
+# --- Thing 1: shadow mode imports ---
+from app.llm.intent_extractor import extract_structured_intent
+from app.orchestration.source_router import resolve_required_sources
+from app.orchestration.followup_resolver import resolve_followup
+import logging as _sil_logging
+_sil_logger = _sil_logging.getLogger("shadow_intent_layer")
+if not _sil_logger.handlers:
+    _handler = _sil_logging.StreamHandler()
+    _handler.setFormatter(_sil_logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    _sil_logger.addHandler(_handler)
+_sil_logger.setLevel(_sil_logging.INFO)
+# --- end Thing 1 imports ---
 
 # =========================================================
 # Debug logging
@@ -46,6 +59,34 @@ def _dprint(*args: Any, **kwargs: Any) -> None:
                 return
 
 logger = logging.getLogger(__name__)
+
+
+def _shadow_extract(query: str, session: dict, llm_fn) -> dict | None:
+    """
+    Shadow mode: runs structured intent extraction alongside existing routing.
+    ONLY logs the result. Does NOT affect any routing output.
+    All exceptions caught — production path is never impacted.
+    """
+    try:
+        last_rows = session.get("last_result_set", [])
+        if isinstance(last_rows, dict):
+            last_rows = last_rows.get("rows", []) if isinstance(last_rows.get("rows"), list) else []
+        intent = extract_structured_intent(
+            query=query,
+            conversation_history=session.get("turn_history", []),
+            llm_caller=llm_fn,
+            last_result_meta={
+                "row_count": len(last_rows),
+                "last_intent": session.get("last_intent"),
+                "available_fields": (
+                    list(last_rows[0].keys()) if last_rows else []
+                ),
+            },
+        )
+        return intent
+    except Exception as e:
+        _sil_logger.error(f"ShadowMode: failed — {e}")
+        return None
 
 
 def _first_fixture(doc: dict) -> dict:
@@ -105,18 +146,54 @@ TOPIC_KEYWORDS = {
 }
 
 
-def select_voyage_sections(user_input: str, doc: dict) -> dict:
+def select_voyage_sections(
+    user_input: str,
+    doc: dict,
+    session_ctx: Optional[Dict[str, Any]] = None,
+) -> dict:
     """
     Picks only the doc sections relevant to the user's question.
     Returns a dict of {section_name: section_data}.
     Falls back to fixture + basic identity fields if nothing matches.
     """
     text = (user_input or "").lower()
-    selected = {}
+    selected: dict = {}
 
-    for section, keywords in TOPIC_KEYWORDS.items():
-        if any(kw in text for kw in keywords):
-            selected[section] = VOYAGE_SECTION_MAP[section](doc)
+    # --- Thing 1 Phase 4D: section projection from structured intent + schema ---
+    _si_4d = session_ctx.get("_structured_intent") if isinstance(session_ctx, dict) else None
+    _schema_sections = None
+
+    if isinstance(_si_4d, dict) and _si_4d.get("confidence") in ("high", "medium"):
+        _req_fields = _si_4d.get("requested_fields") or []
+        if _req_fields:
+            from app.config.schema_loader import load_schema
+
+            _mongo_top = set(
+                (
+                    load_schema()
+                    .get("mongo", {})
+                    .get("collections", {})
+                    .get("voyages", {})
+                    .get("fields", {})
+                    or {}
+                ).keys()
+            )
+            _schema_sections = [f for f in _req_fields if f in _mongo_top]
+
+    if _schema_sections:
+        sections_to_project = _schema_sections
+    else:
+        sections_to_project = None
+    # --- end Phase 4D ---
+
+    if sections_to_project:
+        for section in sections_to_project:
+            if section in VOYAGE_SECTION_MAP:
+                selected[section] = VOYAGE_SECTION_MAP[section](doc)
+    else:
+        for section, keywords in TOPIC_KEYWORDS.items():
+            if any(kw in text for kw in keywords):
+                selected[section] = VOYAGE_SECTION_MAP[section](doc)
 
     # Always include basic identity
     selected["voyage_info"] = {
@@ -354,7 +431,11 @@ class GraphRouter:
     # =========================================================
     
     @staticmethod
-    def _detect_scenario_comparison(user_input: str, extracted_slots: Dict[str, Any]) -> tuple[bool, Dict[str, Any]]:
+    def _detect_scenario_comparison(
+        user_input: str,
+        extracted_slots: Dict[str, Any],
+        session_ctx: Optional[Dict[str, Any]] = None,
+    ) -> tuple[bool, Dict[str, Any]]:
         """
         Pattern-based detection for scenario comparison queries.
         
@@ -367,18 +448,43 @@ class GraphRouter:
         Returns: (is_scenario_comparison, updated_slots)
         """
         user_lower = user_input.lower()
-        
-        # Scenario keywords mapping
+
+        found_scenarios: list[str] = []
+
+        # --- Thing 1 Phase 4B: scenario detection from entity_catalog.yaml ---
+        _si_4b = session_ctx.get("_structured_intent") if isinstance(session_ctx, dict) else None
+        if isinstance(_si_4b, dict) and _si_4b.get("confidence") in ("high", "medium"):
+            _sc_raw = str(_si_4b.get("scenario") or "").strip().upper()
+            if _sc_raw:
+                for part in re.split(r"[\s,/|]+", _sc_raw):
+                    p = part.strip()
+                    if p and p not in found_scenarios:
+                        found_scenarios.append(p)
+
+        from app.config.schema_loader import build_scenario_alias_map
+
+        _alias_map = build_scenario_alias_map()
+        _ul_lower = user_lower
+        for alias, canonical in sorted(_alias_map.items(), key=lambda kv: -len(kv[0])):
+            if alias in _ul_lower and canonical not in found_scenarios:
+                found_scenarios.append(canonical)
+
+        # FALLBACK 2: original hardcoded scenario_keywords dict (deprecated)
+        # DEPRECATED Phase 4B — kept as last-resort fallback (budget/forecast, etc.)
         scenario_keywords = {
-            "actual": "ACTUAL",
             "when_fixed": "WHEN_FIXED",
             "when fixed": "WHEN_FIXED",
-            "when-fixed": "WHEN_FIXED",
-            "whenfixed": "WHEN_FIXED",
+            "wf": "WHEN_FIXED",
+            "actual": "ACTUAL",
+            "act": "ACTUAL",
             "budget": "BUDGET",
             "forecast": "FORECAST",
-            "projected": "PROJECTED"
+            "projected": "PROJECTED",
         }
+        for keyword, scenario_name in scenario_keywords.items():
+            if keyword in user_lower and scenario_name not in found_scenarios:
+                found_scenarios.append(scenario_name)
+        # --- end Phase 4B ---
         
         # Comparison indicators
         comparison_words = [
@@ -386,13 +492,6 @@ class GraphRouter:
             "difference", "variance", "gap", "between",
             "against", "comparison"
         ]
-        
-        # Detect scenarios in query
-        found_scenarios = []
-        for keyword, scenario_name in scenario_keywords.items():
-            if keyword in user_lower:
-                if scenario_name not in found_scenarios:
-                    found_scenarios.append(scenario_name)
         
         # Check for comparison words
         has_comparison = any(word in user_lower for word in comparison_words)
@@ -435,7 +534,10 @@ class GraphRouter:
         return ("voyage_number", "voyage_numbers", "voyage_id", "vessel_name", "imo", "port_name")
 
     @staticmethod
-    def _explicit_vessel_mentions(user_input: str) -> list[str]:
+    def _explicit_vessel_mentions(
+        user_input: str,
+        session_ctx: Optional[Dict[str, Any]] = None,
+    ) -> list[str]:
         """
         Extract likely vessel names spelled out in the user message (proper-noun phrases).
         Used to override stale session anchors when the user names a different ship than memory.
@@ -508,12 +610,16 @@ class GraphRouter:
         return found
 
     @staticmethod
-    def _normalize_vessel_anchor_from_query(slots: Dict[str, Any], user_input: str) -> Dict[str, Any]:
+    def _normalize_vessel_anchor_from_query(
+        slots: Dict[str, Any],
+        user_input: str,
+        session_ctx: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         When the user names exactly one vessel in free text, treat that as the authoritative
         vessel anchor for this turn (overrides Redis-inherited slots and many LLM misses).
         """
-        mentions = GraphRouter._explicit_vessel_mentions(user_input)
+        mentions = GraphRouter._explicit_vessel_mentions(user_input, session_ctx)
         out = dict(slots or {})
         if len(mentions) != 1:
             return out
@@ -940,6 +1046,79 @@ class GraphRouter:
         if not isinstance(state.get("artifacts"), dict):
             state["artifacts"] = {}
 
+        # --- Thing 1: shadow comparison log (pre-routing; no impact) ---
+        def _shadow_llm_fn(prompt: str) -> str:
+            try:
+                resp = self.llm._call_with_retry(
+                    system=prompt,
+                    user=json.dumps({"query": user_input}),
+                    operation="shadow_intent_extraction",
+                )
+                if isinstance(resp, str):
+                    return resp
+                if isinstance(resp, dict):
+                    return json.dumps(resp)
+                return str(resp)
+            except Exception:
+                return ""
+
+        _shadow_pre = None
+        try:
+            _shadow_pre = _shadow_extract(user_input, session_ctx, _shadow_llm_fn)
+            if _shadow_pre:
+                _sil_logger.info(
+                    f"SHADOW | query='{user_input[:80]}' | "
+                    f"op={_shadow_pre.get('operation')} | "
+                    f"confidence={_shadow_pre.get('confidence')} | "
+                    f"sources={_shadow_pre.get('required_sources')} | "
+                    f"scope={_shadow_pre.get('scope')} | "
+                    f"follow_up_action={_shadow_pre.get('follow_up_action')} | "
+                    f"det_intent={session_ctx.get('last_intent')}"
+                )
+            else:
+                _sil_logger.warning(f"SHADOW_FAIL | query='{user_input[:80]}'")
+        except Exception:
+            pass
+        # Thing 1 Phase 4A: persist structured intent for primary routing (same LLM call as shadow).
+        if isinstance(_shadow_pre, dict) and _shadow_pre.get("confidence") in ("high", "medium"):
+            if isinstance(session_ctx, dict):
+                session_ctx["_structured_intent"] = _shadow_pre
+                state["session_ctx"] = session_ctx
+                # --- Phase 4A-fix: source sanitisation for aggregation queries ---
+                _si_check = session_ctx.get("_structured_intent")
+                if isinstance(_si_check, dict):
+                    _si_op_chk = str(_si_check.get("operation") or "").lower()
+                    _si_src = _si_check.get("required_sources") or []
+                    if not isinstance(_si_src, list):
+                        _si_src = []
+                    # Operation ids whose intent_catalog sources are postgres-only (see config/intent_catalog.yaml).
+                    _SINGLE_SRC_OPS = {
+                        "aggregate_analytics",
+                        "aggregation_analytics",
+                        "ranked_list",
+                        "comparative_analysis",
+                    }
+                    if len(_si_src) > 1 and _si_op_chk in _SINGLE_SRC_OPS:
+                        _si_check["required_sources"] = (
+                            ["postgres"] if "postgres" in _si_src else [_si_src[0]]
+                        )
+                        session_ctx["_structured_intent"] = _si_check
+                # --- end Phase 4A-fix source sanitisation ---
+                logger.info(
+                    "PRIMARY_STRUCTURED|phase=4a|confidence=%s|scope=%s|follow_up_action=%s",
+                    _shadow_pre.get("confidence"),
+                    _shadow_pre.get("scope"),
+                    _shadow_pre.get("follow_up_action"),
+                )
+                try:
+                    self.redis.save_session(
+                        state["session_id"],
+                        {"_structured_intent": _shadow_pre},
+                    )
+                except Exception:
+                    pass
+        # --- end Thing 1 pre-shadow log ---
+
         # =========================================================
         # Pending clarification: treat the user's message as a slot value
         # =========================================================
@@ -1085,6 +1264,15 @@ class GraphRouter:
         ul = (user_input or "").strip().lower()
         words = [w for w in ul.split() if w]
         has_result_set = isinstance(session_ctx, dict) and isinstance(session_ctx.get("last_result_set"), dict)
+        # Composite fleet delay + PnL + offhire queries must not be hijacked by last_result_set.
+        if (
+            has_result_set
+            and "delayed" in ul
+            and ("negative" in ul or "pnl" in ul)
+            and "offhire" in ul
+            and ("for voyages" in ul or "voyages flagged" in ul)
+        ):
+            has_result_set = False
         turn_type = self._classify_turn_type(session_ctx=session_ctx, user_input=user_input)
         explicit_fresh_entity = self._looks_like_explicit_fresh_entity_request(user_input)
         fresh_fleet_markers = (
@@ -1169,6 +1357,34 @@ class GraphRouter:
             )
         )
 
+        # --- Thing 1 Phase 4A-fix: scope override with operation guard ---
+        _phase4a_fresh_ranking_utterance = starts_like_new_request and (
+            ("most profitable" in ul)
+            or ("loss-making" in ul)
+            or ("loss making" in ul)
+            or (("trend" in ul) and (("month" in ul) or ("average" in ul)))
+        )
+        _si_scope = session_ctx.get("_structured_intent") if isinstance(session_ctx, dict) else None
+        _structured_scope_ok = isinstance(_si_scope, dict) and _si_scope.get("confidence") in ("high", "medium")
+        if _structured_scope_ok:
+            _si_op = str(_si_scope.get("operation") or "").strip().lower()
+            _si_fu_act = _si_scope.get("follow_up_action")
+            _si_sc_raw = str(_si_scope.get("scope") or "").strip().lower()
+            # Only treat as session follow-up when catalog operation is follow_up_filter
+            # and the model picked a concrete in-memory action. This avoids ranking /
+            # aggregate rows (e.g. T18, T22) being misclassified as followup.result_set
+            # when the extractor sets scope=follow_up with a spurious follow_up_action.
+            _genuine_followup = (
+                _si_sc_raw in ("follow_up", "followup")
+                and _si_op == "follow_up_filter"
+                and (_si_fu_act is not None and str(_si_fu_act).strip() != "")
+            )
+            if _genuine_followup and not _phase4a_fresh_ranking_utterance:
+                turn_type = "followup"
+                fresh_fleet_turn = False
+                starts_like_new_request = False
+        # --- end Phase 4A-fix scope override ---
+
         thread_override = None
         if not explicit_fresh_entity:
             thread_override = self._direct_session_thread_override(
@@ -1221,10 +1437,11 @@ class GraphRouter:
         starts_followup_verb = ul.startswith(("explain", "why", "what went wrong", "went wrong"))
         mentions_remarks = ("remark" in ul) or ("remarks" in ul)
         if has_result_set and mentions_remarks and is_short_followup and starts_followup_verb and not starts_like_new_request and turn_type == "followup" and not explicit_fresh_entity:
+            # Removed brand-specific routing — scope handled by structured intent when available.
             _looks_fresh = any(
                 ul.startswith(p) for p in [
                     "is ", "for vessel", "how is", "show me", "which vessel",
-                    "find vessel", "stena", "sonangol"
+                    "find vessel",
                 ]
             )
             if _looks_fresh:
@@ -1256,8 +1473,8 @@ class GraphRouter:
             )
             and turn_type == "followup"
             and not any(ul.startswith(p) for p in [
-                "is ", "is stena", "is sonangol", "for vessel",
-                "how is", "stena ", "sonangol ", "which vessel"
+                "is ", "for vessel",
+                "how is", "which vessel",
             ])
         ):
             state["intent_key"] = "followup.result_set"
@@ -1286,8 +1503,11 @@ class GraphRouter:
             )
             # Never let the metric parser hijack fleet-wide or corpus questions; the classifier
             # may mark them new_question but metric_followup_override used to bypass that.
+            # Phase 4A-fix: do not treat a clearly new ranking / trend ask as a result-set follow-up
+            # when the utterance opens like a fresh request (avoids hijack from stale last_result_set).
             metric_followup_override = (
                 (not fresh_fleet_turn)
+                and (not _phase4a_fresh_ranking_utterance)
                 and isinstance(op_slots, dict)
                 and op_slots.get("action") in ("project_selected_metric", "top_n", "bottom_n", "compare_extremes", "project_extreme_field")
                 and len(words) <= 12
@@ -1334,7 +1554,18 @@ class GraphRouter:
                             {"phase": "intent_extraction", "intent_key": "vessel.metadata", "slots": scoped_slots, "source": "result_set_operational_followup"},
                         )
                         return state
-            if isinstance(op_slots, dict) and op_slots.get("action") and ((not explicit_fresh_entity) or result_set_refinement) and (turn_type == "followup" or polite_followup or concise_followup_override or metric_followup_override):
+            if (
+                (not _phase4a_fresh_ranking_utterance)
+                and isinstance(op_slots, dict)
+                and op_slots.get("action")
+                and ((not explicit_fresh_entity) or result_set_refinement)
+                and (
+                    turn_type == "followup"
+                    or polite_followup
+                    or concise_followup_override
+                    or metric_followup_override
+                )
+            ):
                 state["intent_key"] = "followup.result_set"
                 state["slots"] = op_slots
                 artifacts = state.get("artifacts") or {}
@@ -1383,11 +1614,39 @@ class GraphRouter:
             },
             session_context=session_ctx,
         )
+
+        # --- Thing 1: shadow comparison log (no routing impact) ---
+        _shadow = _shadow_extract(user_input, session_ctx, _shadow_llm_fn)
+        if _shadow:
+            _sil_logger.info(
+                f"SHADOW | query='{user_input[:80]}' | "
+                f"op={_shadow.get('operation')} | "
+                f"confidence={_shadow.get('confidence')} | "
+                f"sources={_shadow.get('required_sources')} | "
+                f"scope={_shadow.get('scope')} | "
+                f"follow_up_action={_shadow.get('follow_up_action')} | "
+                f"det_intent={ex.get('intent_key')}"
+            )
+        else:
+            _sil_logger.warning(f"SHADOW_FAIL | query='{user_input[:80]}'")
+        # --- end Thing 1 shadow log ---
         
         intent_key = ex.get("intent_key", "out_of_scope")
         extracted_slots = ex.get("slots", {}) or {}
         # session_ctx already loaded above
-        
+
+        # Phase 4A-fix: LLM may return followup.result_set for fresh ranking/trend asks when
+        # session still holds an unrelated last_result_set — remap to primary fleet intents.
+        if _phase4a_fresh_ranking_utterance and intent_key == "followup.result_set":
+            if "most profitable" in ul:
+                intent_key = "ranking.voyages_by_pnl"
+            elif "loss-making" in ul or "loss making" in ul:
+                intent_key = "analysis.segment_performance"
+            elif "trend" in ul:
+                intent_key = "aggregation.trends"
+            if isinstance(ex, dict):
+                ex["intent_key"] = intent_key
+
         # Fix common LLM glitch: "tell me about voyage 1901" → vessel_name="voyage 1901"
         try:
             vn = extracted_slots.get("voyage_number")
@@ -1403,7 +1662,9 @@ class GraphRouter:
             pass
 
         # Pattern-based override for scenario comparisons
-        is_scenario_comp, updated_slots = self._detect_scenario_comparison(user_input, extracted_slots)
+        is_scenario_comp, updated_slots = self._detect_scenario_comparison(
+            user_input, extracted_slots, session_ctx
+        )
         if is_scenario_comp:
             # Override intent if LLM classified incorrectly
             if intent_key in ["out_of_scope", "voyage.summary", "composite.query"]:
@@ -1509,6 +1770,16 @@ class GraphRouter:
                 extracted_slots.pop("imo", None)
                 extracted_slots.pop("vessel_imo", None)
 
+        # Phase 4A-fix (post session-followup): session follow-up logic can re-map to
+        # followup.result_set for fresh ranking/trend utterances — restore primary intents.
+        if _phase4a_fresh_ranking_utterance and intent_key == "followup.result_set":
+            if "most profitable" in ul:
+                intent_key = "ranking.voyages_by_pnl"
+            elif "loss-making" in ul or "loss making" in ul:
+                intent_key = "analysis.segment_performance"
+            elif "trend" in ul:
+                intent_key = "aggregation.trends"
+
         if intent_key == "cargo.details" and not (
             extracted_slots.get("cargo_type")
             or extracted_slots.get("cargo_grade")
@@ -1546,7 +1817,9 @@ class GraphRouter:
             extracted_slots = self._validate_entity_slots(extracted_slots)
             followup_used = self._has_entity_anchor(extracted_slots)
 
-        extracted_slots = self._normalize_vessel_anchor_from_query(extracted_slots, user_input)
+        extracted_slots = self._normalize_vessel_anchor_from_query(
+            extracted_slots, user_input, session_ctx
+        )
         extracted_slots = self._validate_entity_slots(extracted_slots)
 
         comparison_override = self._comparison_followup_override(
@@ -1673,7 +1946,20 @@ class GraphRouter:
         _dprint(f"\n🔍 INTENT EXTRACTION:")
         _dprint(f"   Intent: {intent_key}")
         _dprint(f"   Slots (cleaned): {cleaned_slots}")
-        
+
+        # Phase 4A-fix (final): last-line guard before persisting intent — avoids stale-session
+        # followup.result_set on fresh fleet ranking / trend asks regardless of upstream overrides.
+        _ul_fin = (user_input or "").strip().lower()
+        if intent_key == "followup.result_set" and _ul_fin.startswith(
+            ("show ", "show me", "list ", "rank ", "find ", "tell ", "what ", "which ")
+        ):
+            if "most profitable" in _ul_fin:
+                intent_key = "ranking.voyages_by_pnl"
+            elif "loss-making" in _ul_fin or "loss making" in _ul_fin:
+                intent_key = "analysis.segment_performance"
+            elif "trend" in _ul_fin and ("month" in _ul_fin or "average" in _ul_fin):
+                intent_key = "aggregation.trends"
+
         # Pre-classify single vs composite
         is_single = self._is_single_entity_query(intent_key, cleaned_slots, user_input)
         if is_single:
@@ -2479,15 +2765,24 @@ class GraphRouter:
         if not ul:
             return None
 
+        _sctx_rs = session_ctx if isinstance(session_ctx, dict) else {}
+        _si_rs = _sctx_rs.get("_structured_intent")
+        _skip_corpus_guard = (
+            isinstance(_si_rs, dict)
+            and _si_rs.get("confidence") in ("high", "medium")
+            and str(_si_rs.get("scope") or "").strip().lower() in ("follow_up", "followup")
+        )
+
         # Corpus-wide / distribution questions are not refinements over the last table.
-        if re.search(r"\bacross all (voyages|vessels|ports)\b", ul):
-            return None
-        if "most frequently" in ul or "most often" in ul:
-            return None
-        if re.search(r"\b(all|every)\s+voyages\b", ul) and not any(
-            p in ul for p in ("these voyages", "those voyages", "this list", "that list", "above list")
-        ):
-            return None
+        if not _skip_corpus_guard:
+            if re.search(r"\bacross all (voyages|vessels|ports)\b", ul):
+                return None
+            if "most frequently" in ul or "most often" in ul:
+                return None
+            if re.search(r"\b(all|every)\s+voyages\b", ul) and not any(
+                p in ul for p in ("these voyages", "those voyages", "this list", "that list", "above list")
+            ):
+                return None
 
         # After a multi-row scenario comparison, "TCE variance only" should list every row — not last_focus.
         if ("tce variance" in ul or "pnl variance" in ul) and any(p in ul for p in ("only", "just")):
@@ -3277,7 +3572,7 @@ class GraphRouter:
                     lines.append(f"- {i}. {s}")
                 lines += ["", "Reply with a value (or reply with a number from the list)."]
             else:
-                lines += ["", "Reply with the vessel name (e.g. `Stena Superior`) or IMO (7 digits)."]
+                lines += ["", "Reply with the vessel name or IMO (7 digits)."]
             return ("\n".join(lines).strip(), options)
 
         if m0 == "cargo_type":
@@ -3469,6 +3764,22 @@ class GraphRouter:
             rs = (session_context or {}).get("last_result_set") if isinstance(session_context, dict) else None
             rows = (rs or {}).get("rows") if isinstance(rs, dict) else None
             rows = rows if isinstance(rows, list) else []
+            # Thing 1 Phase 4A: optional in-memory refinement from structured follow-up (before action handlers).
+            si_fu = (session_context or {}).get("_structured_intent") if isinstance(session_context, dict) else None
+            if isinstance(si_fu, dict) and si_fu.get("confidence") in ("high", "medium"):
+                scp = str(si_fu.get("scope") or "").strip().lower()
+                if scp in ("follow_up", "followup"):
+                    rs_slots = (session_context or {}).get("last_focus_slots") if isinstance(session_context, dict) else {}
+                    if not isinstance(rs_slots, dict):
+                        rs_slots = {}
+                    fr = resolve_followup(si_fu, {"last_result_rows": list(rows), "resolved_slots": rs_slots})
+                    if fr and isinstance(fr.get("resolved_rows"), list):
+                        rows = fr["resolved_rows"]
+                        logger.info(
+                            "CACHE_RESOLVED|phase=4a|follow_up_action=%s|row_count=%s",
+                            si_fu.get("follow_up_action"),
+                            len(rows),
+                        )
             action = (slots.get("action") or "").strip().lower()
             ul = (user_input or "").lower()
 
@@ -4431,10 +4742,10 @@ class GraphRouter:
                 "scenario": selected_fin.get("scenario"),
             }
             if len(mongo_docs) == 1:
-                metadata_mongodb = select_voyage_sections(user_input, mongo_docs[0])
+                metadata_mongodb = select_voyage_sections(user_input, mongo_docs[0], session_context)
             elif len(mongo_docs) > 1:
                 metadata_mongodb = {
-                    "voyages": [select_voyage_sections(user_input, d) for d in mongo_docs],
+                    "voyages": [select_voyage_sections(user_input, d, session_context) for d in mongo_docs],
                 }
             else:
                 metadata_mongodb = {}
@@ -6186,10 +6497,10 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                 )
             else:
                 if len(records) == 1:
-                    sections = select_voyage_sections(user_input, records[0])
+                    sections = select_voyage_sections(user_input, records[0], session_context)
                 else:
                     sections = {
-                        "voyages": [select_voyage_sections(user_input, d) for d in records]
+                        "voyages": [select_voyage_sections(user_input, d, session_context) for d in records]
                     }
 
                 context_json = json.dumps(sections, default=str, indent=2)

@@ -1,0 +1,58 @@
+# config/entity_catalog.yaml
+# Entity types, canonical keys, and cross-source resolution strategies.
+# resolution: mongo_first = always resolve UUID from Mongo first, then Postgres.
+
+entities:
+  voyage:
+    canonical_key: voyage_id
+    human_key: voyageNumber
+    cross_source_anchor:
+      mongo_collection: voyages
+      mongo_field: voyageId
+      postgres_field: voyage_id
+      link_field: vesselImo
+      resolution: mongo_first
+    notes: >
+      Users refer to voyages by voyageNumber (e.g. "voyage 2306").
+      voyageId (UUID) is the cross-source join key.
+      voyageNumber in Mongo is a string; voyage_number in Postgres is integer.
+      Always resolve voyageId from Mongo first, then use it in Postgres queries.
+
+  vessel:
+    canonical_key: imo
+    human_key: name
+    lookup_via: voyage.vesselImo
+    notes: >
+      Users refer to vessels by name (e.g. "Elka Delphi").
+      IMO is the cross-source key.
+      IMPORTANT: Postgres vessel_imo may have trailing .0 — use
+      TRIM(TRAILING '.0' FROM vessel_imo) or SPLIT_PART(vessel_imo, '.', 1)
+      when joining Postgres vessel_imo to Mongo imo field.
+
+# Canonical scenario codes → surface forms users type (substring match in router).
+scenarios:
+  WHEN_FIXED:
+    - when fixed
+    - wf
+    - when-fixed
+    - whenfixed
+    - when_fixed
+  ACTUAL:
+    - actual
+    - act
+
+scenario_enum:
+  values: [ACTUAL, WHEN_FIXED]
+  default: ACTUAL
+  aliases:
+    when_fixed: WHEN_FIXED
+    wf: WHEN_FIXED
+    whenFixed: WHEN_FIXED
+    actual: ACTUAL
+    fixed: WHEN_FIXED
+
+imo_normalization:
+  issue: "Postgres vessel_imo stored as '1234567.0', Mongo imo stored as '1234567'"
+  postgres_fix: "SPLIT_PART(vessel_imo, '.', 1)"
+  mongo_fix: "none needed — Mongo imo is clean"
+  use_in: "Any SQL query joining vessel_imo to Mongo imo value"

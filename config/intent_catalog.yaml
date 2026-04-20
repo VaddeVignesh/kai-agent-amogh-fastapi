@@ -1,0 +1,89 @@
+# config/intent_catalog.yaml
+# Available operations the system can perform.
+# These are semantic patterns — detected by LLM, not phrase matching.
+# Injected into the LLM intent extraction prompt at runtime.
+
+operations:
+  - id: single_entity_lookup
+    description: "Fetch specific fields for one or more identified entities by their identifier"
+    requires: [entity_identifier]
+    sources: dynamic
+    examples:
+      - "fetch financial summary for a specific voyage"
+      - "get metadata fields for a specific vessel"
+
+  - id: aggregate_analytics
+    description: "Compute aggregations across all entities — averages, sums, counts, rankings, modes"
+    requires: [metric_fields]
+    sources: postgres_primary
+    examples:
+      - "which entity has the highest value of a metric"
+      - "average metric per group"
+      - "monthly trend of a financial metric"
+
+  - id: comparative_analysis
+    description: "Compare two or more scenarios, time periods, or entity groups on shared metrics"
+    requires: [comparison_dimension, metric_fields]
+    sources: postgres_primary
+    examples:
+      - "compare two scenario values for the same voyage"
+      - "actual vs budget for multiple voyages"
+
+  - id: ranked_list
+    description: "Return top or bottom N entities sorted by a metric with optional filters"
+    requires: [sort_metric]
+    sources: postgres_primary
+    examples:
+      - "top N most profitable"
+      - "lowest performing by a metric"
+      - "rank all entities by value"
+
+  - id: metadata_enrichment
+    description: "Fetch descriptive or document-style attributes stored as nested documents"
+    requires: [entity_identifier, document_fields]
+    sources: document_store
+    examples:
+      - "fetch nested document details for a specific entity"
+      - "get route, cargo, revenue breakdown from document store"
+
+  - id: composite_summary
+    description: "Combine financial KPIs from postgres with document metadata from mongo for complete entity profile"
+    requires: [entity_identifier]
+    sources: all
+    examples:
+      - "full executive summary for an entity"
+      - "combined financial and operational overview"
+
+  - id: follow_up_filter
+    description: "Refine, filter, slice, or re-rank a previous result set already held in session memory"
+    requires: [previous_result_available]
+    sources: none
+    examples:
+      - "slice to top N from previous result"
+      - "filter previous result by a condition"
+      - "re-rank previous result by different metric"
+
+escalation_rules:
+  # Replaces _ENTITY_TO_FLEET in planner.py
+  # When a single-entity intent has no specific entity identifier,
+  # escalate to the fleet-wide version of that operation.
+  - from: single_entity_lookup
+    condition: no_entity_identifier
+    escalate_to: ranked_list
+    note: "User asked about 'a vessel' without naming one — show ranked list"
+
+  - from: metadata_enrichment
+    condition: no_entity_identifier
+    escalate_to: ranked_list
+    note: "User asked for metadata without naming entity — show all"
+
+scope_signals:
+  # Replaces fresh_fleet_markers, explicit_rs_ref, starts_like_new_request
+  # These are DESCRIPTIONS for the LLM — not phrase lists.
+  # LLM reads these and decides scope=follow_up or scope=fresh.
+  follow_up_indicators:
+    description: "Query refines, filters, or references a previous result already in session"
+    patterns_description: "Pronouns referring to prior output, ranking superlatives on existing list, slice/filter verbs on prior result"
+  fresh_indicators:
+    description: "Query starts a new independent question with its own entity or scope"
+    patterns_description: "Named entity appears, new metric/dimension not in prior result, explicit time/date reference"

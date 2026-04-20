@@ -109,7 +109,7 @@ class LLMClient:
     # Deterministic intent router (before LLM)
     # =========================================================
 
-    def _deterministic_intent(self, text: str) -> Optional[str]:
+    def _deterministic_intent_legacy(self, text: str) -> Optional[str]:
         t = text.lower()
         has_specific_voyage_anchor = bool(
             re.search(r"\bvoyage(?:s)?\s+\d{3,5}\b", t)
@@ -332,6 +332,10 @@ class LLMClient:
 
         return None
 
+    def _deterministic_intent(self, text: str, session: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Deterministic routing (Phase 5A: session reserved for future structured priming)."""
+        return self._deterministic_intent_legacy(text)
+
     @staticmethod
     def _compact_context_slots(slots: Any) -> Dict[str, Any]:
         if not isinstance(slots, dict):
@@ -469,7 +473,7 @@ class LLMClient:
         )
 
         # 1️⃣ Deterministic override
-        deterministic = self._deterministic_intent(text_norm)
+        deterministic = self._deterministic_intent(text_norm, session_context)
 
         # 2️⃣ Regex slot extraction (always)
         slots: Dict[str, Any] = {}
