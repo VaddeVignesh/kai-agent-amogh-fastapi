@@ -3,94 +3,78 @@ from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 import uuid
 import os
- 
+
 from dotenv import load_dotenv
 load_dotenv()
- 
+
+from app.auth import login, generate_session_id
+
 # =========================================================
-# IMPORTS — EXACT SAME STACK AS c.py
+# IMPORTS
 # =========================================================
- 
+
 from app.orchestration.graph_router import GraphRouter
- 
 from app.llm.llm_client import LLMClient, LLMConfig
- 
 from app.config.database import get_mongo_db
 from app.adapters.mongo_adapter import MongoAdapter
- 
-from app.adapters.postgres_adapter import (
-    PostgresAdapter,
-    PostgresConfig,
-)
- 
-from app.adapters.redis_store import (
-    RedisStore,
-    RedisConfig,
-)
- 
+from app.adapters.postgres_adapter import PostgresAdapter, PostgresConfig
+from app.adapters.redis_store import RedisStore, RedisConfig
 from app.agents.mongo_agent import MongoAgent
 from app.agents.finance_agent import FinanceAgent
 from app.agents.ops_agent import OpsAgent
- 
- 
+
+
 # =========================================================
 # CREATE FASTAPI APP
 # =========================================================
- 
+
 app = FastAPI(
     title="KAI Agent API",
     description="Maritime Analytics AI Assistant",
     version="1.0",
 )
- 
- 
+
+
 # =========================================================
-# INITIALIZE DEPENDENCIES (MATCHES c.py EXACTLY)
+# CORS MIDDLEWARE
 # =========================================================
- 
-# ---------- LLM ----------
-groq_api_key = os.getenv("GROQ_API_KEY")
-if not groq_api_key:
-    raise RuntimeError("GROQ_API_KEY is not set")
- 
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://localhost:5173",
+        "http://localhost:5174",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# =========================================================
+# INIT LLM + AGENTS
+# =========================================================
+
 llm = LLMClient(
     LLMConfig(
-        api_key=groq_api_key,
+        api_key=os.getenv("GROQ_API_KEY"),
         model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
         temperature=float(os.getenv("GROQ_TEMPERATURE", "0.0")),
     )
 )
- 
- 
-# ---------- Mongo ----------
+
 db = get_mongo_db()
- 
-mongo_adapter = MongoAdapter(
-    db.client,
-    db_name=db.name
-)
- 
-mongo_agent = MongoAgent(
-    mongo_adapter,
-    llm_client=llm
-)
- 
- 
-# ---------- Postgres ----------
+mongo_adapter = MongoAdapter(db.client, db_name=db.name)
+mongo_agent = MongoAgent(mongo_adapter, llm_client=llm)
+
 pg = PostgresAdapter(PostgresConfig.from_env())
- 
-finance_agent = FinanceAgent(
-    pg,
-    llm_client=llm
-)
- 
-ops_agent = OpsAgent(
-    pg,
-    llm_client=llm
-)
- 
- 
-# ---------- Redis ----------
+finance_agent = FinanceAgent(pg, llm_client=llm)
+ops_agent = OpsAgent(pg, llm_client=llm)
+
 redis_store = RedisStore(
     RedisConfig(
         host=os.getenv("REDIS_HOST", "localhost"),
@@ -98,9 +82,7 @@ redis_store = RedisStore(
         db=int(os.getenv("REDIS_DB", "0")),
     )
 )
- 
- 
-# ---------- Graph Router ----------
+
 router = GraphRouter(
     llm=llm,
     redis_store=redis_store,
@@ -108,17 +90,18 @@ router = GraphRouter(
     finance_agent=finance_agent,
     ops_agent=ops_agent,
 )
- 
- 
+
+
 # =========================================================
 # REQUEST / RESPONSE MODELS
 # =========================================================
- 
+
 class QueryRequest(BaseModel):
     query: str
     session_id: str | None = None
- 
- 
+    chat_history: Optional[List[Dict[str, Any]]] = []
+
+
 class QueryResponse(BaseModel):
     session_id: str
     answer: str
@@ -142,33 +125,50 @@ class SessionClearResponse(BaseModel):
     deleted: int = 0
     deleted_keys: Optional[List[str]] = None
     reason: Optional[str] = None
- 
- 
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    success: bool
+    role: str = ""
+    session_id: str = ""
+    message: str = ""
+
+
 # =========================================================
-# HEALTH CHECK
+# ENDPOINTS
 # =========================================================
- 
+
 @app.get("/")
 def root():
     return {"status": "KAI Agent API running 🚀"}
- 
- 
-# =========================================================
-# MAIN QUERY ENDPOINT
-# =========================================================
- 
+
+
+@app.post("/login", response_model=LoginResponse)
+async def login_endpoint(req: LoginRequest):
+    role = login(req.username, req.password)
+    if not role:
+        return LoginResponse(success=False, message="Invalid username or password")
+    session_id = generate_session_id(req.username, role)
+    return LoginResponse(success=True, role=role, session_id=session_id)
+
+
 @app.post("/query", response_model=QueryResponse)
 def query_agent(req: QueryRequest):
-
     if os.getenv("KAI_DEBUG", "").strip().lower() in ("1", "true", "yes", "y", "on"):
         print("Received query:", req.query)
+
     session_id = req.session_id or f"api-{uuid.uuid4().hex[:8]}"
- 
+
     result = router.handle(
         session_id=session_id,
         user_input=req.query
     )
- 
+
     return QueryResponse(
         session_id=session_id,
         answer=result.get("answer", ""),
@@ -195,4 +195,3 @@ def clear_session_memory(req: SessionClearRequest):
         deleted_keys=result.get("deleted_keys") if isinstance(result.get("deleted_keys"), list) else [],
         reason=result.get("reason"),
     )
- 
