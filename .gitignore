@@ -27,9 +27,29 @@ htmlcov/
 
 # Local artifacts
 test_validation_log.json
+logs/
+show_redis.py
+test_backend.py
+frontend/digital-sales-agent-backup/
 
 # Generated smoke outputs (regenerate with scripts/smoke_*.py)
 scripts/smoke_results*.json
 scripts/smoke_*_review.md
 scripts/smoke_analytical_suite_8010.json
 scripts/smoke_presales_vessel_8010.json
+
+# Generated golden validation outputs (regenerate with scripts/run_golden_config_suite.py)
+scripts/golden_config_current.json
+scripts/golden_config_compare_report.json
+scripts/golden_config_*_probe.json
+scripts/golden_config_*_probe_report.json
+scripts/golden_config_phase*.json
+scripts/golden_config_phase*_report.json
+scripts/golden_config_phase*_clean.json
+scripts/golden_config_phase*_clean_report.json
+scripts/golden_config_phase*_context.json
+scripts/golden_config_phase*_context_report.json
+scripts/golden_config_*_rerun.json
+scripts/golden_config_*_rerun_report.json
+scripts/golden_config_*_vs_*.json
+scripts/golden_config_*_vs_*_report.json

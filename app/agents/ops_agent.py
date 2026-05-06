@@ -1,11 +1,27 @@
 from __future__ import annotations
 from dataclasses import dataclass
+import time
 from typing import Any, Dict, List, Optional
 
 from app.adapters.postgres_adapter import PostgresAdapter
+from app.config.agent_rules_loader import (
+    get_ops_cargo_grade_max_count,
+    get_ops_cargo_profitability_intents,
+    get_ops_canonical_sql,
+    get_ops_delay_remark_keywords,
+    get_ops_delay_remark_filter_empty,
+    get_ops_delay_remark_filter_template,
+    get_ops_max_limit,
+    get_ops_simple_intent_mappings,
+    get_ops_validation_message,
+)
+from app.config.domain_loader import get_default_limit, get_default_scenario, is_null_equivalent
+from app.core.logger import get_logger
 from app.sql.sql_allowlist import DEFAULT_ALLOWLIST
 from app.sql.sql_guard import validate_and_prepare_sql
 from app.sql.sql_generator import SQLGenerator
+
+logger = get_logger("ops_agent")
 
 
 @dataclass(frozen=True)
@@ -29,8 +45,8 @@ class OpsAgentResult:
 
 
 class OpsAgent:
-    DEFAULT_LIMIT = 10
-    MAX_LIMIT = 200
+    DEFAULT_LIMIT = get_default_limit()
+    MAX_LIMIT = get_ops_max_limit()
 
     def __init__(self, pg: PostgresAdapter, llm_client=None, sql_generator=None, allowlist=None):
         self.pg = pg
@@ -44,10 +60,24 @@ class OpsAgent:
 
     def run(self, *, intent_key, slots, session_context=None, user_input=None):
         session_context = session_context or {}
+        start = time.time()
+        logger.info(
+            "AGENT_START | agent=ops | mode=registry_sql | intent=%s | query_chars=%s",
+            intent_key,
+            len(user_input or ""),
+        )
 
         try:
             query_key, params = self.map_intent(intent_key, slots)
             rows = self.pg.fetch_all(query_key, params)
+            elapsed = round(time.time() - start, 3)
+            logger.info(
+                "AGENT_END | agent=ops | mode=registry_sql | intent=%s | query_key=%s | rows=%s | latency=%ss",
+                intent_key,
+                query_key,
+                len(rows or []),
+                elapsed,
+            )
             return {
                 "mode": "registry_sql",
                 "intent_key": intent_key,
@@ -56,6 +86,13 @@ class OpsAgent:
                 "rows": rows,
             }
         except Exception as e:
+            elapsed = round(time.time() - start, 3)
+            logger.error(
+                "AGENT_ERROR | agent=ops | mode=registry_sql | intent=%s | latency=%ss | error=%s",
+                intent_key,
+                elapsed,
+                str(e)[:200],
+            )
             return {
                 "mode": "registry_sql",
                 "intent_key": intent_key,
@@ -66,7 +103,12 @@ class OpsAgent:
     def try_dynamic(self, *, question, intent_key, slots):
         try:
             return self.run_dynamic(question=question, intent_key=intent_key, slots=slots)
-        except Exception:
+        except Exception as exc:
+            logger.error(
+                "AGENT_ERROR | agent=ops | mode=dynamic_sql | intent=%s | error=%s",
+                intent_key,
+                str(exc)[:200],
+            )
             return None
 
     # =========================================================
@@ -74,6 +116,12 @@ class OpsAgent:
     # =========================================================
 
     def run_dynamic(self, *, question, intent_key, slots, enforce_limit=200):
+        start = time.time()
+        logger.info(
+            "AGENT_START | agent=ops | mode=dynamic_sql | intent=%s | query_chars=%s",
+            intent_key,
+            len(question or ""),
+        )
 
         if not self.sql_generator:
             raise RuntimeError("OpsAgent.run_dynamic requires sql_generator")
@@ -101,7 +149,7 @@ class OpsAgent:
             else:
                 name = str(raw)
             name = name.strip()
-            if not name or name.lower() in ("null", "none", "", "unknown"):
+            if is_null_equivalent(name):
                 return None
             # Drop raw JSON object strings
             if name.startswith("{") and "grade_name" in name:
@@ -146,25 +194,7 @@ class OpsAgent:
 
         if isinstance(voyage_ids, list) and voyage_ids:
 
-            canonical_sql = """
-                SELECT voyage_id,
-                       voyage_number,
-                       vessel_imo,
-                       vessel_name,
-                       module_type,
-                       fixture_count,
-                       offhire_days,
-                       is_delayed,
-                       delay_reason,
-                       ports_json,
-                       grades_json,
-                       remarks_json,
-                       voyage_start_date,
-                       voyage_end_date
-                FROM ops_voyage_summary
-                WHERE voyage_id = ANY(%(voyage_ids)s)
-                LIMIT %(limit)s
-            """
+            canonical_sql = get_ops_canonical_sql("voyage_ids_lookup")
 
             # IMPORTANT: when we already have explicit voyage_ids from upstream,
             # we should fetch ALL matching rows (do not truncate to the user's display limit).
@@ -192,7 +222,7 @@ class OpsAgent:
         # ----------------------------------------------------------
         # PATH 1b: Cargo profitability support (ports + delay remarks per grade)
         # ----------------------------------------------------------
-        if intent_key in ("analysis.cargo_profitability", "analysis.cargoprofitability") and isinstance(cargo_grades, list) and cargo_grades:
+        if intent_key in get_ops_cargo_profitability_intents() and isinstance(cargo_grades, list) and cargo_grades:
 
             cargo_grades_norm = []
             for g in cargo_grades:
@@ -200,107 +230,20 @@ class OpsAgent:
                 if cleaned is None:
                     continue
                 s = str(cleaned).strip().lower()
-                if s and s not in ("none", "null", "n/a", "na"):
+                if s and not is_null_equivalent(s):
                     cargo_grades_norm.append(s)
-            cargo_grades_norm = list(dict.fromkeys(cargo_grades_norm))[:50]
+            cargo_grades_norm = list(dict.fromkeys(cargo_grades_norm))[: get_ops_cargo_grade_max_count()]
             if not cargo_grades_norm:
                 cargo_grades_norm = []
 
-            canonical_sql = """
-                WITH grade_rows AS (
-                  SELECT
-                    o.voyage_id,
-                    o.voyage_number,
-                    o.is_delayed,
-                    lower(trim(grade.value)) AS cargo_grade,
-                    o.ports_json,
-                    o.remarks_json
-                  FROM ops_voyage_summary o,
-                  jsonb_array_elements_text(o.grades_json) AS grade(value)
-                  WHERE o.grades_json IS NOT NULL
-                    AND o.grades_json::text != '[]'
-                    AND grade.value IS NOT NULL
-                    AND trim(grade.value) != ''
-                ),
-                filtered AS (
-                  SELECT *
-                  FROM grade_rows
-                  WHERE cargo_grade = ANY(%(cargo_grades)s)
-                ),
-                delay_stats AS (
-                  SELECT
-                    cargo_grade,
-                    COUNT(DISTINCT voyage_id) AS voyage_count,
-                    COUNT(DISTINCT voyage_id) FILTER (WHERE is_delayed) AS delayed_voyage_count
-                  FROM filtered
-                  GROUP BY cargo_grade
-                ),
-                port_counts AS (
-                  SELECT
-                    cargo_grade,
-                    port,
-                    COUNT(*) AS cnt
-                  FROM (
-                    SELECT cargo_grade, jsonb_array_elements_text(ports_json) AS port
-                    FROM filtered
-                    WHERE ports_json IS NOT NULL
-                      AND ports_json::text != '[]'
-                  ) p
-                  WHERE port IS NOT NULL AND port != ''
-                  GROUP BY cargo_grade, port
-                ),
-                top_ports AS (
-                  SELECT cargo_grade,
-                         jsonb_agg(port ORDER BY cnt DESC, port) FILTER (WHERE rn <= 8) AS common_ports
-                  FROM (
-                    SELECT cargo_grade, port, cnt,
-                           ROW_NUMBER() OVER (PARTITION BY cargo_grade ORDER BY cnt DESC, port) AS rn
-                    FROM port_counts
-                  ) t
-                  GROUP BY cargo_grade
-                ),
-                remark_counts AS (
-                  SELECT
-                    cargo_grade,
-                    remark,
-                    COUNT(*) AS cnt
-                  FROM (
-                    SELECT cargo_grade, jsonb_array_elements_text(remarks_json) AS remark
-                    FROM filtered
-                    WHERE remarks_json IS NOT NULL
-                      AND remarks_json::text != '[]'
-                  ) r
-                  WHERE remark IS NOT NULL AND remark != ''
-                    AND (
-                      lower(remark) LIKE '%%congest%%'
-                      OR lower(remark) LIKE '%%delay%%'
-                      OR lower(remark) LIKE '%%waiting%%'
-                      OR lower(remark) LIKE '%%queue%%'
-                    )
-                  GROUP BY cargo_grade, remark
-                ),
-                top_remarks AS (
-                  SELECT cargo_grade,
-                         jsonb_agg(remark ORDER BY cnt DESC, remark) FILTER (WHERE rn <= 5) AS congestion_delay_remarks
-                  FROM (
-                    SELECT cargo_grade, remark, cnt,
-                           ROW_NUMBER() OVER (PARTITION BY cargo_grade ORDER BY cnt DESC, remark) AS rn
-                    FROM remark_counts
-                  ) t
-                  GROUP BY cargo_grade
-                )
-                SELECT
-                  ds.cargo_grade,
-                  ds.voyage_count,
-                  ds.delayed_voyage_count,
-                  tp.common_ports,
-                  tr.congestion_delay_remarks
-                FROM delay_stats ds
-                LEFT JOIN top_ports tp ON ds.cargo_grade = tp.cargo_grade
-                LEFT JOIN top_remarks tr ON ds.cargo_grade = tr.cargo_grade
-                ORDER BY ds.voyage_count DESC, ds.cargo_grade
-                LIMIT %(limit)s
-            """
+            remark_filters = " OR ".join(
+                get_ops_delay_remark_filter_template().format(keyword=keyword)
+                for keyword in get_ops_delay_remark_keywords()
+            ) or get_ops_delay_remark_filter_empty()
+
+            canonical_sql = get_ops_canonical_sql("cargo_profitability_context").format(
+                remark_filters=remark_filters
+            )
 
             params = {"cargo_grades": cargo_grades_norm, "limit": limit_val}
             guard = validate_and_prepare_sql(
@@ -327,12 +270,7 @@ class OpsAgent:
         voyage_number = slots.get("voyage_number")
         if voyage_number:
 
-            lookup_sql = """
-                SELECT voyage_id
-                FROM ops_voyage_summary
-                WHERE voyage_number = %(voyage_number)s
-                LIMIT 1
-            """
+            lookup_sql = get_ops_canonical_sql("voyage_number_lookup")
 
             lookup_guard = validate_and_prepare_sql(
                 lookup_sql,
@@ -378,26 +316,7 @@ class OpsAgent:
                     "limit": limit_val,
                 }
 
-                vessel_sql = f"""
-                    SELECT voyage_id,
-                           voyage_number,
-                           vessel_imo,
-                           vessel_name,
-                           module_type,
-                           fixture_count,
-                           offhire_days,
-                           is_delayed,
-                           delay_reason,
-                           ports_json,
-                           grades_json,
-                           remarks_json,
-                           voyage_start_date,
-                           voyage_end_date
-                    FROM ops_voyage_summary
-                    WHERE {where}
-                    ORDER BY voyage_end_date DESC NULLS LAST
-                    LIMIT %(limit)s
-                """
+                vessel_sql = get_ops_canonical_sql("vessel_summary").format(where=where)
 
                 guard = validate_and_prepare_sql(
                     sql=vessel_sql,
@@ -450,6 +369,13 @@ class OpsAgent:
 
         rows = self.pg.execute_dynamic_select(guard.sql, guard.params)
 
+        elapsed = round(time.time() - start, 3)
+        logger.info(
+            "AGENT_END | agent=ops | mode=dynamic_sql | intent=%s | rows=%s | latency=%ss",
+            intent_key,
+            len(rows or []),
+            elapsed,
+        )
         return OpsAgentResult(
             intent_key=intent_key,
             query_key="dynamic.sql",
@@ -472,43 +398,40 @@ class OpsAgent:
             voyage_id = s.get("voyage_id")
             vessel_imo = s.get("imo") or s.get("vessel_imo")
             if not voyage_number and not voyage_id:
-                raise ValueError("voyage.summary requires voyage_number or voyage_id")
+                raise ValueError(get_ops_validation_message("voyage_summary_requires_reference"))
             return "kpi.voyage_by_reference", {
                 "voyage_number": str(int(voyage_number)) if voyage_number is not None else None,
                 "voyage_id": str(voyage_id) if voyage_id is not None else None,
                 "vessel_imo": str(vessel_imo) if vessel_imo is not None else None,
-                "scenario": s.get("scenario") or "ACTUAL",
+                "scenario": s.get("scenario") or get_default_scenario(),
             }
 
         if intent_key == "vessel.summary":
             vessel_ref = s.get("vessel_name") or s.get("imo")
             if not vessel_ref:
-                raise ValueError("vessel.summary requires vessel_name or imo")
+                raise ValueError(get_ops_validation_message("vessel_summary_requires_reference"))
             return "kpi.vessel_voyages_by_reference", {"vessel_ref": str(vessel_ref), "limit": limit}
 
-        if intent_key == "ops.delayed_voyages":
-            return "kpi.delayed_voyages_analysis", {"limit": limit}
+        simple_mappings = get_ops_simple_intent_mappings()
+        if intent_key in simple_mappings:
+            mapping = simple_mappings[intent_key]
+            required_slot = mapping.get("required_slot")
+            if required_slot:
+                value = s.get(str(required_slot))
+                if isinstance(value, str):
+                    value = value.strip()
+                if not value:
+                    raise ValueError(f"{intent_key} requires {required_slot}")
 
-        if intent_key in ("ops.voyages_by_port", "ops.port_query"):
-            return "kpi.port_performance_analysis", {
-                "port_name": s.get("port_name"),
-                "limit": limit,
-            }
-
-        if intent_key == "ops.voyages_by_cargo_grade":
-            cargo_grade = (s.get("cargo_grade") or "").strip()
-            if not cargo_grade:
-                raise ValueError("ops.voyages_by_cargo_grade requires cargo_grade")
-            return "kpi.voyages_by_cargo_grade", {
-                "cargo_grade": cargo_grade,
-                "limit": limit,
-            }
-
-        if intent_key == "port.details":
-            port_name = s.get("port_name")
-            if not port_name:
-                raise ValueError("port.details requires port_name")
-            return "kpi.port_performance_analysis", {"port_name": str(port_name), "limit": limit}
+            params: Dict[str, Any] = {}
+            include = mapping.get("include") if isinstance(mapping.get("include"), list) else []
+            if "limit" in include:
+                params["limit"] = limit
+            if "port_name" in include:
+                params["port_name"] = str(s.get("port_name"))
+            if "cargo_grade" in include:
+                params["cargo_grade"] = str(s.get("cargo_grade")).strip()
+            return str(mapping["query_key"]), params
 
         return "kpi.voyages_by_flexible_filters", {
             "limit": limit,

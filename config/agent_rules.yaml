@@ -1,0 +1,348 @@
+finance:
+  max_limit: 200
+  composite_allowed_extra_slots:
+    - scenario
+    - limit
+    - voyage_ids
+    - voyage_numbers
+    - voyage_number
+    - voyage_id
+    - cargo_grades
+    - vessel_imos
+
+  ranking:
+    default_metric: pnl
+    default_direction: desc
+    allowed_directions:
+      - asc
+      - desc
+    safe_metrics:
+      pnl: pnl
+      revenue: revenue
+      total_expense: total_expense
+      total_commission: total_commission
+      tce: tce
+    intent_metric_overrides:
+      ranking.voyages_by_pnl: pnl
+      ranking.voyages_by_revenue: revenue
+      ranking.voyages_by_commission: total_commission
+
+  simple_intent_mappings:
+    analysis.segment_performance:
+      query_key: finance.vessel_segment_performance
+      include:
+        - limit
+        - scenario
+    analysis.segmentperformance:
+      query_key: finance.vessel_segment_performance
+      include:
+        - limit
+        - scenario
+    ranking.vessels:
+      query_key: kpi.vessel_performance_summary
+      include:
+        - limit
+        - scenario
+        - min_voyage_count
+    analysis.cargo_profitability:
+      query_key: kpi.cargo_profitability_analysis
+      include:
+        - limit
+        - scenario
+    analysis.cargoprofitability:
+      query_key: kpi.cargo_profitability_analysis
+      include:
+        - limit
+        - scenario
+    analysis.high_revenue_low_pnl:
+      query_key: finance.high_revenue_low_pnl
+      include:
+        - limit
+        - scenario
+    ops.offhire_ranking:
+      query_key: kpi.offhire_ranking
+      include:
+        - limit
+        - scenario
+
+  validation_messages:
+    voyage_summary_requires_reference: voyage.summary requires voyage_number or voyage_id
+    vessel_summary_requires_reference: vessel.summary requires vessel_name or imo
+
+  dynamic_sql:
+    repairable_error_patterns:
+      - must appear in the group by
+      - set-returning function
+      - aggregate function calls cannot contain set-returning function calls
+      - syntax error
+      - forbidden sql pattern
+      - placeholder
+    repair_prompts:
+      finance_no_ops_join_initial: |
+        {question}
+
+        IMPORTANT FIX: Do NOT join ops tables. Query ONLY finance_voyage_kpi.
+        Return voyage_id, voyage_number, pnl, revenue, total_expense, tce, total_commission.
+        Filter scenario = COALESCE(%(scenario)s,'ACTUAL'). Order by pnl DESC. LIMIT %(limit)s.
+      forbidden_sql_pattern: |
+        {question}
+
+        IMPORTANT FIX: Return plain SQL only with no comments and no extra statements.
+        Use a single SELECT query and avoid any forbidden tokens.
+      finance_no_ops_join_validation: |
+        {question}
+
+        IMPORTANT FIX: Generate SQL on finance_voyage_kpi ONLY (no joins).
+        Return voyage_id, voyage_number, pnl, revenue, total_expense, tce, total_commission.
+        Filter scenario = COALESCE(%(scenario)s,'ACTUAL'). Use LIMIT %(limit)s.
+      require_kpi_columns: |
+        {question}
+
+        IMPORTANT FIX: Your last SQL did not return the required KPI columns.
+        Return voyage_id, voyage_number, pnl, revenue, total_expense
+        (and optionally tce, total_commission).
+        Use finance_voyage_kpi only and alias columns exactly as named.
+      scenario_variance_columns: |
+        {question}
+
+        IMPORTANT FIX (scenario comparison):
+        Use TWO CTEs aggregated to one row per (voyage_number, normalized vessel_imo)
+        for ACTUAL and WHEN_FIXED, then join on BOTH and aggregate to one row per voyage_number.
+        Filter voyage_number = ANY(%(voyage_numbers)s).
+        Return exactly: voyage_number, pnl_actual, pnl_when_fixed, pnl_variance,
+        tce_actual, tce_when_fixed, tce_variance.
+        Use SUM for pnl fields and AVG for tce fields.
+    segment_performance_fallback_sql:
+      with_voyage_numbers: |
+        SELECT
+          f.voyage_id,
+          f.voyage_number,
+          f.vessel_imo,
+          f.revenue,
+          f.total_expense,
+          f.pnl,
+          f.tce,
+          f.total_commission,
+          f.voyage_start_date,
+          f.voyage_end_date,
+          o.vessel_name,
+          o.module_type,
+          o.ports_json,
+          o.grades_json,
+          o.activities_json,
+          o.remarks_json
+        FROM finance_voyage_kpi f
+        LEFT JOIN ops_voyage_summary o
+          ON f.voyage_number = o.voyage_number
+          AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+        WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
+          AND f.voyage_number = ANY(%(voyage_numbers)s)
+        ORDER BY f.voyage_end_date DESC
+        LIMIT %(limit)s
+      default_negative_pnl: |
+        SELECT
+          f.voyage_id,
+          f.voyage_number,
+          f.vessel_imo,
+          f.revenue,
+          f.total_expense,
+          f.pnl,
+          f.tce,
+          f.total_commission,
+          f.voyage_start_date,
+          f.voyage_end_date,
+          o.vessel_name,
+          o.module_type,
+          o.ports_json,
+          o.grades_json,
+          o.activities_json,
+          o.remarks_json
+        FROM finance_voyage_kpi f
+        LEFT JOIN ops_voyage_summary o
+          ON f.voyage_number = o.voyage_number
+          AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+        WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
+          AND f.pnl < 0
+        ORDER BY f.pnl ASC
+        LIMIT %(limit)s
+
+ops:
+  max_limit: 200
+  cargo_grade_max_count: 50
+  cargo_profitability_intents:
+    - analysis.cargo_profitability
+    - analysis.cargoprofitability
+  delay_remark_keywords:
+    - congest
+    - delay
+    - waiting
+    - queue
+
+  validation_messages:
+    voyage_summary_requires_reference: voyage.summary requires voyage_number or voyage_id
+    vessel_summary_requires_reference: vessel.summary requires vessel_name or imo
+
+  canonical_sql:
+    voyage_ids_lookup: |
+      SELECT voyage_id,
+             voyage_number,
+             vessel_imo,
+             vessel_name,
+             module_type,
+             fixture_count,
+             offhire_days,
+             is_delayed,
+             delay_reason,
+             ports_json,
+             grades_json,
+             remarks_json,
+             voyage_start_date,
+             voyage_end_date
+      FROM ops_voyage_summary
+      WHERE voyage_id = ANY(%(voyage_ids)s)
+      LIMIT %(limit)s
+    voyage_number_lookup: |
+      SELECT voyage_id
+      FROM ops_voyage_summary
+      WHERE voyage_number = %(voyage_number)s
+      LIMIT 1
+    vessel_summary: |
+      SELECT voyage_id,
+             voyage_number,
+             vessel_imo,
+             vessel_name,
+             module_type,
+             fixture_count,
+             offhire_days,
+             is_delayed,
+             delay_reason,
+             ports_json,
+             grades_json,
+             remarks_json,
+             voyage_start_date,
+             voyage_end_date
+      FROM ops_voyage_summary
+      WHERE {where}
+      ORDER BY voyage_end_date DESC NULLS LAST
+      LIMIT %(limit)s
+    cargo_profitability_context: |
+      WITH grade_rows AS (
+        SELECT
+          o.voyage_id,
+          o.voyage_number,
+          o.is_delayed,
+          lower(trim(grade.value)) AS cargo_grade,
+          o.ports_json,
+          o.remarks_json
+        FROM ops_voyage_summary o,
+        jsonb_array_elements_text(o.grades_json) AS grade(value)
+        WHERE o.grades_json IS NOT NULL
+          AND o.grades_json::text != '[]'
+          AND grade.value IS NOT NULL
+          AND trim(grade.value) != ''
+      ),
+      filtered AS (
+        SELECT *
+        FROM grade_rows
+        WHERE cargo_grade = ANY(%(cargo_grades)s)
+      ),
+      delay_stats AS (
+        SELECT
+          cargo_grade,
+          COUNT(DISTINCT voyage_id) AS voyage_count,
+          COUNT(DISTINCT voyage_id) FILTER (WHERE is_delayed) AS delayed_voyage_count
+        FROM filtered
+        GROUP BY cargo_grade
+      ),
+      port_counts AS (
+        SELECT
+          cargo_grade,
+          port,
+          COUNT(*) AS cnt
+        FROM (
+          SELECT cargo_grade, jsonb_array_elements_text(ports_json) AS port
+          FROM filtered
+          WHERE ports_json IS NOT NULL
+            AND ports_json::text != '[]'
+        ) p
+        WHERE port IS NOT NULL AND port != ''
+        GROUP BY cargo_grade, port
+      ),
+      top_ports AS (
+        SELECT cargo_grade,
+               jsonb_agg(port ORDER BY cnt DESC, port) FILTER (WHERE rn <= 8) AS common_ports
+        FROM (
+          SELECT cargo_grade, port, cnt,
+                 ROW_NUMBER() OVER (PARTITION BY cargo_grade ORDER BY cnt DESC, port) AS rn
+          FROM port_counts
+        ) t
+        GROUP BY cargo_grade
+      ),
+      remark_counts AS (
+        SELECT
+          cargo_grade,
+          remark,
+          COUNT(*) AS cnt
+        FROM (
+          SELECT cargo_grade, jsonb_array_elements_text(remarks_json) AS remark
+          FROM filtered
+          WHERE remarks_json IS NOT NULL
+            AND remarks_json::text != '[]'
+        ) r
+        WHERE remark IS NOT NULL AND remark != ''
+          AND ({remark_filters})
+        GROUP BY cargo_grade, remark
+      ),
+      top_remarks AS (
+        SELECT cargo_grade,
+               jsonb_agg(remark ORDER BY cnt DESC, remark) FILTER (WHERE rn <= 5) AS congestion_delay_remarks
+        FROM (
+          SELECT cargo_grade, remark, cnt,
+                 ROW_NUMBER() OVER (PARTITION BY cargo_grade ORDER BY cnt DESC, remark) AS rn
+          FROM remark_counts
+        ) t
+        GROUP BY cargo_grade
+      )
+      SELECT
+        ds.cargo_grade,
+        ds.voyage_count,
+        ds.delayed_voyage_count,
+        tp.common_ports,
+        tr.congestion_delay_remarks
+      FROM delay_stats ds
+      LEFT JOIN top_ports tp ON ds.cargo_grade = tp.cargo_grade
+      LEFT JOIN top_remarks tr ON ds.cargo_grade = tr.cargo_grade
+      ORDER BY ds.voyage_count DESC, ds.cargo_grade
+      LIMIT %(limit)s
+  delay_remark_filter_template: lower(remark) LIKE '%%{keyword}%%'
+  delay_remark_filter_empty: "FALSE"
+
+  simple_intent_mappings:
+    ops.delayed_voyages:
+      query_key: kpi.delayed_voyages_analysis
+      include:
+        - limit
+    ops.voyages_by_port:
+      query_key: kpi.port_performance_analysis
+      required_slot: port_name
+      include:
+        - port_name
+        - limit
+    ops.port_query:
+      query_key: kpi.port_performance_analysis
+      required_slot: port_name
+      include:
+        - port_name
+        - limit
+    ops.voyages_by_cargo_grade:
+      query_key: kpi.voyages_by_cargo_grade
+      required_slot: cargo_grade
+      include:
+        - cargo_grade
+        - limit
+    port.details:
+      query_key: kpi.port_performance_analysis
+      required_slot: port_name
+      include:
+        - port_name
+        - limit

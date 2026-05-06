@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import ast
 import json
-import logging
 import os
 import re
 import re as _re
@@ -27,36 +26,69 @@ from typing import Any, Dict, List, Optional
 
 from groq import Groq
 
-logger = logging.getLogger(__name__)
+from app.config.prompt_rules_loader import (
+    get_answer_generation_fallback,
+    get_answer_polish_system_prompt,
+    get_answer_postprocess_replacements,
+    get_default_sql_json_prompt,
+    get_llm_answer_generation_system_prompt,
+    get_llm_conversation_memory_label,
+    get_llm_intent_classifier_system_prompt_template,
+    get_llm_ranking_answer_hint,
+    get_out_of_scope_response_template,
+)
+from app.config.routing_rules_loader import (
+    get_llm_answer_financial_first_terms,
+    get_llm_answer_grade_terms,
+    get_llm_answer_narrative_triggers,
+    get_llm_answer_port_terms,
+    get_llm_answer_remark_terms,
+    get_llm_average_voyage_duration_terms,
+    get_llm_cargo_aggregate_terms,
+    get_llm_cargo_frequency_terms,
+    get_llm_cargo_negative_profit_terms,
+    get_llm_cargo_non_primary_subject_terms,
+    get_llm_cargo_profitability_metric_terms,
+    get_llm_cargo_profitability_terms,
+    get_llm_cargo_subject_terms,
+    get_llm_comparison_terms,
+    get_llm_delay_ranking_terms,
+    get_llm_delay_terms,
+    get_llm_emissions_ranking_terms,
+    get_llm_emissions_terms,
+    get_llm_entity_summary_terms,
+    get_llm_fleet_vessel_terms,
+    get_llm_generic_agg_terms,
+    get_llm_metadata_fleet_wide_markers,
+    get_llm_metadata_keywords,
+    get_llm_mongo_only_voyage_fields,
+    get_llm_out_of_scope_greeting_exact,
+    get_llm_out_of_scope_greeting_prefixes,
+    get_llm_out_of_scope_identity_phrases,
+    get_llm_out_of_scope_weather_keywords,
+    get_llm_per_vessel_terms,
+    get_llm_port_broad_visit_terms,
+    get_llm_port_call_ranking_terms,
+    get_llm_port_call_terms,
+    get_llm_port_fleet_signals,
+    get_llm_profit_metric_terms,
+    get_llm_ranking_order_terms,
+    get_llm_scenario_comparison_terms,
+    get_llm_vessel_fleet_exclusion_terms,
+    get_llm_vessel_metadata_agg_terms,
+    get_llm_vessel_metric_signals,
+    get_llm_vessel_performance_terms,
+    get_llm_vessel_ranking_signals,
+    get_llm_voyage_count_per_vessel_terms,
+    get_llm_voyage_extreme_phrases,
+    get_llm_voyage_performance_phrases,
+    get_llm_voyage_port_listing_terms,
+    get_llm_voyage_profitability_phrases,
+    get_llm_voyage_resolved_vessel_metadata_terms,
+)
+from app.core.logger import get_logger
 
-MONGO_ONLY_VOYAGE_FIELDS = frozenset([
-    # fixture / commercial
-    "charterer", "broker", "commission", "commission rate", "commission rates",
-    "cp date", "cp quantity", "demurrage rate", "laytime", "time bar",
-    "fixture", "fixture terms", "bill of lading", "bl quantity", "shipper",
-    # cargo
-    "cargo grade", "grade", "cargo",
-    # route / legs
-    "route", "leg", "legs", "arrival", "departure",
-    "load port", "discharge port", "port call",
-    "distance", "passage days",
-    # revenue / expense detail
-    "freight rate", "revenue line", "expense line",
-    "rebill", "worldscale", "ws ",
-    # bunkers
-    "bunker consumption", "bunker cost", "bunker grade",
-    "hsbf", "lsgo", "rob", "stems", "bunker",
-    # emissions
-    "cii", "cii band", "co2", "sox", "nox",
-    "emissions", "eeoi", "aer",
-    # remarks
-    "remark", "remarks", "who added", "added by",
-    # projected results
-    "projected", "projected pnl", "projected revenue",
-    "projected tce", "tce projection",
-    # metadata / source
-    "metadata", "voyage metadata", "source link", "url",
-])
+logger = get_logger("llm_client")
 
 
 def _should_use_voyage_metadata(
@@ -80,7 +112,7 @@ def _should_use_voyage_metadata(
     if not has_voyage_anchor:
         return False
     text_lower = (user_input or "").lower()
-    return any(field in text_lower for field in MONGO_ONLY_VOYAGE_FIELDS)
+    return any(field in text_lower for field in get_llm_mongo_only_voyage_fields())
 
 
 # =========================================================
@@ -116,19 +148,15 @@ class LLMClient:
             or (re.search(r"\bfor\s+voyages?\b", t) and re.search(r"\b\d{3,5}\b", t))
         )
         looks_specific_vessel_performance = bool(
-            re.search(r"\bstena\s+[a-z0-9][a-z0-9\-]*\b", t) and any(k in t for k in ("overall", "performing", "voyage history", "trend"))
-        )
-        voyage_resolved_vessel_metadata_terms = (
-            "operating status", "operational status", "is operating", "is operational",
-            "hire rate", "hirerate", "scrubber", "passage type", "passage types",
-            "account code", "market type",
+            re.search(r"\bstena\s+[a-z0-9][a-z0-9\-]*\b", t)
+            and any(k in t for k in get_llm_vessel_performance_terms())
         )
 
-        if has_specific_voyage_anchor and any(k in t for k in voyage_resolved_vessel_metadata_terms):
+        if has_specific_voyage_anchor and any(k in t for k in get_llm_voyage_resolved_vessel_metadata_terms()):
             return "vessel.metadata"
 
-        if any(k in t for k in ("average voyage duration", "average voyage days", "voyage duration in days")) and any(
-            k in t for k in ("per vessel", "each vessel", "by vessel")
+        if any(k in t for k in get_llm_average_voyage_duration_terms()) and any(
+            k in t for k in get_llm_per_vessel_terms()
         ):
             return "aggregation.average"
 
@@ -138,57 +166,54 @@ class LLMClient:
 
         # 1) Cargo-grade profitability (fleet aggregate) — must run before generic ranking
         # so grade-level aggregate asks don't get misrouted to ranking.pnl.
-        cargo_grade_terms = ("cargo grade", "cargo grades", "grade", "grades", "cargo")
-        aggregate_terms = ("highest", "top", "most", "average", "avg", "overall", "profit", "profitable", "pnl", "revenue")
-        cargo_frequency_terms = ("frequent", "frequency", "most common", "most commonly", "appears most", "appears the most", "most carried")
+        cargo_grade_terms = get_llm_cargo_subject_terms()
+        aggregate_terms = get_llm_cargo_aggregate_terms()
+        cargo_frequency_terms = get_llm_cargo_frequency_terms()
         cargo_subject_is_primary = not any(
-            k in t for k in ("voyages", "for voyage", "voyage-by-voyage", "vessel", "vessels", "module type", "module types")
+            k in t for k in get_llm_cargo_non_primary_subject_terms()
         )
         if cargo_subject_is_primary and any(k in t for k in cargo_grade_terms) and ("when-fixed" in t or "when fixed" in t or ("actual" in t and "variance" in t)):
             return "analysis.cargo_profitability"
         if cargo_subject_is_primary and any(k in t for k in cargo_grade_terms) and any(
-            k in t for k in ("average pnl", "avg pnl", "highest average pnl", "average revenue", "avg revenue")
+            k in t for k in get_llm_cargo_profitability_metric_terms()
         ):
             return "analysis.cargo_profitability"
         if (
             cargo_subject_is_primary
             and any(k in t for k in cargo_grade_terms)
             and any(k in t for k in cargo_frequency_terms)
-            and not any(k in t for k in ("profitable", "profit", "pnl", "revenue", "overall"))
+            and not any(k in t for k in get_llm_cargo_profitability_terms())
         ):
             return "ranking.cargo"
-        if any(k in t for k in cargo_grade_terms) and any(k in t for k in ("negative pnl", "negative pn", "loss-making", "loss making", "loss-making voyages", "negative profit")):
+        if any(k in t for k in cargo_grade_terms) and any(k in t for k in get_llm_cargo_negative_profit_terms()):
             return "ranking.cargo"
         if cargo_subject_is_primary and any(k in t for k in cargo_grade_terms) and any(k in t for k in aggregate_terms):
             return "analysis.cargo_profitability"
 
         # Scenario comparison should win over plain voyage-vs-voyage comparison.
-        if "when-fixed" in t or "when fixed" in t or ("actual" in t and "variance" in t):
+        if any(k in t for k in get_llm_scenario_comparison_terms()) or ("actual" in t and "variance" in t):
             return "analysis.scenario_comparison"
 
         # Explicit voyage-to-voyage comparison with 2+ voyage numbers.
-        if any(k in t for k in ("compare", "vs", "versus", "difference", "which is better")):
+        if any(k in t for k in get_llm_comparison_terms()):
             nums = re.findall(r"\b\d{3,5}\b", t)
             if len(nums) >= 2:
                 return "comparison.voyages"
 
         # Voyage-anchored port listing should stay voyage-scoped.
         if re.search(r"\bvoyage\s+\d{3,5}\b", t) and any(
-            k in t for k in ("which ports", "ports were visited", "ports visited", "visited ports", "port list")
+            k in t for k in get_llm_voyage_port_listing_terms()
         ):
             return "voyage.metadata"
 
         # 0) "Tell me about voyage 1901" / "voyage 1901 summary" → voyage summary
-        if "voyage" in t and any(k in t for k in ("tell me about", "details about", "information about", "summary", "summarize")):
+        if "voyage" in t and any(k in t for k in get_llm_entity_summary_terms()):
             if re.search(r"\bvoyage\s+\d{3,5}\b", t):
                 return "voyage.summary"
 
         # 0) "Tell me about vessel ..." → vessel summary
         if ("vessel" in t or "ship" in t) and (
-            "tell me about" in t
-            or "details about" in t
-            or "information about" in t
-            or "summary" in t
+            any(k in t for k in get_llm_entity_summary_terms())
         ):
             return "vessel.summary"
 
@@ -196,7 +221,7 @@ class LLMClient:
         # not fleet rankings (e.g., "For vessel X, show voyage-by-voyage trend...").
         # Keep this generic and avoid fleet phrases like "which vessel/per vessel/each vessel".
         if ("for vessel " in t or "for ship " in t) and not any(
-            p in t for p in ("which vessel", "per vessel", "each vessel", "vessels have", "vessel have")
+            p in t for p in get_llm_vessel_fleet_exclusion_terms()
         ):
             return "vessel.summary"
 
@@ -209,49 +234,41 @@ class LLMClient:
             return "ranking.vessels"
 
         # 1b) Vessel-level fleet aggregates should stay vessel-scoped, not voyage-scoped.
-        vessel_ranking_signals = (
-            "which vessel", "which vessels", "top vessel", "top vessels", "vessel has", "vessels have",
-            "per vessel", "each vessel", "across all voyages", "fleet"
-        )
-        vessel_metric_signals = (
-            "pnl", "profit", "profitability", "revenue", "tce", "expense", "cost",
-            "voyage count", "number of voyage", "speed", "hire rate", "contract", "offhire"
-        )
-        if ("vessel" in t or "vessels" in t) and any(k in t for k in vessel_ranking_signals) and any(
-            k in t for k in vessel_metric_signals
+        if ("vessel" in t or "vessels" in t) and any(k in t for k in get_llm_vessel_ranking_signals()) and any(
+            k in t for k in get_llm_vessel_metric_signals()
         ):
             return "ranking.vessels"
 
         # 2) Voyage-ranking phrasing should stay voyage-scoped even when extra output
         # fields like cargo grade / ports are requested.
-        if any(k in t for k in ("most profitable voyages", "top profitable voyages", "top performing voyages")):
+        if any(k in t for k in get_llm_voyage_profitability_phrases()):
             return "ranking.voyages_by_pnl"
 
         # 2) Ranking by PnL
-        if ("top" in t or "highest" in t or "rank" in t) and ("pnl" in t or "profit" in t):
+        if any(k in t for k in get_llm_ranking_order_terms()) and any(k in t for k in get_llm_profit_metric_terms()):
             return "ranking.pnl"
 
         # 2b) Ranking by revenue
-        if ("top" in t or "highest" in t or "rank" in t) and "revenue" in t:
+        if any(k in t for k in get_llm_ranking_order_terms()) and "revenue" in t:
             return "ranking.revenue"
 
         # Emissions / climate metric rankings.
-        if any(k in t for k in ("co2", "emission", "emissions", "eeoi", "aer", "sox", "nox", "cii")) and any(
-            k in t for k in ("top", "highest", "worst", "lowest", "most", "least", "high")
+        if any(k in t for k in get_llm_emissions_terms()) and any(
+            k in t for k in get_llm_emissions_ranking_terms()
         ):
             return "ranking.voyages"
 
         # Natural language voyage-performance phrasing.
-        if any(k in t for k in ("top performing voyages", "most profitable voyages", "top performing voyage", "most profitable voyage", "least profitable voyage")):
+        if any(k in t for k in get_llm_voyage_performance_phrases()):
             if not looks_specific_vessel_performance:
                 return "ranking.voyages_by_pnl"
-        if any(k in t for k in ("best voyage", "worst voyage")) and not looks_specific_vessel_performance:
+        if any(k in t for k in get_llm_voyage_extreme_phrases()) and not looks_specific_vessel_performance:
             return "ranking.voyages_by_pnl"
 
         # 4) Port-call ranking (voyages with most port calls / ports visited / port stops)
         if (
-            any(k in t for k in ("port call", "port calls", "port count", "port counts", "port stops", "port visits"))
-            and any(k in t for k in ("top", "most", "highest", "rank", "visited"))
+            any(k in t for k in get_llm_port_call_terms())
+            and any(k in t for k in get_llm_port_call_ranking_terms())
         ) or ("visited the most ports" in t):
             return "ranking.port_calls"
 
@@ -276,57 +293,32 @@ class LLMClient:
             return "ranking.voyages"
 
         # 8) Fleet-wide port ranking — catch ALL variants before LLM sees them
-        _port_fleet_signals = (
-            "most visit", "most common", "most commonly", "most frequent",
-            "commonly visit", "frequently visit",
-            "busiest port", "popular port",
-            "which port", "top port",
-        )
-        if "port" in t and any(k in t for k in _port_fleet_signals):
+        if "port" in t and any(k in t for k in get_llm_port_fleet_signals()):
             return "ranking.ports"
         # Broader catch: any combo of (most/common/frequent/busiest) + (visit*) + port
-        if "port" in t and "most" in t and any(k in t for k in ("visit", "common", "frequent", "busy")):
+        if "port" in t and "most" in t and any(k in t for k in get_llm_port_broad_visit_terms()):
             return "ranking.ports"
 
         # 9) Voyage count per vessel (how many voyages does each/per vessel)
-        if "voyage" in t and any(k in t for k in ("each vessel", "per vessel", "how many voyage", "number of voyage", "vessel have", "vessels have")):
+        if "voyage" in t and any(k in t for k in get_llm_voyage_count_per_vessel_terms()):
             return "aggregation.count"
 
         # 10) Fleet-level vessel aggregate/screening queries.
-        fleet_vessel_terms = (
-            "which vessel", "which vessels", "top vessels", "vessels with", "show vessels",
-            "operating vessels", "active vessels", "scrubber vessels", "non-scrubber vessels",
-            "market type has", "fastest on ballast", "fastest on laden",
-            "longest contract", "highest hire rate", "expensive to operate",
-        )
-        vessel_metadata_agg_terms = (
-            "operating", "operational", "active vessels",
-            "scrubber", "non-scrubber", "non scrubber",
-            "hire rate", "hirerate",
-            "ballast", "laden", "default ballast speed", "default laden speed",
-            "contract", "duration", "current contract",
-            "pool", "short pool", "long pool",
-            "market type",
-        )
-        agg_terms = (
-            "highest", "lowest", "top", "most", "least", "best", "worst",
-            "count", "average", "avg", "total", "longest", "fastest",
-        )
         explicit_single_vessel = bool(re.search(r"\b(?:vessel|ship)\s+[a-z0-9][a-z0-9\- ]{1,40}\b", t))
         if (
             ("vessel" in t or "vessels" in t)
-            and any(k in t for k in vessel_metadata_agg_terms)
+            and any(k in t for k in get_llm_vessel_metadata_agg_terms())
             and not explicit_single_vessel
         ):
             return "ranking.vessel_metadata"
-        if any(k in t for k in fleet_vessel_terms):
+        if any(k in t for k in get_llm_fleet_vessel_terms()):
             return "ranking.vessels"
-        if ("vessel" in t or "vessels" in t) and any(k in t for k in agg_terms) and not explicit_single_vessel:
+        if ("vessel" in t or "vessels" in t) and any(k in t for k in get_llm_generic_agg_terms()) and not explicit_single_vessel:
             return "ranking.vessels"
 
         # 11) Delay/waiting-centric ranking.
-        if any(k in t for k in ("delay", "waiting cost", "waiting", "offhire")) and any(
-            k in t for k in ("highest", "biggest", "most", "worst", "top")
+        if any(k in t for k in get_llm_delay_terms()) and any(
+            k in t for k in get_llm_delay_ranking_terms()
         ):
             return "ops.offhire_ranking"
 
@@ -407,47 +399,47 @@ class LLMClient:
 
         lines: List[str] = []
         if hot_turns:
-            lines.append("HOT CONTEXT (last 2-3 turns; use for immediate follow-up resolution):")
+            lines.append(get_llm_conversation_memory_label("hot_context_header"))
             for idx, item in enumerate(hot_turns, start=1):
-                lines.append(f"Hot Turn {idx}:")
-                lines.append(f"- User: {item.get('query')}")
+                lines.append(get_llm_conversation_memory_label("hot_turn_label").format(index=idx))
+                lines.append(get_llm_conversation_memory_label("user_label").format(value=item.get("query")))
                 if item.get("intent_key"):
-                    lines.append(f"- Intent: {item.get('intent_key')}")
+                    lines.append(get_llm_conversation_memory_label("intent_label").format(value=item.get("intent_key")))
                 if item.get("slots"):
-                    lines.append(f"- Anchors/Slots: {json.dumps(item.get('slots'), ensure_ascii=True)}")
+                    lines.append(get_llm_conversation_memory_label("anchors_slots_label").format(value=json.dumps(item.get("slots"), ensure_ascii=True)))
                 if item.get("answer_headline"):
-                    lines.append(f"- Prior answer summary: {item.get('answer_headline')}")
+                    lines.append(get_llm_conversation_memory_label("prior_answer_summary_label").format(value=item.get("answer_headline")))
         else:
-            lines.append("HOT CONTEXT: none")
+            lines.append(get_llm_conversation_memory_label("hot_context_empty"))
 
         lines.append("")
         if warm_turns:
-            lines.append("WARM CONTEXT (older turns; anchors only for backward references):")
+            lines.append(get_llm_conversation_memory_label("warm_context_header"))
             for idx, item in enumerate(warm_turns, start=1):
-                lines.append(f"Warm Turn {idx}:")
+                lines.append(get_llm_conversation_memory_label("warm_turn_label").format(index=idx))
                 if item.get("intent_key"):
-                    lines.append(f"- Intent: {item.get('intent_key')}")
+                    lines.append(get_llm_conversation_memory_label("intent_label").format(value=item.get("intent_key")))
                 if item.get("slots"):
-                    lines.append(f"- Anchors: {json.dumps(item.get('slots'), ensure_ascii=True)}")
+                    lines.append(get_llm_conversation_memory_label("anchors_label").format(value=json.dumps(item.get("slots"), ensure_ascii=True)))
         else:
-            lines.append("WARM CONTEXT: none")
+            lines.append(get_llm_conversation_memory_label("warm_context_empty"))
 
         return "\n".join(lines)
 
     def _recent_turns_prompt(self, session_context: Optional[Dict[str, Any]], *, limit: int = 3) -> str:
         turns = self._recent_turns_for_context(session_context, limit=limit)
         if not turns:
-            return "No recent conversational context."
+            return get_answer_generation_fallback("no_recent_context")
         lines = []
         for idx, item in enumerate(turns, start=1):
-            lines.append(f"Turn {idx}:")
-            lines.append(f"- User: {item.get('query')}")
+            lines.append(get_llm_conversation_memory_label("turn_label").format(index=idx))
+            lines.append(get_llm_conversation_memory_label("user_label").format(value=item.get("query")))
             if item.get("intent_key"):
-                lines.append(f"- Intent: {item.get('intent_key')}")
+                lines.append(get_llm_conversation_memory_label("intent_label").format(value=item.get("intent_key")))
             if item.get("slots"):
-                lines.append(f"- Slots: {json.dumps(item.get('slots'), ensure_ascii=True)}")
+                lines.append(get_llm_conversation_memory_label("slots_label").format(value=json.dumps(item.get("slots"), ensure_ascii=True)))
             if item.get("answer_headline"):
-                lines.append(f"- Prior answer summary: {item.get('answer_headline')}")
+                lines.append(get_llm_conversation_memory_label("prior_answer_summary_label").format(value=item.get("answer_headline")))
         return "\n".join(lines)
 
     # =========================================================
@@ -571,86 +563,11 @@ class LLMClient:
                 deterministic = "analysis.segment_performance"
 
         tl = text_norm.lower()
-        metadata_keywords = (
-            "passage type",
-            "passage types",
-            "consumption profile",
-            "consumption profiles",
-            "consumption",
-            "default consumption",
-            "speed",
-            "ifo",
-            "mgo",
-            "ballast",
-            "laden",
-            "non passage",
-            "non-passage",
-            "idle",
-            "load",
-            "discharge",
-            "heat",
-            "clean",
-            "inert",
-            "hire rate",
-            "hirerate",
-            "hire_rate",
-            "hire-rate",
-            "scrubber",
-            "market type",
-            "contract history",
-            "contract",
-            "tags",
-            "account code",
-            "is vessel operating",
-            "operating status",
-            "operational",
-            "is operating",
-            "owner",
-            "duration",
-            "cp date",
-            "delivery",
-            "extracted at",
-            "fixture",
-            "charterer",
-            "laycan",
-            "demurrage",
-            "freight",
-            "cargo quantity",
-            "cargoes",
-            "leg",
-            "legs",
-            "route leg",
-            "bunker",
-            "bunkers",
-            "emission",
-            "emissions",
-            "co2",
-            "projected result",
-            "projected pnl",
-            "url",
-            "source link",
-            "commercial metadata",
-            "voyage metadata",
-            "vessel metadata",
-            "metadata",
-        )
+        metadata_keywords = get_llm_metadata_keywords()
 
         # Metadata-first routing for vessel/voyage-anchored questions.
         # Allow metadata override when early deterministic pick is summary intent.
-        fleet_wide_markers = (
-            "which vessels",
-            "which vessel has the",
-            "top vessels",
-            "vessels with",
-            "market type has",
-            "across all",
-            "across fleet",
-            "fleet-wide",
-            "all vessels",
-            "most vessels",
-            "highest voyage count",
-            "lowest voyage count",
-        )
+        fleet_wide_markers = get_llm_metadata_fleet_wide_markers()
         looks_fleet_wide = any(m in tl for m in fleet_wide_markers)
 
         if any(k in tl for k in metadata_keywords) and (
@@ -726,7 +643,9 @@ class LLMClient:
         # the LLM can distinguish entity-anchored vs fleet-wide aggregate intents.
         # No hardcoding — descriptions come purely from the registry.
         # =========================================================
-        from app.registries.intent_registry import INTENT_REGISTRY
+        from app.registries.intent_loader import get_yaml_registry_facade
+
+        INTENT_REGISTRY = get_yaml_registry_facade(validate_parity=True)["INTENT_REGISTRY"]
 
         intent_lines = []
         for i in supported_intents:
@@ -744,55 +663,10 @@ class LLMClient:
         intents_formatted = "\n".join(intent_lines)
         recent_context = self._memory_windows_prompt(session_context)
 
-        system = f"""
-You are a maritime finance intent classifier.
-Return ONLY valid JSON with keys: intent_key, slots, is_followup, inherit_slots_from_session, backward_reference, followup_confidence.
-
-RECENT CONVERSATION CONTEXT:
-{recent_context}
-
-SUPPORTED INTENTS (read descriptions carefully before classifying):
-{intents_formatted}
-
-CLASSIFICATION RULES:
-- First identify the PRIMARY subject the rows should represent: voyages, vessels, cargo grades, ports, module types, or a single anchored entity.
-- Supporting columns do NOT change the primary subject. Example: if the user asks for voyages and also wants cargo grades/ports/remarks as extra columns, the intent is still a voyage intent.
-- If the user names a SPECIFIC vessel by name or IMO → use vessel.summary or vessel.metadata
-- If the user names a SPECIFIC voyage by number → use voyage.summary
-- If the user asks about the ENTIRE fleet with no specific entity → use ranking.*, aggregation.*, or analysis.* intents
-- Intents marked FLEET-WIDE must NEVER have vessel_name or voyage_number in slots — those fields should be absent
-- NEVER extract vessel_name from query phrases like "highest PnL", "most voyages", "best performing", "earned the most" — those are metrics, not vessel names
-- If the user asks for voyages ranked by PnL/revenue/commission/port calls and also requests vessel name, cargo grade, key ports, remarks, margin %, or expense ratio, keep it as a voyage ranking intent.
-- If the user asks for module type breakdowns, use `analysis.by_module_type` even if cargo grades or ports are requested as output columns.
-- If the user asks for vessels with voyage count / average PnL / most common cargo grade, use `ranking.vessels` because the grouped subject is vessels.
-- If the user asks for voyages that visited a named port and then says rank by PnL/revenue, keep the intent voyage-ranking and extract the port as a filter slot.
-- If the user asks about one specific vessel overall, its trend, voyage history, best/worst voyage, or whether it is performing well, use `vessel.summary`.
-- NEVER output voyage_ids
-- voyage_numbers must be int list
-- limit must be int (default 10 if user says "top N" without specifying N)
-- If no intent clearly fits → out_of_scope (use sparingly — always prefer the closest matching intent over out_of_scope)
-- Decide whether the current message is a follow-up using the hot/warm context above.
-- Set is_followup=true only when the user is continuing or referring back to prior context.
-- inherit_slots_from_session must be a list of slot KEYS ONLY, such as ["voyage_number"] or ["vessel_name", "imo"].
-- Set backward_reference=true only when the user is referring to older context beyond the immediate last turn.
-- followup_confidence must be one of: high, medium, low.
-- If the current message is a fresh query with an explicitly named new entity, use is_followup=false and inherit_slots_from_session=[].
-- Ranking aliases (allowed):
-  - ranking.pnl: Rank voyages/entities by PnL (e.g., "top 10 voyages by PnL", "highest profit voyages")
-  - ranking.revenue: Rank voyages/entities by revenue
-  - ranking.port_calls: Rank voyages by number of port calls/visits/stops (e.g., "show 10 voyages with most port calls")
-- Use composite.query only when the question genuinely requires combining heterogeneous data in a way no single ranking/analysis intent can represent.
-
-SLOT EXTRACTION:
-- cargo_grades: list[str] | null
-  Any petroleum/chemical cargo grade or product type the user mentions
-  (e.g. "Naphtha", "Crude", "VLSFO", "Jet Fuel", "DPP", "CPP", "LNG", "Gasoil", etc.).
-  Normalize to lowercase. Return null if no grade mentioned.
-  Examples:
-    "Show Naphtha voyages"     -> ["naphtha"]
-    "crude and fuel oil ships" -> ["crude", "fuel oil"]
-    "all voyages last month"   -> null
-"""
+        system = get_llm_intent_classifier_system_prompt_template().format(
+            recent_context=recent_context,
+            intents_formatted=intents_formatted,
+        )
 
         result = self._call_with_retry(
             system=system,
@@ -1001,7 +875,9 @@ SLOT EXTRACTION:
                     # Pull all slot keys that ranking/aggregation/fleet-wide intents
                     # declare as their metrics — anything matching those patterns
                     # in a vessel_name value means it was mis-extracted.
-                    from app.registries.intent_registry import INTENT_REGISTRY
+                    from app.registries.intent_loader import get_yaml_registry_facade
+
+                    INTENT_REGISTRY = get_yaml_registry_facade(validate_parity=True)["INTENT_REGISTRY"]
                     fleet_intents_with_metric = [
                         cfg for cfg in INTENT_REGISTRY.values()
                         if cfg.get("route") == "composite"
@@ -1100,7 +976,7 @@ SLOT EXTRACTION:
         **kwargs,
     ) -> Dict[str, Any]:
 
-        system = system_prompt or "Return SQL JSON only."
+        system = system_prompt or get_default_sql_json_prompt()
 
         raw = self._call_with_retry(
             system=system,
@@ -1185,62 +1061,15 @@ SLOT EXTRACTION:
             q = (question or "").strip()
             q_lower = q.lower()
 
-            greeting_exact = {
-                "hi", "hello", "hey", "hiya", "yo",
-                "good morning", "good afternoon", "good evening",
-                "help", "start",
-            }
-            if q_lower in greeting_exact or any(q_lower.startswith(p) for p in ("hi ", "hello ", "hey ")):
-                return (
-                    "### Hello\n"
-                    "- I'm **Digital Sales Agent**, your maritime finance + operations analytics assistant.\n"
-                    "- I can help you analyze **voyages, vessels, ports, cargo grades, delays/offhire, remarks**, and related **financial KPIs** (PnL, revenue, expense, TCE, commissions).\n\n"
-                    "### Try asking\n"
-                    "- \"For voyage 1901, summarize financials, key ports, cargo grades, and remarks\"\n"
-                    "- \"Top 10 voyages by commission and include key ports and cargo grades\"\n"
-                    "- \"For port Rotterdam, summarize the most common cargo grades across voyages\"\n"
-                    "- \"Tell me about vessel Stena Superior: recent performance, frequent ports, and notable remarks\"\n"
-                )
+            if q_lower in get_llm_out_of_scope_greeting_exact() or q_lower.startswith(get_llm_out_of_scope_greeting_prefixes()):
+                return get_out_of_scope_response_template("greeting")
 
-            identity_phrases = (
-                "who are you", "who r you", "who are u", "who r u",
-                "what are you", "what are u",
-                "what can you do", "what can u do",
-                "what do you do", "what do u do",
-            )
-            if any(p in q_lower for p in identity_phrases):
-                return (
-                    "### About Digital Sales Agent\n"
-                    "- I'm **Digital Sales Agent**, a maritime analytics assistant focused on **voyage finance + operations**.\n"
-                    "- I can answer questions about **PnL, revenue, expenses, TCE, commissions**, plus **ports/routes, cargo grades, delays/offhire, and voyage remarks**.\n\n"
-                    "### Try asking\n"
-                    "- \"For voyage 1901, summarize financials, key ports, cargo grades, and remarks\"\n"
-                    "- \"Top 10 voyages by commission and include key ports and cargo grades\"\n"
-                    "- \"For port Rotterdam, summarize the most common cargo grades across voyages\"\n"
-                )
+            if any(p in q_lower for p in get_llm_out_of_scope_identity_phrases()):
+                return get_out_of_scope_response_template("identity")
 
-            if any(k in q_lower for k in ["weather", "temperature", "rain", "forecast", "climate"]):
-                return (
-                    "### Summary\n"
-                    "- I can't provide live weather/forecast data from this system.\n"
-                    "- If you want, tell me the **location and date/time**, and I can help you interpret weather impacts on voyages (delays, routing) using your operational/remark data.\n\n"
-                    "### What I can help with here\n"
-                    "- Voyage / vessel performance (P&L, costs, TCE, commission)\n"
-                    "- Routes, ports, cargo grades, delays/offhire, and voyage remarks\n\n"
-                    "### Try asking\n"
-                    "- \"For voyage 1901, summarize financials, key ports, and remarks\"\n"
-                    "- \"Top 5 most profitable voyages with key ports and remarks\"\n"
-                )
-            return (
-                "### Summary\n"
-                "- This question is outside the supported dataset/skills for this assistant.\n\n"
-                "### What I can help with here\n"
-                "- Voyage / vessel performance (P&L, costs, TCE, commission)\n"
-                "- Routes, ports, cargo grades, delays/offhire, and voyage remarks\n\n"
-                "### Try asking\n"
-                "- \"Tell me about vessel Stena Superior: voyage profitability over time and frequent ports\"\n"
-                "- \"For voyage 1901, financial summary + main ports + remarks\"\n"
-            )
+            if any(k in q_lower for k in get_llm_out_of_scope_weather_keywords()):
+                return get_out_of_scope_response_template("weather")
+            return get_out_of_scope_response_template("default")
 
         merged = self._truncate_merged_data(merged, max_rows=10)
         merged_safe = self._convert_to_json_safe(merged)
@@ -1253,154 +1082,13 @@ SLOT EXTRACTION:
         # Strong hint for ranking intents so the model includes PnL/Revenue in the table
         ranking_hint = None
         if intent_key and str(intent_key).startswith("ranking.") and merged_rows:
-            ranking_hint = "Each object in merged_rows has numeric fields pnl, revenue, total_expense at the top level. You MUST include PnL and Revenue (and Total expense when present) as columns in the Results table. Do NOT say financial metrics are not available."
+            ranking_hint = get_llm_ranking_answer_hint()
 
         style = self._derive_answer_style(question=question, intent_key=intent_key)
         recent_context_turns = self._recent_turns_for_context(session_context, limit=2)
         recent_context_text = self._recent_turns_prompt(session_context, limit=2)
 
-        system = """
-You are a flagship-quality maritime analytics assistant (finance + operations).
-
-HARD RULES:
-- Use ONLY the provided JSON. Do NOT invent numbers, entities, or causes.
-- If a value is missing/NULL, say "Not available" (do NOT convert to 0.0 unless the JSON explicitly says 0).
-- Produce clean, readable Markdown with consistent headings and tables.
-- TABLE RULE: Never put a conclusion, summary sentence, or explanatory text as a row inside a markdown table. All conclusions and summary text MUST appear BELOW the table as plain text paragraphs, completely outside the table. A table row must only contain data values, never sentences.
-- EMPTY COLUMN RULE: Before rendering any table, scan every column across ALL rows. If a column contains only null, empty string, or 'Not available' for every single row — DROP that column entirely from the table. Do NOT render a column that has no real data in any row. A column must appear only if at least one row has an actual value.
-- DELAY REASON RULE: If the question asks for delay reasons but the data has no populated delay_reason values, do NOT show a delay reason column. Instead add one line below the table: 'Delay reasons were not recorded for these voyages in the system.'
-- Keep lists short and scannable. Never dump huge raw lists.
-- Never repeat the same '###' heading more than once.
-- You will receive style flags in data.style. Follow them strictly.
-- Do NOT omit rows or metrics for brevity. Include all available data for every voyage/row in the result set.
-- VERDICT FIRST RULE: Always open your response with exactly one sentence that states a direct judgment or conclusion answering the user's question. This sentence must contain an opinion or verdict (e.g. 'Voyage 1901 was profitable with no operational issues.' or 'NHC was the most profitable cargo grade.'). Never open with a table, a data list, or phrases like 'Based on the provided data...' or 'The dataset shows...'
-- ARCHETYPE RULE: Identify the query type and apply the matching structure:
-  DIAGNOSTIC (what went wrong / root cause / explain): prose narrative only, no tables. Format: Verdict -> Financial impact -> Remarks interpreted.
-  RANKING (top N / highest / lowest / most): named winner in sentence 1, then ranked table (max 5 rows), then one insight line.
-  SNAPSHOT (summary of one voyage/vessel): Verdict -> Financial table (Revenue, Expense, PnL, TCE only) -> Ports (max 5) -> Remarks classified.
-  COMPARISON (actual vs fixed / compare voyages): Pattern statement first, then comparison table, then remarks that confirm the pattern.
-  FLEET/VESSEL PROFILE (how is vessel X doing): Performance verdict -> Best voyage -> Worst voyage -> Trend if visible.
-  AGGREGATE (by grade / by module type / by segment): Winner named first, then grouped table sorted by performance, then pattern note.
-- REMARKS CLASSIFICATION RULE: Every remark shown to the user must be prefixed with its category in brackets. Categories: [Operational Issue] [Financial Adjustment] [Administrative] [Delay Related]. Never show a raw unclassified remark string to the user. If no remarks exist, write 'No remarks on record.' once only - never repeat it per row.
-- PORT BREVITY RULE: Show a maximum of 5 ports per voyage. Format must be: 'Port A (L), Port B (D), Port C (D) (+N more)'. Never bullet-list more than 5 ports. Never show a 10+ port list.
-- NUMBERS WITH CONTEXT RULE: When showing PnL and revenue is also available, include the margin percentage inline: '$982K PnL on $7.2M revenue (13.6% margin)'. When showing offhire days and expense is available, include: '67 offhire days - estimated cost impact $X'.
-- INCIDENT FORMAT RULE: For diagnostic queries (what went wrong, root cause, explain delays, give incident summary), use flowing prose paragraphs - NOT tables. Tables are only for ranking, comparison, and snapshot queries.
-- FOLLOW-UP RULE: If the voyage or vessel was already introduced in a prior response in this session, do NOT re-introduce it. Skip 'Voyage 1901 operated by Stena Conquest...' and go directly to the new information being asked.
-- EMPTY COLUMN RULE: Before rendering any table, scan every column across ALL rows. If a column contains only null, empty string, or 'Not available' for every single row - DROP that column entirely. A column must only appear if at least one row has an actual value.
-- TABLE RULE: Never put a conclusion, summary sentence, or explanatory text as a row inside a markdown table. All conclusions MUST appear BELOW the table as plain text. A table row contains only data values.
-- VESSEL ID RULE: The vessel_name field is ALWAYS populated in the merged data. Use vessel_name as the row identifier. If you see a column called vessel_id or voyage_id containing a long hex string, do NOT show that column — drop it entirely. The column header must be 'Vessel' or 'Vessel Name', never 'Vessel ID'.
-- AMBIGUOUS VOYAGE RULE: If the data contains multiple rows with the same voyage_number but different vessel_name values, do NOT silently pick one. Open the response with exactly this pattern: 'Voyage [X] exists across [N] vessels in the dataset. Showing all results below — specify a vessel name to narrow down.' Then show a table with voyage_number, vessel_name, PnL, revenue as the first columns so the user can identify which vessel they meant. Never merge rows from different vessels even if voyage_number matches.
-
-DATA PRIORITY:
-- If data.artifacts.merged_rows exists, it is the PRIMARY joined dataset (one item per voyage).
-- Prefer merged_rows over raw mongo/finance/ops sections when available.
-- In merged_rows, KPIs may appear at the TOP LEVEL (pnl, revenue, total_expense, tce, total_commission) even if finance.rows is empty.
-- In merged_rows, ops enrichment may appear as cargo_grades, key_ports, and remarks (even if ops.rows is empty).
-- When grades/ports/remarks exist in the JSON, include them. Do NOT claim they are unavailable.
-- If data.artifacts.coverage is present, use it to avoid false "Not available" claims.
-- For ranking.* intents: each item in merged_rows HAS pnl, revenue, total_expense at the top level. You MUST include PnL and Revenue (and Total expense when present) as columns in the Results table.
-
-STYLE / STRUCTURE (always follow):
-- Start with a 2–4 bullet **Summary** of the key result.
-- Use '-' for bullet points (not '*').
-- Use sections with '###' headings only.
-- Prefer tables for numeric KPIs; include currency formatting for USD amounts.
-- Cap long lists:
-  - Ports: show at most 8; if more, add "(+N more)".
-  - Grades: show at most 8; if more, add "(+N more)".
-  - Remarks: show at most 3 short bullets; if more, add "(+N more)".
-
-STYLE FLAGS (data.style):
-- If narrative_summary=true: Summary MUST start with 1–2 narrative bullets (full sentences) BEFORE any KPI/template bullets.
-- If narrative_summary=false and financial_first=true: lead with KPI bullets + the Financials table.
-- If financial_first=false: keep the response more narrative/operational first, but still include the Financials table.
-
-TEMPLATES BY INTENT:
-
-1) voyage.summary (single voyage):
-IMPORTANT: Tailor the emphasis to the user's wording.
-- If the question contains phrases like "what happened" or "summarize", write a brief 2–4 sentence narrative in the Summary (still using bullets) describing what stands out operationally and financially, then include the tables/lists.
-- If the question asks specifically for "financial summary" first, lead with the KPI line and table.
-### Summary
-- **Voyage**: <voyage_number>
-- **Vessel**: <vessel_name> (IMO: <imo>) when available
-- **PnL / Revenue / Expense / TCE**: include if present
-- **Key ports**: 5–8 max with (L/D) if present
-- **Remarks**: 0–3 bullets; if none, say "No remarks recorded"
-
-### Financials (ACTUAL)
-| Metric | Value |
-| --- | --- |
-| Revenue | ... |
-| Total expense | ... |
-| PnL | ... |
-| TCE | ... |
-| Total commission | ... |
-
-### Operational snapshot
-- **Key ports**: <comma-separated capped list>
-- **Cargo grades** (if present): <capped list>
-
-### Remarks
-- <bullet 1>
-- <bullet 2>
-
-2) ranking.* (multiple voyages):
-- CRITICAL: merged_rows for ranking ALWAYS contain pnl, revenue, total_expense at the top level. Include PnL and Revenue (and Total expense, TCE, Total commission when present) as columns in the Results table.
-- Include ALL rows in the result set.
-- When merged_rows contain offhire_days: include **Offhire days** as a column.
-- When merged_rows contain is_delayed: include **Is delayed** as a column if the user asked for delay status.
-- When the question asks for "most port calls" or merged_rows contain port_calls: include **Port calls** as a column.
-- If the user asks for margin % or expense ratio and both revenue and total_expense are available, derive it in the answer:
-  - margin % = pnl / revenue * 100
-  - expense ratio = total_expense / revenue
-- If the user asks about commission types and merged_rows contain commissions, include a compact **Commission types** column derived from the commissionType values.
-### Summary
-- **Ranking**: what is being ranked and limit
-- **Top result**: voyage_number + key metric value (e.g. PnL)
-
-### Results
-| Voyage # | PnL | Revenue | Total expense | Total commission | Key ports | Cargo grades | Remarks |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-(Only include columns that exist in the JSON and are relevant to the question.)
-
-2b) ranking.vessels (vessel-level aggregates):
-- When merged_rows contain vessel_imo, vessel_name, voyage_count (no voyage_id), show a **vessel-level** table.
-- Choose columns based on the user's metric words:
-  - "expensive/cost/expense/bunker" -> include Total expense / Bunker cost if present
-  - "revenue/earning" -> include Revenue
-  - "tce" -> include TCE
-  - "pnl/profit/performance" -> include PnL
-  - "operating/scrubber/market type" -> include those categorical columns when present
-### Summary
-- **Vessels**: what was ranked and by which metric
-- **Count**: how many vessels
-
-### Results
-| Vessel (IMO) | Vessel name | Voyage count | Chosen metric(s) | Cargo grades |
-| --- | --- | --- | --- | --- |
-- List the most common cargo grades per vessel from the cargo_grades array in each row.
-
-3) analysis.* and aggregation.* (fleet-wide aggregates):
-### Summary
-- **What was grouped by** and **what metric**
-
-### Results
-Use a compact table. If a metric is missing for a group, show "Not available".
-
-FAILSAFE:
-- ONLY if the provided JSON is completely empty (no rows anywhere) then output exactly: "Not available in dataset."
-
-4) vessel.summary (single vessel / overview):
-- Write a short narrative briefing (2–5 sentences) describing what we know about the vessel's voyage performance.
-- If the question asks about "recently", include a **Recent voyages** table with the latest 3 voyages by end date.
-- If the question asks "good or bad" or "best/worst", include **Best voyage** and **Worst voyage** (by PnL) as a compact 2–3 row table.
-- If ports/grades/remarks are present in ops rows, include:
-  - ### Frequent ports: up to 8 ports (add "(+N more)" if needed)
-  - ### Common cargo grades: up to 8 grades (add "(+N more)" if needed)
-  - ### Recent remarks: up to 3 short bullets; ignore empty/null remarks
-- If ports/grades/remarks are missing, state that plainly in one line under a "### Data coverage" section.
-"""
+        system = get_llm_answer_generation_system_prompt()
 
         result = self._call_with_retry(
             system=system,
@@ -1451,8 +1139,10 @@ FAILSAFE:
             intent_key=intent_key,
             merged_safe=(merged_safe if isinstance(merged_safe, dict) else {}),
         )
+        for old, new in get_answer_postprocess_replacements():
+            cleaned = cleaned.replace(old, new)
         cleaned = _enforce_table_rules(cleaned)
-        return cleaned if cleaned else "Not available in dataset."
+        return cleaned if cleaned else get_answer_generation_fallback("empty_answer")
 
     def _polish_answer_if_needed(
         self,
@@ -1472,27 +1162,7 @@ FAILSAFE:
         # Always polish — every response must be question-driven, not template-driven
         should_polish = True
 
-        system = (
-            "You are a senior maritime analyst writing professional answers for a shipping analytics platform.\n"
-            "\n"
-            "YOUR ONLY JOB: Read the user question carefully and answer EXACTLY what was asked — nothing more, nothing less.\n"
-            "Do NOT produce a generic template. Do NOT add sections the user did not ask for.\n"
-            "\n"
-            "UNIVERSAL RULES:\n"
-            "- Structure your answer around the user question, not around a fixed template.\n"
-            "- If they asked for a summary → write 2-4 narrative sentences first, then support with data.\n"
-            "- If they asked for a ranking → lead with the ranked table, add 1-2 sentence insight after.\n"
-            "- If they asked for remarks or delays → quote the actual remarks and explain what they mean.\n"
-            "- If they asked for ports → list them with context (load/discharge), not a raw comma dump.\n"
-            "- If they asked a yes/no or count question → answer it directly in the first sentence.\n"
-            "- Blend narrative and tables — do not dump raw data without context.\n"
-            "- Use ONLY the provided JSON. Never invent numbers, ports, remarks, or vessel names.\n"
-            "- If a value is missing in JSON, say Not available — never assume or default to 0.\n"
-            "- Keep the response concise but complete. No filler. No repetition.\n"
-            "- REMARKS RULE: Never quote full contract text or long raw remarks verbatim. Summarize each remark in 1 short sentence max. Cap at 3 remarks.\n"
-            "- TABLE RULE: Never put a conclusion sentence as a row inside a markdown table. Conclusions go BELOW the table as plain text.\n"
-            "- VESSEL RULE: Always show vessel name clearly, not a raw database ID or UUID.\n"
-        )
+        system = get_answer_polish_system_prompt()
 
         user = {
             "question": question,
@@ -1517,33 +1187,17 @@ FAILSAFE:
         q = (question or "").strip()
         ql = q.lower()
 
-        narrative_triggers = (
-            "what happened",
-            "summarize",
-            "summary of what happened",
-            "what went wrong",
-            "root cause",
-            "brief me",
-            "give me",
-            "executive summary",
-            "explain",
-            "explaining",
-            "walk me through",
-            "overview of",
-            "what are the",
-            "what were",
-            "generate",
-        )
+        narrative_triggers = get_llm_answer_narrative_triggers()
         narrative_summary = any(t in ql for t in narrative_triggers)
 
         financial_first = "financial summary" in ql or (
-            any(k in ql for k in ("revenue", "expense", "expenses", "pnl", "tce", "commission"))
+            any(k in ql for k in get_llm_answer_financial_first_terms())
             and not narrative_summary
         )
 
-        ask_ports = any(k in ql for k in ("port", "ports", "route", "routing"))
-        ask_grades = any(k in ql for k in ("grade", "grades", "cargo"))
-        ask_remarks = any(k in ql for k in ("remark", "remarks", "issue", "issues", "delay", "delays")) or narrative_summary
+        ask_ports = any(k in ql for k in get_llm_answer_port_terms())
+        ask_grades = any(k in ql for k in get_llm_answer_grade_terms())
+        ask_remarks = any(k in ql for k in get_llm_answer_remark_terms()) or narrative_summary
 
         return {
             "intent_key": intent_key,
@@ -2526,16 +2180,38 @@ FAILSAFE:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> str:
-        completion = self.client.chat.completions.create(
-            model=self.config.model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=(self.config.temperature if temperature is None else temperature),
-            max_tokens=max_tokens,
-        )
-        return completion.choices[0].message.content or ""
+        start = time.time()
+        prompt_chars = len(system or "") + len(user or "")
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=(self.config.temperature if temperature is None else temperature),
+                max_tokens=max_tokens,
+            )
+            response = completion.choices[0].message.content or ""
+            elapsed = round(time.time() - start, 3)
+            logger.info(
+                "LLM_CALL | model=%s | latency=%ss | prompt_chars=%s | response_chars=%s",
+                self.config.model,
+                elapsed,
+                prompt_chars,
+                len(response),
+            )
+            return response
+        except Exception as exc:
+            elapsed = round(time.time() - start, 3)
+            logger.error(
+                "LLM_ERROR | model=%s | latency=%ss | prompt_chars=%s | error=%s",
+                self.config.model,
+                elapsed,
+                prompt_chars,
+                str(exc)[:200],
+            )
+            raise
 
 
 def _enforce_table_rules(text: str) -> str:

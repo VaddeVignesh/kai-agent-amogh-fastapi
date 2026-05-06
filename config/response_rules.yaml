@@ -1,0 +1,105 @@
+# Response shaping rules.
+# Python owns merge/format logic; this file owns display labels and tunable caps.
+
+compact_payload:
+  row_limits:
+    raw_section_rows: 50
+    merged_rows: 50
+    voyage_ids: 50
+    finance_sample_rows_when_joined: 5
+  list_limits:
+    key_ports: 10
+    cargo_grades: 10
+    remarks: 5
+  display:
+    unknown_vessel_label: Unknown Vessel
+    imo_prefix: "IMO:"
+  null_equivalent_grade_values:
+    - none
+    - "null"
+    - n/a
+    - na
+
+router_fallback_templates:
+  no_data_available: Not available in dataset.
+  backend_unavailable_with_list: |
+    ### Summary
+    - I can't retrieve voyage details for **{voyage_ref}** right now because {backend_list} is unavailable.
+
+    ### What this means
+    - The query routing is working and the voyage reference is being recognized.
+    - The live data sources are not reachable, so the app has no finance or voyage-document rows to summarize.
+
+    ### Next step
+    - Start the local database services, then retry the same question.
+  backend_unavailable_generic: |
+    ### Summary
+    - I can't retrieve voyage details for **{voyage_ref}** right now because the data backends are unavailable.
+
+    ### What's needed to answer
+    - **Postgres** (finance/ops): `localhost:5432`
+    - **MongoDB** (remarks/fixtures): `localhost:27017`
+
+    ### Next step
+    - Start the databases (or update `POSTGRES_DSN` / `MONGO_URI`), then ask again.
+  multi_voyage_formatting_failed: |
+    ### Summary
+    - I found the voyage financial and operational details, but could not format the final response right now.
+  finance_identity_mismatch: |
+    ### Summary
+    - I found finance rows for voyage number **{voyage_ref}**, but they map to different vessel identities than Mongo's canonical voyage record.
+    - I did not combine them into a single-voyage financial summary because that would be misleading.
+
+    ### Finance vessel candidates
+    - {candidate_preview}{candidate_suffix}
+
+    ### Next step
+    - Query by voyage_id (or specify vessel name/IMO) to get one unambiguous financial summary.
+  missing_finance_records: |
+    ### Summary
+    - I could not find finance records in Postgres for voyage **{voyage_ref}**.
+    - I will not infer financial KPIs from other voyages.
+
+    ### Available context
+    - Mongo voyage context is available ({remarks_count} remarks).
+
+    ### Next step
+    - Verify this voyage exists in `finance_voyage_kpi` / `ops_voyage_summary` and retry.
+  llm_summary_error: |
+    Error generating summary: {error}
+  vessel_metadata_empty: |
+    ### Summary
+    - No vessel metadata was available from MongoDB.
+    - These queries require vessel-level metadata from the `vessels` collection.
+  voyage_or_vessel_metadata_empty: |
+    ### Summary
+    - No metadata available for the requested vessel/voyage.
+    - Try with vessel name, IMO, or a specific voyage number.
+  voyage_metadata_empty: |
+    ### Summary
+    - No voyage metadata found for the requested voyage.
+    - Try with a specific voyage number.
+  voyage_metadata_formatting_failed: |
+    ### Summary
+    - Voyage metadata is available but I could not generate a formatted response right now.
+
+result_set_response_templates:
+  not_available: Not available
+  no_remarks_recorded: No remarks recorded.
+  no_rows_field_populated: No rows in the previous result set had **{field}** populated.
+  no_previous_result_set_read_remarks: I don’t have a previous result set to read remarks from. Please run the base list query again.
+  no_previous_result_set_list_ports: I don’t have a previous result set to list ports from. Please run the base query again.
+  no_previous_result_set_list_cargo_grades: I don’t have a previous result set to list cargo grades from. Please run the base query again.
+  selected_row_not_identified: I couldn’t identify which row you meant from the previous result set.
+  cannot_project_field: I couldn’t project **{field}** from the previous result set.
+  cannot_project_selected_field: I couldn’t project **{field}** from the selected row in the previous result set.
+  no_cargo_grades_previous_result_set: No cargo grades were available in the previous result set.
+  no_key_ports_previous_result_set: No key ports were available in the previous result set.
+  no_key_ports_for_row: No key ports available.
+  no_cargo_grades_for_row: No cargo grades available.
+  remarks_each_heading: "### Remarks for each voyage (from previous results)"
+  remarks_for_label_heading: "### Remarks for {label}"
+  cargo_grades_for_label_heading: "### Cargo grades for {label}"
+  key_ports_for_label_heading: "### Key ports for {label}"
+  key_ports_current_result_set_heading: "### Key ports for current result set"
+  cargo_grades_current_result_set_heading: "### Cargo grades for current result set"

@@ -3,12 +3,35 @@ from __future__ import annotations
 import ast
 from typing import Any, Dict
 
+from app.config.response_rules_loader import (
+    get_compact_cargo_grades_limit,
+    get_compact_finance_sample_rows_when_joined,
+    get_compact_key_ports_limit,
+    get_compact_merged_rows_limit,
+    get_compact_raw_section_row_limit,
+    get_compact_remarks_limit,
+    get_compact_voyage_ids_limit,
+    get_imo_prefix,
+    get_null_equivalent_grade_values,
+    get_unknown_vessel_label,
+)
+
 
 def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
     """
     Remove bulky fields and keep only what's needed for summarization.
     """
     out: Dict[str, Any] = {}
+    raw_section_row_limit = get_compact_raw_section_row_limit()
+    merged_rows_limit = get_compact_merged_rows_limit()
+    voyage_ids_limit = get_compact_voyage_ids_limit()
+    finance_sample_rows_limit = get_compact_finance_sample_rows_when_joined()
+    key_ports_limit = get_compact_key_ports_limit()
+    cargo_grades_limit = get_compact_cargo_grades_limit()
+    remarks_limit = get_compact_remarks_limit()
+    unknown_vessel_label = get_unknown_vessel_label()
+    imo_prefix = get_imo_prefix()
+    null_equivalent_grade_values = get_null_equivalent_grade_values()
 
     def _has_joined_rows(artifacts: Any) -> bool:
         return isinstance(artifacts, dict) and isinstance(artifacts.get("merged_rows"), list) and len(artifacts.get("merged_rows") or []) > 0
@@ -58,7 +81,7 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
                     )
                 else:
                     kp_clean.append(str(x))
-            kp = _cap_list(kp_clean, 10)
+            kp = _cap_list(kp_clean, key_ports_limit)
 
         cg = r.get("cargo_grades")
         if isinstance(cg, list):
@@ -67,17 +90,17 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
             for x in cg:
                 s = _grade_text(x)
                 sn = s.lower()
-                if not s or sn in ("none", "null", "n/a", "na"):
+                if not s or sn in null_equivalent_grade_values:
                     continue
                 if sn in seen_cg:
                     continue
                 seen_cg.add(sn)
                 cg_clean.append(s)
-            cg = _cap_list(cg_clean, 10)
+            cg = _cap_list(cg_clean, cargo_grades_limit)
 
         rem = r.get("remarks")
         if isinstance(rem, list):
-            rem = _cap_list([str(x) for x in rem if x not in (None, "", [], {})], 5)
+            rem = _cap_list([str(x) for x in rem if x not in (None, "", [], {})], remarks_limit)
         elif rem not in (None, "", [], {}):
             rem = str(rem)
 
@@ -149,8 +172,8 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
             _vimo = r.get("vessel_imo") or fin.get("vessel_imo")
             out_row["vessel_name"] = (
                 _vname if _vname and str(_vname).strip()
-                else f"IMO:{_vimo}" if _vimo
-                else "Unknown Vessel"
+                else f"{imo_prefix}{_vimo}" if _vimo
+                else unknown_vessel_label
             )
             out_row["voyage_count"] = r.get("voyage_count")
             out_row["avg_pnl"] = r.get("avg_pnl") or r.get("pnl")
@@ -161,8 +184,8 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
                 out_row["vessel_imo"] = _vimo
                 out_row["vessel_name"] = (
                     _vname if _vname and str(_vname).strip()
-                    else f"IMO:{_vimo}" if _vimo
-                    else "Unknown Vessel"
+                    else f"{imo_prefix}{_vimo}" if _vimo
+                    else unknown_vessel_label
                 )
         return out_row
 
@@ -170,14 +193,14 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(fin, dict):
         out["finance"] = {
             "mode": fin.get("mode"),
-            "rows": (fin.get("rows") or [])[:50],
+            "rows": (fin.get("rows") or [])[:raw_section_row_limit],
         }
 
     ops = merged.get("ops")
     if isinstance(ops, dict):
         out["ops"] = {
             "mode": ops.get("mode"),
-            "rows": (ops.get("rows") or [])[:50],
+            "rows": (ops.get("rows") or [])[:raw_section_row_limit],
         }
 
     mongo = merged.get("mongo")
@@ -185,7 +208,7 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
         out["mongo"] = {
             "mode": mongo.get("mode"),
             "collection": mongo.get("collection"),
-            "rows": (mongo.get("rows") or [])[:50],
+            "rows": (mongo.get("rows") or [])[:raw_section_row_limit],
         }
 
     artifacts = merged.get("artifacts")
@@ -193,10 +216,10 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
         compact_artifacts: Dict[str, Any] = {}
         if isinstance(artifacts.get("merged_rows"), list):
             compact_artifacts["merged_rows"] = [
-                _light_merged_row(r) for r in (artifacts.get("merged_rows", [])[:50] or [])
+                _light_merged_row(r) for r in (artifacts.get("merged_rows", [])[:merged_rows_limit] or [])
             ]
         if isinstance(artifacts.get("voyage_ids"), list):
-            compact_artifacts["voyage_ids"] = artifacts.get("voyage_ids", [])[:50]
+            compact_artifacts["voyage_ids"] = artifacts.get("voyage_ids", [])[:voyage_ids_limit]
         # Optional: lightweight coverage hints help the summarizer avoid false "Not available" claims.
         if isinstance(artifacts.get("coverage"), dict):
             compact_artifacts["coverage"] = artifacts.get("coverage") or {}
@@ -208,7 +231,7 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
     if _has_joined_rows(out.get("artifacts")):
         # Keep a tiny sample of finance rows (helps formatting KPIs) but drop the rest.
         if isinstance(out.get("finance"), dict) and isinstance(out["finance"].get("rows"), list):
-            out["finance"]["rows"] = out["finance"]["rows"][:5]
+            out["finance"]["rows"] = out["finance"]["rows"][:finance_sample_rows_limit]
         if isinstance(out.get("ops"), dict):
             out["ops"]["rows"] = []
         if isinstance(out.get("mongo"), dict):

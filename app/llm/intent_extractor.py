@@ -2,6 +2,7 @@ import json
 import logging
 from typing import Optional, Callable
 
+from app.config.prompt_rules_loader import get_structured_intent_prompt_template
 from app.config.schema_loader import (
     get_postgres_schema_str,
     get_mongo_schema_str,
@@ -12,74 +13,6 @@ from app.config.schema_loader import (
 )
 
 logger = logging.getLogger(__name__)
-
-_INTENT_PROMPT = """You are a query understanding engine for a multi-source system.
-Map the user query to structured schema elements.
-
-RULES:
-- Use ONLY field names that appear in the schema sections below.
-- Do NOT invent field names.
-- Derive required_sources from which source group owns each requested field.
-- If scope is follow_up, set follow_up_action to: filter, sort, slice, or rerank.
-- scenario defaults to ACTUAL if not specified by user.
-
-## Postgres Schema
-{postgres_schema}
-
-## Document Store Schema
-{mongo_schema}
-
-## Field to Source Mapping
-{source_map}
-
-## Available Operations
-{intent_catalog}
-
-## Entity Definitions and Cross-Source Rules
-{entity_catalog}
-
-## Conversation History (last 3 turns)
-{conversation_context}
-
-## Previous Result Summary
-{last_result_meta}
-
-## User Query
-{query}
-
-Return ONLY valid JSON. No explanation. No markdown fences.
-
-{{
-  "operation": "<operation id from Available Operations>",
-  "entities": [
-    {{
-      "type": "<entity type from Entity Definitions>",
-      "identifier_field": "<exact field name from schema>",
-      "identifier_value": "<value the user provided or null>"
-    }}
-  ],
-  "requested_fields": ["<exact field names from schema only>"],
-  "filters": [
-    {{
-      "field": "<exact schema field>",
-      "operator": "<eq|in|gt|lt|gte|lte|between|ilike>",
-      "value": "<value>"
-    }}
-  ],
-  "aggregation": {{
-    "function": "<avg|sum|count|min|max|mode|rank|null>",
-    "group_by": ["<exact schema field or null>"],
-    "order_by": "<field ASC|DESC or null>",
-    "limit": <integer or null>
-  }},
-  "scenario": "<ACTUAL|WHEN_FIXED or null — default ACTUAL>",
-  "required_sources": ["<postgres|mongo>"],
-  "scope": "<fresh|follow_up>",
-  "follow_up_action": "<filter|sort|slice|rerank|null>",
-  "confidence": "<high|medium|low>",
-  "reasoning": "<one sentence explaining the operation and source choice>"
-}}
-"""
 
 
 def _format_context(history: list) -> str:
@@ -126,7 +59,7 @@ def extract_structured_intent(
     last_result_meta: Optional[dict] = None,
 ) -> Optional[dict]:
     try:
-        prompt = _INTENT_PROMPT.format(
+        prompt = get_structured_intent_prompt_template().format(
             postgres_schema=get_postgres_schema_str(),
             mongo_schema=get_mongo_schema_str(),
             source_map=get_source_map_str(),

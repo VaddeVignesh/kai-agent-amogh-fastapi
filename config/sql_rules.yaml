@@ -1,0 +1,235 @@
+allowlist:
+  allowed_tables:
+    - finance_voyage_kpi
+    - ops_voyage_summary
+    - jsonb_array_elements_text
+    - jsonb_array_elements
+  allowed_columns:
+    finance_voyage_kpi:
+      - voyage_id
+      - voyage_number
+      - vessel_imo
+      - scenario
+      - revenue
+      - total_expense
+      - pnl
+      - tce
+      - total_commission
+      - bunker_cost
+      - port_cost
+      - voyage_days
+      - voyage_start_date
+      - voyage_end_date
+      - modified_by
+      - modified_date
+      - extracted_at
+    ops_voyage_summary:
+      - voyage_id
+      - voyage_number
+      - vessel_id
+      - vessel_imo
+      - vessel_name
+      - module_type
+      - fixture_count
+      - offhire_days
+      - is_delayed
+      - delay_reason
+      - voyage_start_date
+      - voyage_end_date
+      - ports_json
+      - grades_json
+      - activities_json
+      - remarks_json
+      - tags
+      - url
+      - extracted_at
+  forbidden_patterns:
+    - '--'
+    - '/\*.*\*/'
+    - ';.*$'
+    - '\bEXEC\b'
+    - '\bEXECUTE\b'
+    - '\bCREATE\b'
+    - '\bDROP\b'
+    - '\bALTER\b'
+    - '\bTRUNCATE\b'
+    - '\bRENAME\b'
+    - '\bINSERT\b'
+    - '\bUPDATE\b'
+    - '\bDELETE\b'
+    - '\bMERGE\b'
+    - '\bxp_cmdshell\b'
+    - '\bdbms_\w+\b'
+    - '\butl_file\b'
+    - '\binformation_schema\b'
+    - '\bpg_catalog\b'
+
+guard:
+  default_enforced_limit: 50
+  column_fixes:
+    costs: total_expense
+    commission: total_commission
+    profit: pnl
+    profitability: pnl
+    expense: total_expense
+    expenses: total_expense
+    start_date: voyage_start_date
+    end_date: voyage_end_date
+    voyage_start: voyage_start_date
+    voyage_end: voyage_end_date
+  table_fixes:
+    ops_voyage: ops_voyage_summary
+    voyage_kpi: finance_voyage_kpi
+    finance_voyage: finance_voyage_kpi
+    finance_voyage_summary: finance_voyage_kpi
+  invalid_columns:
+    - cargo_grade
+    - cargograde
+    - portname
+    - port_name
+    - port
+    - remarks
+    - voyage_profitability
+    - key_ports_visited
+    - cost
+    - imo
+    - total_cost
+    - vessel_id
+  finance_only_columns:
+    - pnl
+    - revenue
+    - tce
+    - bunker_cost
+    - port_cost
+    - total_expense
+    - total_commission
+    - scenario
+  ops_only_columns:
+    - offhire_days
+    - is_delayed
+    - delay_reason
+    - module_type
+    - fixture_count
+    - grades_json
+    - ports_json
+    - remarks_json
+  jsonb_functions:
+    - jsonb_array_elements_text
+    - jsonb_array_elements
+    - jsonb_each
+    - jsonb_each_text
+    - jsonb_object_keys
+  table_domains:
+    finance_voyage_kpi: finance
+    ops_voyage_summary: ops
+  rewrite_patterns:
+    json_text_contains:
+      pattern: '(\w+_json)\s*@>\s*''([^'']*)'''
+      replacement: '\1::text ILIKE ''%\2%'''
+    in_named_param:
+      pattern: '\bIN\s+(%\(\w+\)s)'
+      replacement: '= ANY(\1)'
+  invalid_column_message: "Column '{column}' does not exist. Use grades_json / ports_json instead."
+
+generator:
+  default_limit: 25
+  default_intent_key: composite.query
+  empty_sql: SELECT 1 WHERE 1=0
+  retryable_pg_errors:
+    - must appear in the GROUP BY
+    - aggregate function
+    - syntax error
+    - does not exist
+    - invalid input syntax
+    - operator does not exist
+    - ambiguous column
+    - column
+  hardcoded_limit_pattern: '\blimit\s+\d+'
+  hardcoded_string_pattern: '(?:=|>=|<=|>|<|ilike|like|in\s*\()\s*''[^'']{1,120}'''
+  allowed_literals:
+    - ".0"
+    - ""
+    - " "
+  agent_table_scopes:
+    finance:
+      - finance_voyage_kpi
+      - ops_voyage_summary
+    ops:
+      - ops_voyage_summary
+  join_hints:
+    - left: finance_voyage_kpi
+      right: ops_voyage_summary
+      keys:
+        - voyage_number + vessel_imo (string-normalized with REPLACE(.0,''))
+  param_conventions:
+    named_params: Use %(param)s placeholders. Never hardcode values.
+    list_params: f.voyage_id = ANY(%(voyage_ids)s::TEXT[])
+    scenario: COALESCE(%(scenario)s,'ACTUAL') - always injected.
+    limit: LIMIT %(limit)s - always injected.
+  constraints:
+    select_only: true
+    no_writes: true
+    must_have_limit: true
+  composite_query_nature: Fleet-wide aggregate query. Use GROUP BY + aggregates. Do not filter to a single voyage unless a slot provides one. Identify the grouping dimension from the question and build from rules.
+  error_retry_suffix: |
+    PREVIOUS ATTEMPT FAILED:
+    {error_hint}
+    Fix the SQL. Common causes:
+    1. Non-aggregated column missing from GROUP BY
+    2. Column does not exist - check schema above exactly
+    3. Division by zero - use NULLIF(denominator, 0)
+    4. Wrong table for column (e.g. voyage_days is on f, not o)
+    5. LATERAL-expanded column in SELECT but missing from GROUP BY
+    6. Hardcoded LIMIT number - use LIMIT %(limit)s
+    7. Hardcoded string value in WHERE - use %(param)s placeholder
+  validation_messages:
+    non_select: SQL does not start with SELECT
+    missing_limit: SQL missing LIMIT clause. Use LIMIT %(limit)s - never a bare number.
+    hardcoded_limit: "Hardcoding violation: LIMIT has a bare integer. Use LIMIT %(limit)s instead."
+    hardcoded_scenario: "Hardcoding violation: scenario value is hardcoded. Use COALESCE(%(scenario)s,'ACTUAL')."
+    hardcoded_literals: "Hardcoding violation: literal value(s) found in filter: {suspicious}. Use %(param)s placeholders instead."
+    select_star: SQL uses SELECT *. Name all columns explicitly.
+    count_star: SQL uses COUNT(*). Use COUNT(DISTINCT f.voyage_id) or COUNT(DISTINCT o.voyage_id).
+    forbidden_column: "Non-existent column reference: {column} - {reason}"
+    missing_slot_placeholder: "SQL uses placeholder {placeholder} but slot '{slot_key}' is not present for this request."
+  forbidden_columns:
+    - column: o.voyage_days
+      reason: voyage_days is on f only
+    - column: expense_to_revenue_ratio
+      reason: column does not exist, compute inline
+    - column: demurrage_days
+      reason: column does not exist
+  required_param_slots:
+    "%(scenario)s":
+      slot: scenario
+    "%(limit)s":
+      slot: limit
+      default: generator_default_limit
+      type: int
+    "%(voyage_ids)s":
+      slot: voyage_ids
+      default: []
+    "%(vessel_name)s":
+      slot: vessel_name
+    "%(voyage_number)s":
+      slot: voyage_number
+    "%(voyage_id)s":
+      slot: voyage_id
+    "%(cargo_grades)s":
+      slot: cargo_grades
+      default: []
+    "%(start_date)s":
+      slot: start_date
+    "%(end_date)s":
+      slot: end_date
+    "%(vessel_imo)s":
+      slot: vessel_imo
+  optional_placeholder_slots:
+    "%(voyage_number)s": voyage_number
+    "%(voyage_id)s": voyage_id
+    "%(voyage_ids)s": voyage_ids
+    "%(vessel_name)s": vessel_name
+    "%(vessel_imo)s": vessel_imo
+    "%(cargo_grades)s": cargo_grades
+    "%(start_date)s": start_date
+    "%(end_date)s": end_date

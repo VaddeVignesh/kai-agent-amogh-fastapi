@@ -3,6 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set
 
+from app.config.mongo_rules_loader import (
+    get_mongo_guard_default_limit,
+    get_mongo_guard_max_limit,
+    get_mongo_regex_options_allowed_value,
+)
+
 
 @dataclass(frozen=True)
 class MongoGuardResult:
@@ -28,7 +34,7 @@ def _walk(obj: Any, allowed_ops: Set[str]) -> bool:
                 if k == "$options":
                     if "$regex" not in obj:
                         return False
-                    if not isinstance(v, str) or v.strip().lower() != "i":
+                    if not isinstance(v, str) or v.strip().lower() != get_mongo_regex_options_allowed_value():
                         return False
                 elif k not in allowed_ops:
                     return False
@@ -68,7 +74,7 @@ def validate_mongo_spec(
         except Exception:
             proj_clean[str(k)] = 0
 
-    lim = max(1, min(int(limit or 10), 50))
+    lim = max(1, min(int(limit or get_mongo_guard_default_limit()), get_mongo_guard_max_limit()))
 
     sort_clean = None
     if sort is not None:

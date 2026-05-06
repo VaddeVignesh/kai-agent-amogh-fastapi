@@ -1,0 +1,232 @@
+schema_hint:
+  collections:
+    vessels:
+      id_fields:
+        - imo
+        - name
+        - vesselId
+      fields:
+        - vesselId
+        - imo
+        - name
+        - accountCode
+        - hireRate
+        - scrubber
+        - marketType
+        - isVesselOperating
+        - tags.category
+        - tags.value
+      examples:
+        by_imo:
+          imo: '9705902'
+        by_name:
+          name: Elka Delphi
+    voyages:
+      id_fields:
+        - voyageId
+        - voyageNumber
+        - vesselName
+      fields:
+        - voyageId
+        - voyageNumber
+        - vesselName
+        - url
+        - tags
+        - startDateUtc
+        - remarks
+        - remarks.remark
+        - remarks.modifiedByFull
+        - remarks.modifiedDate
+        - fixtures
+        - fixtures.cpDate
+        - fixtures.displayOrder
+        - fixtures.grades
+        - fixtures.fixtureGrades.gradeName
+        - fixtures.fixturePorts.portName
+        - fixtures.fixturePorts.activityType
+        - fixtures.fixturePorts.displayOrder
+        - fixtures.fixtureBillsOfLading.description
+        - fixtures.fixtureBillsOfLading.fixtureGradeName
+        - fixtures.fixtureBillsOfLading.portName
+        - legs
+        - legs.portName
+        - legs.type
+        - legs.displayOrder
+        - projected_results.pnl
+        - projected_results.revenue
+        - projected_results.expenses
+        - projected_results.expense
+        - projected_results.tce
+      examples:
+        by_voyageId:
+          voyageId: BDEA0AD71D00DE30244B96E0D474F30A
+        by_voyageNumber:
+          voyageNumber: '1901'
+        by_vesselName_exact:
+          vesselName: Stena Conquest
+        by_vesselName_regex:
+          vesselName:
+            '$regex': (?i)stena
+        remarks_for_voyage_ids:
+          voyageId:
+            '$in':
+              - BDEA0AD71D00DE30244B96E0D474F30A
+        voyages_by_port_regex:
+          fixtures.fixturePorts.portName:
+            '$regex': (?i)rotterdam
+  rules:
+    - Return only fields that are needed for the question.
+    - Always include minimal identifiers (voyageId + voyageNumber, or imo + name).
+    - Prefer projection to reduce payload.
+    - 'voyageNumber is stored as STRING in Mongo; use strings like "1901".'
+    - Use remarks (not remarkList) and fixtures (not fixtureList).
+    - Financials live under projected_results.* (not results.financialSummary.*).
+    - Use projected_results.expenses for total expense (projected_results.expense is not total).
+    - Use only allowed operators from allowed_operators.
+  allowed_operators:
+    - '$and'
+    - '$or'
+    - '$in'
+    - '$nin'
+    - '$eq'
+    - '$ne'
+    - '$gt'
+    - '$gte'
+    - '$lt'
+    - '$lte'
+    - '$regex'
+    - '$options'
+    - '$exists'
+    - '$size'
+    - '$not'
+    - '$elemMatch'
+
+guard:
+  default_limit: 10
+  max_limit: 50
+  regex_options_allowed_value: i
+
+projections:
+  full_voyage_context:
+    voyageId: 1
+    voyageNumber: 1
+    vesselName: 1
+    vesselImo: 1
+    startDateUtc: 1
+    extracted_at: 1
+    remarks: 1
+    remarkList: 1
+    fixtures: 1
+    legs: 1
+    revenues: 1
+    expenses: 1
+  full_voyage_context_by_id:
+    voyageId: 1
+    voyageNumber: 1
+    vesselName: 1
+    vesselImo: 1
+    remarks: 1
+    remarkList: 1
+    fixtures: 1
+    legs: 1
+    revenues: 1
+    expenses: 1
+  minimal_document:
+    _id: 0
+    voyageId: 1
+    voyageNumber: 1
+    vesselName: 1
+    voyageStatus: 1
+    imo: 1
+    name: 1
+    vesselStatus: 1
+  voyage_metadata_context:
+    _id: 0
+    voyageId: 1
+    voyageNumber: 1
+    vesselName: 1
+    fixtures: 1
+    legs: 1
+    revenues: 1
+    expenses: 1
+    bunkers: 1
+    emissions: 1
+    remarks: 1
+    projected_results: 1
+    startDateUtc: 1
+  voyage_metadata_detail:
+    voyageId: 1
+    voyageNumber: 1
+    vesselName: 1
+    tags: 1
+    url: 1
+    fixtures: 1
+    legs: 1
+    revenues: 1
+    expenses: 1
+    bunkers: 1
+    emissions: 1
+    remarks: 1
+    projected_results: 1
+    startDateUtc: 1
+    extracted_at: 1
+    _id: 0
+  voyage_identity:
+    _id: 0
+    voyageNumber: 1
+    voyageId: 1
+    vesselName: 1
+    vesselImo: 1
+  single_path_mongo_payload:
+    _id: 0
+    voyageId: 1
+    voyageNumber: 1
+    remarks: 1
+    fixtures: 1
+  voyage_id_lookup:
+    voyageId: 1
+
+limits:
+  full_voyage_context_batch: 40
+  fleet_vessel_list: 200
+  voyages_by_vessel_name: 50
+  voyage_metadata_context_batch: 40
+  voyage_metadata_detail_batch: 40
+  voyage_identity_batch: 40
+
+agent:
+  full_voyage_context_output_fields:
+    voyage_id: voyageId
+    voyage_number: voyageNumber
+    vessel_name: vesselName
+    vessel_imo: vesselImo
+    remarks:
+      first_of:
+        - remarks
+        - remarkList
+      default: []
+    fixtures:
+      source: fixtures
+      default: []
+    legs:
+      source: legs
+      default: []
+    revenues:
+      source: revenues
+      default: []
+    expenses:
+      source: expenses
+      default: []
+  full_voyage_context_scoring:
+    recency_fields:
+      - startDateUtc
+      - extracted_at
+    anchor_fields:
+      - vesselImo
+      - vesselName
+    payload_fields:
+      - fixtures
+      - legs
+      - expenses
+      - revenues
+    id_field: voyageId

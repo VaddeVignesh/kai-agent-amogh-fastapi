@@ -5,9 +5,17 @@ import {
   Send, Bot, User, Copy, ThumbsUp, ThumbsDown, RefreshCw,
   Sparkles, ChevronDown, ChevronRight,
   TrendingUp, ShoppingCart, Users, Package, Clock, BarChart3,
-  DollarSign, Activity, Database, Filter, Target, Workflow,
+  DollarSign, Activity, Database, Workflow,
+  CheckCircle2, Brain, Route,
 } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+
+const createRequestId = () => {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `req_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+};
 
 export interface InsightMetric {
   label: string;
@@ -17,10 +25,21 @@ export interface InsightMetric {
 }
 
 export interface ExecutionTrace {
-  intent: string;
-  filters: { key: string; value: string }[];
-  sources: string[];
-  steps: string[];
+  intent?: string;
+  filters?: { key: string; value: string }[];
+  sources?: string[];
+  steps?: string[];
+  raw?: unknown[];
+  displayIntent?: string;
+  route?: string;
+  likelyPath?: string;
+  phases?: string[];
+  agents?: string[];
+  sqlGenerated?: boolean;
+  totalTokens?: number;
+  visibleFilters?: { key: string; value: string }[];
+  hiddenFilterCount?: number;
+  stages?: { title: string; detail: string; area: string; status: string }[];
 }
 
 export interface Message {
@@ -56,11 +75,151 @@ const newWelcome = (text: string): Message => ({
   timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
 });
 
+const getTraceValue = (entry: unknown, key: string): unknown => {
+  return entry && typeof entry === "object" ? (entry as Record<string, unknown>)[key] : undefined;
+};
+
+const humanizeToken = (value: string) => value
+  .replace(/[_-]+/g, " ")
+  .replace(/\b\w/g, (char) => char.toUpperCase());
+
+const humanizeIntent = (intent?: string) => {
+  if (!intent) return "Analytical request";
+  const parts = intent.split(".");
+  return humanizeToken(parts[parts.length - 1] || intent);
+};
+
+const displaySource = (source: string) => {
+  const normalized = source.toLowerCase();
+  if (normalized.includes("finance")) return "Finance Agent";
+  if (normalized.includes("ops")) return "Ops Agent";
+  if (normalized.includes("mongo")) return "Mongo Agent";
+  if (normalized.includes("llm")) return "LLM Reasoning";
+  if (normalized.includes("postgres")) return "Postgres";
+  if (normalized.includes("redis")) return "Session Memory";
+  return humanizeToken(source);
+};
+
+const visibleFilter = ({ key, value }: { key: string; value: string }) => {
+  if (key === "voyage_ids") {
+    const count = value.split(",").filter(Boolean).length;
+    return { key: "voyage set", value: `${count} matched voyages` };
+  }
+  if (value.length > 70) return { key: humanizeToken(key), value: `${value.slice(0, 67)}...` };
+  return { key: humanizeToken(key), value };
+};
+
+const buildTraceStages = (steps: string[], sources: string[]) => {
+  const stepText = steps.join(" ").toLowerCase();
+  const hasComposite = stepText.includes("composite");
+  const hasFinance = sources.some((s) => s.toLowerCase().includes("finance"));
+  const hasOps = sources.some((s) => s.toLowerCase().includes("ops"));
+  const hasLlm = sources.some((s) => s.toLowerCase().includes("llm")) || stepText.includes("token");
+
+  return [
+    {
+      title: "Understood request",
+      detail: "Detected intent, extracted filters, and prepared the session context.",
+      area: "Intent",
+      status: "Done",
+    },
+    {
+      title: hasComposite ? "Planned multi-agent route" : "Planned execution route",
+      detail: hasComposite ? "Selected a composite workflow across multiple data agents." : "Selected the best available route for the query.",
+      area: "Planner",
+      status: "Done",
+    },
+    {
+      title: "Queried analytical data",
+      detail: [
+        hasFinance ? "Finance metrics" : "",
+        hasOps ? "operations context" : "",
+      ].filter(Boolean).join(" + ") || "Backend data sources",
+      area: hasFinance && hasOps ? "Finance + Ops" : hasFinance ? "Finance" : hasOps ? "Ops" : "Data",
+      status: "Done",
+    },
+    {
+      title: "Generated admin response",
+      detail: hasLlm ? "Summarized retrieved evidence with the LLM layer." : "Prepared the final response payload.",
+      area: "Response",
+      status: "Done",
+    },
+  ];
+};
+
+const normalizeTrace = (data: unknown): ExecutionTrace | undefined => {
+  if (!data || typeof data !== "object") return undefined;
+  const payload = data as Record<string, unknown>;
+  const rawTrace = Array.isArray(payload.trace) ? payload.trace : [];
+  const slots = payload.slots && typeof payload.slots === "object" ? payload.slots as Record<string, unknown> : {};
+  const sources = new Set<string>();
+  const phases = new Set<string>();
+  const steps: string[] = [];
+  let likelyPath: string | undefined;
+  let sqlGenerated = Boolean(payload.dynamic_sql_used);
+  let totalTokens = 0;
+
+  rawTrace.forEach((entry, index) => {
+    const node = getTraceValue(entry, "node") ?? getTraceValue(entry, "step") ?? getTraceValue(entry, "event");
+    const status = getTraceValue(entry, "status") ?? getTraceValue(entry, "phase");
+    const phase = getTraceValue(entry, "phase");
+    const path = getTraceValue(entry, "likely_path");
+    const source = getTraceValue(entry, "source") ?? getTraceValue(entry, "agent");
+    const tokenEstimate = getTraceValue(entry, "total_tokens_est");
+    const sqlPresent = getTraceValue(entry, "sql_present");
+    const sql = getTraceValue(entry, "sql");
+    if (typeof phase === "string" && phase.trim()) phases.add(phase.trim());
+    if (typeof path === "string" && path.trim()) likelyPath = path.trim();
+    if (typeof source === "string" && source.trim()) sources.add(source.trim());
+    if (sqlPresent === true || (typeof sql === "string" && sql.trim())) sqlGenerated = true;
+    if (typeof tokenEstimate === "number" && Number.isFinite(tokenEstimate)) {
+      totalTokens = Math.max(totalTokens, tokenEstimate);
+    }
+    const label = [node, status].filter(Boolean).join(" - ");
+    steps.push(label || `Trace event ${index + 1}`);
+  });
+
+  const filters = Object.entries(slots)
+    .filter(([, value]) => value !== null && value !== undefined && value !== "" && value !== false)
+    .map(([key, value]) => ({ key, value: String(value) }));
+
+  const intent = typeof payload.intent_key === "string" ? payload.intent_key : undefined;
+  const dynamicSqlAgents = Array.isArray(payload.dynamic_sql_agents)
+    ? payload.dynamic_sql_agents.filter((agent): agent is string => typeof agent === "string")
+    : [];
+  dynamicSqlAgents.forEach((agent) => sources.add(agent));
+  const sourceList = Array.from(sources);
+  const displaySources = sourceList.map(displaySource);
+  const visibleFilters = filters
+    .filter(({ value }) => value.length <= 160 || value.includes(","))
+    .map(visibleFilter)
+    .slice(0, 5);
+
+  return {
+    intent,
+    displayIntent: humanizeIntent(intent),
+    route: steps.some((step) => step.toLowerCase().includes("composite")) ? "Composite workflow" : "Single route",
+    likelyPath: likelyPath ? humanizeToken(likelyPath) : undefined,
+    phases: Array.from(phases).map(humanizeToken),
+    agents: Array.from(sources).map(displaySource),
+    sqlGenerated,
+    totalTokens: totalTokens || undefined,
+    filters,
+    visibleFilters,
+    hiddenFilterCount: Math.max(0, filters.length - visibleFilters.length),
+    sources: displaySources,
+    steps,
+    stages: buildTraceStages(steps, sourceList),
+    raw: rawTrace,
+  };
+};
+
 interface AnalyticsChatProps {
   title?: string;
   welcome?: string;
   seed?: Message[];
   showInsightPanel?: boolean;
+  showExecutionTrace?: boolean;
   height?: string;
 }
 
@@ -69,6 +228,7 @@ export default function AnalyticsChat({
   welcome = "Welcome to the AI Sales Copilot. Ask about orders, revenue, customers, products, or performance — I'll route the question to the right data agent.",
   seed,
   showInsightPanel = true,
+  showExecutionTrace = false,
   height = "calc(100vh - 220px)",
 }: AnalyticsChatProps) {
   const [messages, setMessages] = useState<Message[]>(seed ?? [newWelcome(welcome)]);
@@ -97,6 +257,7 @@ export default function AnalyticsChat({
   const handleSend = async (text?: string) => {
     const content = (text ?? query).trim();
     if (!content || isProcessing) return;
+    const requestId = createRequestId();
     const userMsg: Message = {
       id: messages.length + 1,
       role: "user",
@@ -119,10 +280,11 @@ export default function AnalyticsChat({
         body: JSON.stringify({
           query: content,
           session_id: effectiveSessionId,
+          request_id: requestId,
           chat_history: messages
             .filter(m => m.role === "user" || m.role === "assistant")
             .map(m => ({ role: m.role, content: m.content }))
-        })
+        }),
       });
       const data = await res.json();
 
@@ -135,8 +297,9 @@ export default function AnalyticsChat({
         {
           id: prev.length + 1,
           role: "assistant",
-          content: data.answer ?? data.response ?? data.result ?? JSON.stringify(data),
+          content: data.clarification || data.answer || data.response || data.result || JSON.stringify(data),
           timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          trace: showExecutionTrace ? normalizeTrace(data) : undefined,
         },
       ]);
     } catch (err) {
@@ -215,58 +378,78 @@ export default function AnalyticsChat({
                 </ReactMarkdown>
               </div>
 
-              {msg.role === "assistant" && msg.trace && (
+              {showExecutionTrace && msg.role === "assistant" && msg.trace && (
                 <div className="mt-3 pt-3 border-t border-border/50">
                   <button
                     onClick={() => toggleTrace(msg.id)}
-                    className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                    className="w-full flex items-center gap-2 rounded-lg border border-border bg-background/70 px-3 py-1.5 text-left hover:bg-accent/40 transition-colors"
                   >
-                    {openTraces[msg.id] ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
-                    <Workflow className="w-3.5 h-3.5" />
-                    Execution trace
+                    <div className="min-w-0 flex-1">
+                      <span className="text-xs font-semibold text-foreground">Execution trace</span>
+                      <span className="ml-2 text-[10px] text-muted-foreground">Admin diagnostics</span>
+                    </div>
+                    {openTraces[msg.id] ? <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" /> : <ChevronRight className="w-3.5 h-3.5 text-muted-foreground" />}
                   </button>
                   {openTraces[msg.id] && (
-                    <div className="mt-3 space-y-3 rounded-lg bg-background/50 border border-border p-3 text-xs">
-                      <div className="flex items-start gap-2">
-                        <Target className="w-3.5 h-3.5 text-primary mt-0.5 shrink-0" />
-                        <div>
-                          <p className="font-medium text-foreground">Intent</p>
-                          <p className="text-muted-foreground font-mono">{msg.trace.intent}</p>
+                    <div className="mt-2 rounded-xl border border-border bg-gradient-to-br from-background via-background to-primary/5 shadow-sm overflow-hidden text-xs">
+                      <div className="px-3 py-2 border-b border-border bg-muted/20">
+                        <div className="flex items-center justify-between gap-3">
+                          <div>
+                            <p className="text-xs font-semibold text-foreground">Run diagnostics</p>
+                            <p className="text-[10px] text-muted-foreground">Phase, path, agent, SQL, and token summary</p>
+                          </div>
+                          <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full bg-[hsl(var(--success))]/10 text-[hsl(var(--success))] font-semibold">
+                            <CheckCircle2 className="w-3 h-3" />
+                            Complete
+                          </span>
                         </div>
                       </div>
-                      <div className="flex items-start gap-2">
-                        <Filter className="w-3.5 h-3.5 text-primary mt-0.5 shrink-0" />
-                        <div className="flex-1">
-                          <p className="font-medium text-foreground mb-1">Extracted filters</p>
+                      <div className="divide-y divide-border">
+                        <div className="grid grid-cols-[150px_1fr] gap-3 px-3 py-2.5 hover:bg-muted/20">
+                          <div className="flex items-center gap-2 text-muted-foreground font-medium">
+                            <Activity className="w-3.5 h-3.5 text-primary" />
+                            Phase
+                          </div>
                           <div className="flex flex-wrap gap-1.5">
-                            {msg.trace.filters.map((f) => (
-                              <span key={f.key} className="px-2 py-0.5 rounded bg-accent text-muted-foreground font-mono">
-                                {f.key}: <span className="text-foreground">{f.value}</span>
-                              </span>
+                            {(msg.trace.phases?.length ? msg.trace.phases : ["Not provided"]).slice(0, 4).map((phase) => (
+                              <span key={phase} className="px-2 py-0.5 rounded-full bg-accent text-foreground font-medium">{phase}</span>
                             ))}
                           </div>
                         </div>
-                      </div>
-                      <div className="flex items-start gap-2">
-                        <Database className="w-3.5 h-3.5 text-primary mt-0.5 shrink-0" />
-                        <div className="flex-1">
-                          <p className="font-medium text-foreground mb-1">Data sources</p>
-                          <div className="flex flex-wrap gap-1.5">
-                            {msg.trace.sources.map((s) => (
-                              <span key={s} className="px-2 py-0.5 rounded bg-primary/10 text-primary font-mono">{s}</span>
-                            ))}
+                        <div className="grid grid-cols-[150px_1fr] gap-3 px-3 py-2.5 hover:bg-muted/20">
+                          <div className="flex items-center gap-2 text-muted-foreground font-medium">
+                            <Route className="w-3.5 h-3.5 text-primary" />
+                            Likely path
                           </div>
+                          <span className="text-foreground font-semibold">{msg.trace.likelyPath || msg.trace.route || "Not provided"}</span>
                         </div>
-                      </div>
-                      <div className="flex items-start gap-2">
-                        <Activity className="w-3.5 h-3.5 text-primary mt-0.5 shrink-0" />
-                        <div className="flex-1">
-                          <p className="font-medium text-foreground mb-1">Steps executed</p>
-                          <ol className="space-y-1 list-decimal list-inside text-muted-foreground">
-                            {msg.trace.steps.map((step, i) => (
-                              <li key={i}>{step}</li>
-                            ))}
-                          </ol>
+                        <div className="grid grid-cols-[150px_1fr] gap-3 px-3 py-2.5 hover:bg-muted/20">
+                          <div className="flex items-center gap-2 text-muted-foreground font-medium">
+                            <Brain className="w-3.5 h-3.5 text-primary" />
+                            Agent used
+                          </div>
+                          <span className="text-foreground font-semibold break-words">
+                            {(msg.trace.agents?.length ? msg.trace.agents : ["Not provided"]).join(", ")}
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-[150px_1fr] gap-3 px-3 py-2.5 hover:bg-muted/20">
+                          <div className="flex items-center gap-2 text-muted-foreground font-medium">
+                            <Database className="w-3.5 h-3.5 text-primary" />
+                            SQL generated
+                          </div>
+                          <span className={`w-fit inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full font-semibold ${msg.trace.sqlGenerated ? "bg-[hsl(var(--success))]/10 text-[hsl(var(--success))]" : "bg-muted text-muted-foreground"}`}>
+                            <CheckCircle2 className="w-3 h-3" />
+                            {msg.trace.sqlGenerated ? "Yes" : "No"}
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-[150px_1fr] gap-3 px-3 py-2.5 hover:bg-muted/20">
+                          <div className="flex items-center gap-2 text-muted-foreground font-medium">
+                            <Workflow className="w-3.5 h-3.5 text-primary" />
+                            Total tokens
+                          </div>
+                          <span className="text-foreground font-semibold">
+                            {typeof msg.trace.totalTokens === "number" ? msg.trace.totalTokens.toLocaleString() : "Not available"}
+                          </span>
                         </div>
                       </div>
                     </div>

@@ -1,5 +1,6 @@
 import logging
 
+from app.config.routing_rules_loader import get_planner_default_primary_source
 from app.config.schema_loader import build_field_to_source_index
 
 logger = logging.getLogger(__name__)
@@ -31,5 +32,5 @@ def get_primary_source(requested_fields: list) -> str:
     sources = resolve_required_sources(requested_fields)
     if len(sources) == 1:
         return sources[0]
-    return "postgres"
+    return get_planner_default_primary_source()
 

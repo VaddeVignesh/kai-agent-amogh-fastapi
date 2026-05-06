@@ -4,6 +4,7 @@ import ast
 import json
 import logging
 import os
+import time
 import traceback
 import uuid
 from dataclasses import asdict, is_dataclass
@@ -14,23 +15,114 @@ import re
 import sys
 
 from app.orchestration.planner import Planner, ExecutionPlan
-from app.registries.intent_registry import INTENT_REGISTRY, SUPPORTED_INTENTS, resolve_intent
+from app.config.mongo_rules_loader import get_mongo_limit, get_mongo_projection
+from app.config.prompt_rules_loader import (
+    get_graph_router_multi_voyage_answer_system_prompt,
+    get_graph_router_voyage_metadata_answer_system_prompt,
+)
+from app.config.response_rules_loader import get_result_set_response_template, get_router_fallback_template
+from app.registries.intent_loader import get_yaml_registry_facade
 from app.registries.sql_registry import SQL_REGISTRY
 from app.services.response_merger import compact_payload
 from app.adapters.mongo_adapter import narrow_voyage_rows_by_entity_slots
+from app.config.routing_rules_loader import (
+    get_cargo_grade_terms,
+    get_cargo_grade_voyage_terms,
+    get_concise_followup_keywords,
+    get_comparison_followup_terms,
+    get_coreference_words,
+    get_corpus_guard_result_set_reference_phrases,
+    get_direct_thread_reference_phrases,
+    get_explicit_result_set_reference_phrases,
+    get_first_selector_phrases,
+    get_followup_backward_markers,
+    get_fresh_fleet_markers,
+    get_fresh_ranking_pnl_terms,
+    get_fresh_ranking_phrases,
+    get_fresh_ranking_segment_terms,
+    get_fresh_ranking_trend_terms,
+    get_fresh_ranking_trend_context_words,
+    get_fresh_ranking_trend_words,
+    get_generic_followup_markers,
+    get_incomplete_entity_detail_markers,
+    get_incomplete_entity_fastpath_queries,
+    get_incomplete_entity_fleet_port_aggregate_markers,
+    get_incomplete_entity_placeholder_slot_values,
+    get_incomplete_entity_question_markers,
+    get_incomplete_entity_topic_phrases,
+    get_incomplete_entity_topic_terms,
+    get_last_selector_phrases,
+    get_long_new_question_prefixes,
+    get_new_request_prefixes,
+    get_operational_followup_keywords,
+    get_older_vessel_markers,
+    get_polite_followup_prefixes,
+    get_proper_name_request_prefixes,
+    get_result_set_operation_fields,
+    get_result_set_operation_verbs,
+    get_result_set_corpus_followup_exclusion_terms,
+    get_result_set_explain_verbs,
+    get_result_set_extreme_keywords,
+    get_result_set_extreme_metric_aliases,
+    get_result_set_fresh_start_prefixes,
+    get_result_set_list_fields_context_terms,
+    get_result_set_list_fields_extra_exclusion_terms,
+    get_result_set_low_extreme_terms,
+    get_result_set_metric_followup_exclusion_terms,
+    get_result_set_projection_field_terms,
+    get_result_set_question_prefixes,
+    get_result_set_refinement_phrases,
+    get_result_set_refinement_extreme_terms,
+    get_result_set_scope_phrases,
+    get_result_set_selected_metric_aliases,
+    get_result_set_selected_metric_context_terms,
+    get_result_set_selected_metric_triggers,
+    get_result_set_short_projection_field_terms,
+    get_result_set_stale_delay_guard_terms,
+    get_scenario_comparison_words,
+    get_scenario_keyword_aliases,
+    get_selected_row_reference_phrases,
+    get_simple_voyage_analytical_markers,
+    get_same_entity_reference_words,
+    get_session_thread_context_markers,
+    get_short_contextual_followup_fields,
+    get_singular_selection_markers,
+    get_metric_followup_override_actions,
+    get_structured_followup_operations,
+    get_structured_followup_scopes,
+    get_thread_override_explicit_entity_markers,
+    get_thread_override_fleet_switch_markers,
+    get_thread_override_ranking_terms,
+    get_thread_override_referential_markers,
+    get_thread_override_vessel_keywords,
+    get_thread_override_vessel_metadata_terms,
+    get_thread_override_voyage_keywords,
+    get_thread_override_voyage_metadata_terms,
+    get_value_like_fresh_words,
+    get_vessel_mention_descriptor_suffixes,
+    get_vessel_mention_false_prefixes,
+    get_vessel_mention_stop_first_words,
+    get_voyage_topic_keywords,
+)
+from app.core.logger import get_logger
 
-# --- Thing 1: shadow mode imports ---
+_INTENT_FACADE = get_yaml_registry_facade(validate_parity=True)
+INTENT_REGISTRY = _INTENT_FACADE["INTENT_REGISTRY"]
+SUPPORTED_INTENTS = _INTENT_FACADE["SUPPORTED_INTENTS"]
+resolve_intent = _INTENT_FACADE["resolve_intent"]
+_SUGGESTION_CACHE_TTL_SECONDS = 300.0
+
 from app.llm.intent_extractor import extract_structured_intent
 from app.orchestration.source_router import resolve_required_sources
 from app.orchestration.followup_resolver import resolve_followup
 import logging as _sil_logging
+
 _sil_logger = _sil_logging.getLogger("shadow_intent_layer")
 if not _sil_logger.handlers:
     _handler = _sil_logging.StreamHandler()
     _handler.setFormatter(_sil_logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
     _sil_logger.addHandler(_handler)
 _sil_logger.setLevel(_sil_logging.INFO)
-# --- end Thing 1 imports ---
 
 # =========================================================
 # Debug logging
@@ -58,15 +150,21 @@ def _dprint(*args: Any, **kwargs: Any) -> None:
                 # Last-resort: don't crash debug logging.
                 return
 
-logger = logging.getLogger(__name__)
+logger = get_logger("graph_router")
+
+
+def _router_fallback(name: str, **values: Any) -> str:
+    template = get_router_fallback_template(name)
+    return template.format(**values) if template else ""
+
+
+def _result_set_text(name: str, **values: Any) -> str:
+    template = get_result_set_response_template(name)
+    return template.format(**values) if template else ""
 
 
 def _shadow_extract(query: str, session: dict, llm_fn) -> dict | None:
-    """
-    Shadow mode: runs structured intent extraction alongside existing routing.
-    ONLY logs the result. Does NOT affect any routing output.
-    All exceptions caught — production path is never impacted.
-    """
+    """Run structured intent extraction defensively for routing diagnostics."""
     try:
         last_rows = session.get("last_result_set", [])
         if isinstance(last_rows, dict):
@@ -123,27 +221,7 @@ VOYAGE_SECTION_MAP = {
     "remarks":     lambda d: d.get("remarks", []),
 }
 
-TOPIC_KEYWORDS = {
-    "commissions": ["charterer", "broker", "commission", "rate", "agent", "co broker"],
-    "cargo":       ["cargo", "grade", "bl ", "shipper", "naphtha", "bill of lading",
-                    "quantity", "mt ", "bbls"],
-    "fixture":     ["cp date", "laytime", "demurrage", "time bar", "fixture",
-                    "overage", "lay can"],
-    "ports":       ["port", "load port", "discharge port", "bilbao", "antwerp",
-                    "activity"],
-    "legs":        ["route", "leg", "arrival", "departure", "distance", "passage",
-                    "speed", "ballast", "laden", "draft", "eca"],
-    "revenues":    ["revenue", "freight", "rebill", "ws ", "worldscale", "flat rate",
-                    "revenue line"],
-    "expenses":    ["expense", "miscellaneous", "ets", "expense line"],
-    "bunkers":     ["bunker", "hsbf", "lsgo", "rob", "consumption", "stem",
-                    "fuel", "refill"],
-    "emissions":   ["cii", "co2", "sox", "nox", "emission", "eeoi", "aer", "band"],
-    "projected":   ["projected", "tce", "pnl", "efficiency", "estimated",
-                    "projection", "forecast"],
-    "remarks":     ["remark", "note", "who added", "comment", "added by",
-                    "modified by"],
-}
+TOPIC_KEYWORDS = get_voyage_topic_keywords()
 
 
 def select_voyage_sections(
@@ -159,7 +237,7 @@ def select_voyage_sections(
     text = (user_input or "").lower()
     selected: dict = {}
 
-    # --- Thing 1 Phase 4D: section projection from structured intent + schema ---
+    # Prefer structured intent fields when selecting document sections.
     _si_4d = session_ctx.get("_structured_intent") if isinstance(session_ctx, dict) else None
     _schema_sections = None
 
@@ -271,6 +349,7 @@ class GraphRouter:
         self.mongo_agent = mongo_agent
         self.finance_agent = finance_agent
         self.ops_agent = ops_agent
+        self._suggestion_cache: Dict[str, tuple[float, list[Any]]] = {}
 
         self.planner = Planner(llm)
         self.graph = self._build_graph()
@@ -451,7 +530,7 @@ class GraphRouter:
 
         found_scenarios: list[str] = []
 
-        # --- Thing 1 Phase 4B: scenario detection from entity_catalog.yaml ---
+        # Prefer structured intent scenario hints, then fall back to configured aliases.
         _si_4b = session_ctx.get("_structured_intent") if isinstance(session_ctx, dict) else None
         if isinstance(_si_4b, dict) and _si_4b.get("confidence") in ("high", "medium"):
             _sc_raw = str(_si_4b.get("scenario") or "").strip().upper()
@@ -469,29 +548,15 @@ class GraphRouter:
             if alias in _ul_lower and canonical not in found_scenarios:
                 found_scenarios.append(canonical)
 
-        # FALLBACK 2: original hardcoded scenario_keywords dict (deprecated)
-        # DEPRECATED Phase 4B — kept as last-resort fallback (budget/forecast, etc.)
-        scenario_keywords = {
-            "when_fixed": "WHEN_FIXED",
-            "when fixed": "WHEN_FIXED",
-            "wf": "WHEN_FIXED",
-            "actual": "ACTUAL",
-            "act": "ACTUAL",
-            "budget": "BUDGET",
-            "forecast": "FORECAST",
-            "projected": "PROJECTED",
-        }
+        # FALLBACK 2: routing_rules.yaml scenario keyword aliases.
+        scenario_keywords = get_scenario_keyword_aliases()
         for keyword, scenario_name in scenario_keywords.items():
             if keyword in user_lower and scenario_name not in found_scenarios:
                 found_scenarios.append(scenario_name)
         # --- end Phase 4B ---
         
         # Comparison indicators
-        comparison_words = [
-            "compare", "vs", "versus", "v/s", "v.s.", 
-            "difference", "variance", "gap", "between",
-            "against", "comparison"
-        ]
+        comparison_words = get_scenario_comparison_words()
         
         # Check for comparison words
         has_comparison = any(word in user_lower for word in comparison_words)
@@ -501,7 +566,7 @@ class GraphRouter:
             updated_slots = dict(extracted_slots)
             updated_slots["scenario"] = found_scenarios
             
-            _dprint(f"   🔍 PATTERN DETECTED: Scenario comparison")
+            _dprint("   Pattern detected: Scenario comparison")
             _dprint(f"      Scenarios found: {found_scenarios}")
             
             return True, updated_slots
@@ -558,14 +623,9 @@ class GraphRouter:
             seen.add(key)
             found.append(s)
 
-        stop_first = {
-            "can", "you", "what", "which", "show", "tell", "give", "find", "list", "the", "a", "an",
-            "how", "why", "when", "where", "who", "are", "is", "does", "do", "did", "was", "were",
-            "there", "these", "those", "this", "that", "any", "some", "each", "every", "all", "most",
-            "customer", "usage", "historical", "commercial", "technical", "standard", "key", "full",
-            "profile", "details", "vessel", "vessels", "ship", "ships", "fleet", "best", "worst",
-            "top", "bottom", "long", "term", "charter", "active", "inactive", "another", "other",
-        }
+        stop_first = get_vessel_mention_stop_first_words()
+        descriptor_suffixes = get_vessel_mention_descriptor_suffixes()
+        false_prefixes = get_vessel_mention_false_prefixes()
 
         def _ok_group(s: str) -> bool:
             parts = s.split()
@@ -573,8 +633,8 @@ class GraphRouter:
                 return False
             if parts[0].lower() in stop_first:
                 return False
-            if len(parts) == 2 and parts[1].lower() in {"pool", "segment", "class", "type"}:
-                if parts[0].upper() in {"IMO", "ECO", "MR"}:
+            if len(parts) == 2 and parts[1].lower() in descriptor_suffixes:
+                if parts[0].upper() in false_prefixes:
                     return False
             return True
 
@@ -701,7 +761,7 @@ class GraphRouter:
                 value = str(voyage_id or "").strip()
                 if not value:
                     return False
-                return bool(adapter.fetch_voyage(value, projection={"voyageId": 1}))
+                return bool(adapter.fetch_voyage(value, projection=get_mongo_projection("voyage_id_lookup")))
             except TypeError:
                 return bool(adapter.fetch_voyage(str(voyage_id or "").strip()))
             except Exception:
@@ -854,7 +914,7 @@ class GraphRouter:
     ) -> tuple[str, Dict[str, Any], str] | None:
         ui = (user_input or "").strip()
         ul = ui.lower()
-        if not ui or not any(k in ul for k in ("compare", "vs", "versus", "difference")):
+        if not ui or not any(k in ul for k in get_comparison_followup_terms()):
             return None
         if not isinstance(session_ctx, dict):
             return None
@@ -864,16 +924,7 @@ class GraphRouter:
         if not isinstance(sess_slots, dict):
             sess_slots = {}
 
-        backward_markers = (
-            "previously",
-            "previous",
-            "earlier",
-            "before",
-            "at that point",
-            "at the start",
-            "from the start",
-            "starting",
-        )
+        backward_markers = get_followup_backward_markers()
         prefer_older = backward_reference or any(marker in ul for marker in backward_markers)
         last_intent = str(session_ctx.get("last_intent") or session_ctx.get("last_intent_key") or "").strip().lower()
 
@@ -988,13 +1039,7 @@ class GraphRouter:
                     rewritten = f"Compare vessel {current_vessel} with vessel {explicit_vessel}. Original request: {ui}"
                     return "comparison.vessels", dict(slots), rewritten
 
-            older_vessel_markers = (
-                "asked vessel",
-                "previous vessel",
-                "earlier vessel",
-                "before vessel",
-                "last vessel",
-            )
+            older_vessel_markers = get_older_vessel_markers()
             if prefer_older and current_vessel not in (None, "", [], {}):
                 previous_vessel = self._find_distinct_slot_in_turn_history(
                     session_ctx=session_ctx,
@@ -1046,7 +1091,64 @@ class GraphRouter:
         if not isinstance(state.get("artifacts"), dict):
             state["artifacts"] = {}
 
-        # --- Thing 1: shadow comparison log (pre-routing; no impact) ---
+        # Fast-path exact incomplete entity questions so clarification does not wait on LLM routing.
+        normalized_user_input = re.sub(r"\s+", " ", (user_input or "").strip().lower()).rstrip("?.!")
+        for fastpath_intent, phrases in get_incomplete_entity_fastpath_queries().items():
+            if normalized_user_input in phrases:
+                state["intent_key"] = fastpath_intent
+                state["slots"] = {}
+                artifacts = state.get("artifacts") or {}
+                artifacts["intent_key"] = fastpath_intent
+                artifacts["slots"] = {}
+                artifacts["user_input"] = user_input
+                state["artifacts"] = artifacts
+                self._trace(
+                    state,
+                    {
+                        "phase": "intent_extraction",
+                        "intent_key": fastpath_intent,
+                        "slots": {},
+                        "likely_path": "single",
+                        "source": "incomplete_entity_fastpath",
+                    },
+                )
+                return state
+
+        # Fast-path obvious voyage lookup requests. This avoids an LLM intent call for
+        # simple inputs like "show voyage 2205" while leaving analytical/follow-up
+        # questions on the normal router path.
+        simple_voyage_match = re.search(r"\bvoyage\s+(?:number\s+|no\.?\s+|#\s*)?(\d{3,5})\b", user_input, flags=re.IGNORECASE)
+        if simple_voyage_match:
+            ul_fast = user_input.lower()
+            analytical_markers = get_simple_voyage_analytical_markers()
+            if not any(marker in ul_fast for marker in analytical_markers):
+                voyage_number = int(simple_voyage_match.group(1))
+                intent_key = "voyage.summary"
+                cleaned_slots = {
+                    "voyage_number": voyage_number,
+                    "voyage_numbers": [voyage_number],
+                }
+
+                state["intent_key"] = intent_key
+                state["slots"] = cleaned_slots
+                artifacts = state.get("artifacts") or {}
+                artifacts["intent_key"] = intent_key
+                artifacts["slots"] = cleaned_slots
+                artifacts["user_input"] = user_input
+                state["artifacts"] = artifacts
+                self._trace(
+                    state,
+                    {
+                        "phase": "intent_extraction",
+                        "intent_key": intent_key,
+                        "slots": cleaned_slots,
+                        "likely_path": "single",
+                        "source": "simple_voyage_fastpath",
+                    },
+                )
+                return state
+
+        # Structured intent extraction feeds routing hints and diagnostic logging.
         def _shadow_llm_fn(prompt: str) -> str:
             try:
                 resp = self.llm._call_with_retry(
@@ -1079,12 +1181,12 @@ class GraphRouter:
                 _sil_logger.warning(f"SHADOW_FAIL | query='{user_input[:80]}'")
         except Exception:
             pass
-        # Thing 1 Phase 4A: persist structured intent for primary routing (same LLM call as shadow).
+        # Persist structured intent for primary routing.
         if isinstance(_shadow_pre, dict) and _shadow_pre.get("confidence") in ("high", "medium"):
             if isinstance(session_ctx, dict):
                 session_ctx["_structured_intent"] = _shadow_pre
                 state["session_ctx"] = session_ctx
-                # --- Phase 4A-fix: source sanitisation for aggregation queries ---
+                # Keep aggregate-style operations on their configured primary source.
                 _si_check = session_ctx.get("_structured_intent")
                 if isinstance(_si_check, dict):
                     _si_op_chk = str(_si_check.get("operation") or "").lower()
@@ -1103,7 +1205,6 @@ class GraphRouter:
                             ["postgres"] if "postgres" in _si_src else [_si_src[0]]
                         )
                         session_ctx["_structured_intent"] = _si_check
-                # --- end Phase 4A-fix source sanitisation ---
                 logger.info(
                     "PRIMARY_STRUCTURED|phase=4a|confidence=%s|scope=%s|follow_up_action=%s",
                     _shadow_pre.get("confidence"),
@@ -1117,7 +1218,6 @@ class GraphRouter:
                     )
                 except Exception:
                     pass
-        # --- end Thing 1 pre-shadow log ---
 
         # =========================================================
         # Pending clarification: treat the user's message as a slot value
@@ -1265,104 +1365,31 @@ class GraphRouter:
         words = [w for w in ul.split() if w]
         has_result_set = isinstance(session_ctx, dict) and isinstance(session_ctx.get("last_result_set"), dict)
         # Composite fleet delay + PnL + offhire queries must not be hijacked by last_result_set.
+        stale_delay_guard = get_result_set_stale_delay_guard_terms()
         if (
             has_result_set
-            and "delayed" in ul
-            and ("negative" in ul or "pnl" in ul)
-            and "offhire" in ul
-            and ("for voyages" in ul or "voyages flagged" in ul)
+            and all(term in ul for term in stale_delay_guard.get("all", []))
+            and any(term in ul for term in stale_delay_guard.get("any", []))
+            and any(term in ul for term in stale_delay_guard.get("scope", []))
         ):
             has_result_set = False
         turn_type = self._classify_turn_type(session_ctx=session_ctx, user_input=user_input)
         explicit_fresh_entity = self._looks_like_explicit_fresh_entity_request(user_input)
-        fresh_fleet_markers = (
-            "across all",
-            "across fleet",
-            "fleet-wide",
-            "all voyages",
-            "all vessels",
-            "each vessel",
-            "each port",
-            "each cargo grade",
-            "per vessel",
-            "per port",
-            "per cargo grade",
-            "by vessel",
-            "by voyage",
-            "by port",
-            "for all vessels",
-            "for all voyages",
-            "whole fleet",
-            "entire fleet",
-        )
+        fresh_fleet_markers = get_fresh_fleet_markers()
         fresh_fleet_turn = any(marker in ul for marker in fresh_fleet_markers)
         explicit_rs_ref = any(
             p in ul
-            for p in (
-                "among these",
-                "among them",
-                "among this",
-                "from above",
-                "from the above",
-                "from this",
-                "in that list",
-                "in the list",
-                "above list",
-                "the above",
-                "those voyages",
-                "these voyages",
-            )
+            for p in get_explicit_result_set_reference_phrases()
         )
-        starts_like_new_request = ul.startswith(
-            (
-                "show ",
-                "show me",
-                "list ",
-                "rank ",
-                "find ",
-                "give ",
-                "tell ",
-                "summarize",
-                "compare ",
-                "for ",
-                "which ",
-                "what ",
-                "if ",
-                "is ",
-                "how ",
-                "does ",
-                "did ",
-                "are ",
-                "was ",
-                "were ",
-                "ports ",
-                "port ",
-                "cargo ",
-                "vessels ",
-                "vessel ",
-                "voyages ",
-                "voyage ",
-                "average ",
-                "avg ",
-                "top ",
-                "bottom ",
-                "highest ",
-                "lowest ",
-                "most ",
-                "least ",
-                "total ",
-                "count ",
-                "find ",
-                "calculate ",
-            )
-        )
+        starts_like_new_request = ul.startswith(get_new_request_prefixes())
 
-        # --- Thing 1 Phase 4A-fix: scope override with operation guard ---
+        # Use structured follow-up scope only when the operation/action is concrete.
         _phase4a_fresh_ranking_utterance = starts_like_new_request and (
-            ("most profitable" in ul)
-            or ("loss-making" in ul)
-            or ("loss making" in ul)
-            or (("trend" in ul) and (("month" in ul) or ("average" in ul)))
+            any(phrase in ul for phrase in get_fresh_ranking_phrases())
+            or (
+                any(word in ul for word in get_fresh_ranking_trend_words())
+                and any(word in ul for word in get_fresh_ranking_trend_context_words())
+            )
         )
         _si_scope = session_ctx.get("_structured_intent") if isinstance(session_ctx, dict) else None
         _structured_scope_ok = isinstance(_si_scope, dict) and _si_scope.get("confidence") in ("high", "medium")
@@ -1375,15 +1402,14 @@ class GraphRouter:
             # aggregate rows (e.g. T18, T22) being misclassified as followup.result_set
             # when the extractor sets scope=follow_up with a spurious follow_up_action.
             _genuine_followup = (
-                _si_sc_raw in ("follow_up", "followup")
-                and _si_op == "follow_up_filter"
+                _si_sc_raw in get_structured_followup_scopes()
+                and _si_op in get_structured_followup_operations()
                 and (_si_fu_act is not None and str(_si_fu_act).strip() != "")
             )
             if _genuine_followup and not _phase4a_fresh_ranking_utterance:
                 turn_type = "followup"
                 fresh_fleet_turn = False
                 starts_like_new_request = False
-        # --- end Phase 4A-fix scope override ---
 
         thread_override = None
         if not explicit_fresh_entity:
@@ -1395,7 +1421,7 @@ class GraphRouter:
         if (
             thread_override is not None
             and "context" in ul
-            and any(p in ul for p in ("same vessel", "same voyage", "still the same vessel", "still the same voyage"))
+            and any(p in ul for p in get_session_thread_context_markers())
         ):
             override_intent, override_slots = thread_override
             state["intent_key"] = override_intent
@@ -1434,15 +1460,12 @@ class GraphRouter:
         # Explain remarks / what went wrong: only treat as follow-up if it's a short follow-up prompt,
         # NOT a full new request like "Show me the top 5 ... and include remarks that explain why ...".
         is_short_followup = len(words) <= 12
-        starts_followup_verb = ul.startswith(("explain", "why", "what went wrong", "went wrong"))
+        starts_followup_verb = ul.startswith(get_result_set_explain_verbs())
         mentions_remarks = ("remark" in ul) or ("remarks" in ul)
         if has_result_set and mentions_remarks and is_short_followup and starts_followup_verb and not starts_like_new_request and turn_type == "followup" and not explicit_fresh_entity:
             # Removed brand-specific routing — scope handled by structured intent when available.
             _looks_fresh = any(
-                ul.startswith(p) for p in [
-                    "is ", "for vessel", "how is", "show me", "which vessel",
-                    "find vessel",
-                ]
+                ul.startswith(p) for p in get_result_set_fresh_start_prefixes()
             )
             if _looks_fresh:
                 pass  # fall through to normal intent extraction
@@ -1463,19 +1486,16 @@ class GraphRouter:
         # Extremes (highest/lowest) as a short follow-up prompt.
         if (
             has_result_set
-            and any(k in ul for k in ("highest", "lowest", "max", "min", "best", "worst", "better", "higher", "lower"))
+            and any(k in ul for k in get_result_set_extreme_keywords())
             and is_short_followup
             and not explicit_fresh_entity
             and (
                 not starts_like_new_request
-                or any(k in ul for k in ("out of it", "out of them", "among these", "among them"))
-                or ul.startswith(("which was", "what was"))
+                or any(k in ul for k in get_result_set_scope_phrases())
+                or ul.startswith(get_result_set_question_prefixes())
             )
             and turn_type == "followup"
-            and not any(ul.startswith(p) for p in [
-                "is ", "for vessel",
-                "how is", "which vessel",
-            ])
+            and not any(ul.startswith(p) for p in get_result_set_fresh_start_prefixes())
         ):
             state["intent_key"] = "followup.result_set"
             state["slots"] = {"action": "compare_extremes"}
@@ -1494,46 +1514,28 @@ class GraphRouter:
         # Allow polite command phrasing ("can you list ...") even if turn classifier is conservative.
         if has_result_set:
             op_slots = self._parse_result_set_followup_action(user_input=user_input, session_ctx=session_ctx)
-            polite_followup = ul.startswith(("can u ", "can you ", "could you ", "please "))
+            polite_followup = ul.startswith(get_polite_followup_prefixes())
             concise_followup_override = (not fresh_fleet_turn) and len(words) <= 12 and any(
-                k in ul for k in (
-                    "best", "worst", "highest", "lowest", "changed the most",
-                    "what about", "cargo grade", "grade", "remarks", "remark", "that one", "that voyage"
-                )
+                k in ul for k in get_concise_followup_keywords()
             )
             # Never let the metric parser hijack fleet-wide or corpus questions; the classifier
             # may mark them new_question but metric_followup_override used to bypass that.
-            # Phase 4A-fix: do not treat a clearly new ranking / trend ask as a result-set follow-up
-            # when the utterance opens like a fresh request (avoids hijack from stale last_result_set).
+            # Do not let stale result-set memory hijack fresh ranking or trend asks.
             metric_followup_override = (
                 (not fresh_fleet_turn)
                 and (not _phase4a_fresh_ranking_utterance)
                 and isinstance(op_slots, dict)
-                and op_slots.get("action") in ("project_selected_metric", "top_n", "bottom_n", "compare_extremes", "project_extreme_field")
+                and op_slots.get("action") in get_metric_followup_override_actions()
                 and len(words) <= 12
             )
             result_set_refinement = concise_followup_override and any(
                 k in ul
-                for k in (
-                    "best voyage",
-                    "worst voyage",
-                    "top voyage",
-                    "lowest voyage",
-                    "highest voyage",
-                    "top one",
-                    "bottom one",
-                    "best one",
-                    "worst one",
-                    "highest one",
-                    "lowest one",
-                    "first one",
-                    "last one",
-                )
+                for k in get_result_set_refinement_phrases()
             )
             if (
                 has_result_set
-                and any(k in ul for k in ("operational", "operating", "is it operational", "is it operating", "status"))
-                and any(k in ul for k in ("that", "this", "same"))
+                and any(k in ul for k in get_operational_followup_keywords())
+                and any(k in ul for k in get_same_entity_reference_words())
             ):
                 lfs = session_ctx.get("last_focus_slots") if isinstance(session_ctx, dict) else None
                 if isinstance(lfs, dict):
@@ -1615,7 +1617,7 @@ class GraphRouter:
             session_context=session_ctx,
         )
 
-        # --- Thing 1: shadow comparison log (no routing impact) ---
+        # Log structured intent output for diagnostics.
         _shadow = _shadow_extract(user_input, session_ctx, _shadow_llm_fn)
         if _shadow:
             _sil_logger.info(
@@ -1629,20 +1631,19 @@ class GraphRouter:
             )
         else:
             _sil_logger.warning(f"SHADOW_FAIL | query='{user_input[:80]}'")
-        # --- end Thing 1 shadow log ---
         
         intent_key = ex.get("intent_key", "out_of_scope")
         extracted_slots = ex.get("slots", {}) or {}
         # session_ctx already loaded above
 
-        # Phase 4A-fix: LLM may return followup.result_set for fresh ranking/trend asks when
+        # The LLM may return followup.result_set for fresh ranking/trend asks when
         # session still holds an unrelated last_result_set — remap to primary fleet intents.
         if _phase4a_fresh_ranking_utterance and intent_key == "followup.result_set":
-            if "most profitable" in ul:
+            if any(term in ul for term in get_fresh_ranking_pnl_terms()):
                 intent_key = "ranking.voyages_by_pnl"
-            elif "loss-making" in ul or "loss making" in ul:
+            elif any(term in ul for term in get_fresh_ranking_segment_terms()):
                 intent_key = "analysis.segment_performance"
-            elif "trend" in ul:
+            elif any(term in ul for term in get_fresh_ranking_trend_terms()):
                 intent_key = "aggregation.trends"
             if isinstance(ex, dict):
                 ex["intent_key"] = intent_key
@@ -1734,7 +1735,7 @@ class GraphRouter:
         # Deterministic intent for cargo-grade voyage filters
         # "what voyages have NHC as cargo grade" should not go out_of_scope.
         # =========================================================
-        if any(k in ul for k in ("cargo grade", "cargo grades", "grade")) and ("voyage" in ul or "voyages" in ul):
+        if any(k in ul for k in get_cargo_grade_terms()) and any(k in ul for k in get_cargo_grade_voyage_terms()):
             if extracted_slots.get("cargo_grade") or extracted_slots.get("cargo_type"):
                 extracted_slots["cargo_grade"] = extracted_slots.get("cargo_grade") or extracted_slots.get("cargo_type")
                 intent_key = "ops.voyages_by_cargo_grade"
@@ -1770,14 +1771,14 @@ class GraphRouter:
                 extracted_slots.pop("imo", None)
                 extracted_slots.pop("vessel_imo", None)
 
-        # Phase 4A-fix (post session-followup): session follow-up logic can re-map to
+        # Session follow-up logic can re-map to
         # followup.result_set for fresh ranking/trend utterances — restore primary intents.
         if _phase4a_fresh_ranking_utterance and intent_key == "followup.result_set":
-            if "most profitable" in ul:
+            if any(term in ul for term in get_fresh_ranking_pnl_terms()):
                 intent_key = "ranking.voyages_by_pnl"
-            elif "loss-making" in ul or "loss making" in ul:
+            elif any(term in ul for term in get_fresh_ranking_segment_terms()):
                 intent_key = "analysis.segment_performance"
-            elif "trend" in ul:
+            elif any(term in ul for term in get_fresh_ranking_trend_terms()):
                 intent_key = "aggregation.trends"
 
         if intent_key == "cargo.details" and not (
@@ -1942,12 +1943,11 @@ class GraphRouter:
             cleaned_slots.pop("imo", None)
             cleaned_slots.pop("vessel_imo", None)
         
-        # Debug
-        _dprint(f"\n🔍 INTENT EXTRACTION:")
+        _dprint("\nIntent extraction:")
         _dprint(f"   Intent: {intent_key}")
         _dprint(f"   Slots (cleaned): {cleaned_slots}")
 
-        # Phase 4A-fix (final): last-line guard before persisting intent — avoids stale-session
+        # Final guard before persisting intent: avoids stale-session
         # followup.result_set on fresh fleet ranking / trend asks regardless of upstream overrides.
         _ul_fin = (user_input or "").strip().lower()
         if intent_key == "followup.result_set" and _ul_fin.startswith(
@@ -2001,52 +2001,29 @@ class GraphRouter:
         ui = (user_input or "").strip()
         ul = ui.lower()
         slots = dict(extracted_slots or {})
+        placeholder_values = get_incomplete_entity_placeholder_slot_values()
+
+        for slot_key, placeholders in placeholder_values.items():
+            value = slots.get(slot_key)
+            if isinstance(value, str) and value.strip().lower() in set(placeholders):
+                slots.pop(slot_key, None)
 
         wants_details = any(
             p in ul
-            for p in (
-                "tell me about",
-                "details",
-                "detail",
-                "information",
-                "info",
-                "summary",
-                "summarize",
-                "what is",
-                "what's",
-                "describe",
-                "define",
-            )
+            for p in get_incomplete_entity_detail_markers()
         )
 
         has_voyage_anchor = bool(slots.get("voyage_number") or slots.get("voyage_numbers") or slots.get("voyage_id"))
         has_vessel_anchor = bool(slots.get("vessel_name") or slots.get("imo"))
         has_port_anchor = bool(slots.get("port_name"))
-        is_fleet_port_aggregate = (
-            "all voyages" in ul
-            or "across all" in ul
-            or "fleet" in ul
-            or any(
-                p in ul
-                for p in (
-                    "most visited",
-                    "most commonly visited",
-                    "most common port",
-                    "most frequent port",
-                    "busiest port",
-                    "top port",
-                    "port frequency",
-                    "port count",
-                    "highest average",
-                    "average demurrage",
-                )
-            )
-        )
+        is_fleet_port_aggregate = any(p in ul for p in get_incomplete_entity_fleet_port_aggregate_markers())
+        topic_terms = get_incomplete_entity_topic_terms()
+        topic_phrases = get_incomplete_entity_topic_phrases()
 
         # Port details intent ONLY when the user is asking about a port,
         # not when "ports" appears as an attribute of a voyage/vessel summary.
         # Safe because we only trigger it when there is no other entity anchor.
-        port_topic = bool(re.search(r"\bport\b", ul))
+        port_topic = any(re.search(rf"\b{re.escape(term)}\b", ul) for term in topic_terms.get("port", []))
         if (
             port_topic
             and wants_details
@@ -2058,29 +2035,15 @@ class GraphRouter:
             return "port.details", slots
 
         # Vessel summary intent if user asks about "vessel/ship" without vessel_name/imo.
-        vessel_topic = bool(re.search(r"\b(vessel|ship)\b", ul)) and any(
-            p in ul
-            for p in (
-                "tell me about vessel",
-                "tell me about ship",
-                "vessel summary",
-                "ship details",
-                "vessel details",
-            )
+        vessel_topic = any(re.search(rf"\b{re.escape(term)}\b", ul) for term in topic_terms.get("vessel", [])) and any(
+            p in ul for p in topic_phrases.get("vessel", [])
         )
         if vessel_topic and wants_details and not has_vessel_anchor and not has_voyage_anchor and not has_port_anchor:
             return "vessel.summary", slots
 
         # Voyage summary intent if user asks about "voyage" without voyage_number/id.
-        voyage_topic = bool(re.search(r"\bvoyage\b", ul)) and any(
-            p in ul
-            for p in (
-                "tell me about voyage",
-                "voyage summary",
-                "voyage details",
-                "details about voyage",
-                "information about voyage",
-            )
+        voyage_topic = any(re.search(rf"\b{re.escape(term)}\b", ul) for term in topic_terms.get("voyage", [])) and any(
+            p in ul for p in topic_phrases.get("voyage", [])
         )
         if voyage_topic and wants_details and not has_voyage_anchor and not has_vessel_anchor and not has_port_anchor:
             return "voyage.summary", slots
@@ -2175,7 +2138,7 @@ class GraphRouter:
                 return slots
 
             # Do not treat an incomplete question as a port name (e.g. "tell me about port").
-            if any(p in ul for p in ("tell me", "what is", "what's", "summary", "summarize", "details", "information", "explain", "show ", "list ", "find ")):
+            if any(p in ul for p in get_incomplete_entity_question_markers()):
                 # If they provided "port <name>" inside the sentence, we still accept it.
                 m = re.search(r"\bport\s+([A-Za-z].+)$", ui, flags=re.IGNORECASE)
                 if not m:
@@ -2208,7 +2171,7 @@ class GraphRouter:
                 slots["imo"] = m.group(1)
             else:
                 # Avoid absorbing an incomplete question as the vessel name.
-                if any(p in ul for p in ("tell me", "what is", "what's", "summary", "summarize", "details", "information", "explain", "show ", "list ", "find ")):
+                if any(p in ul for p in get_incomplete_entity_question_markers()):
                     # Allow patterns like "vessel Stena Important"
                     m2 = re.search(r"\b(vessel|ship)\s+([A-Za-z].+)$", ui, flags=re.IGNORECASE)
                     if not m2:
@@ -2311,10 +2274,7 @@ class GraphRouter:
             return True
 
         # Proper-name style asks such as "Is Stena Superior ...".
-        proper_name_starts = (
-            "is ", "how is ", "tell me about ", "show ", "show me ", "give ", "what is ", "for "
-        )
-        if any(ul.startswith(p) for p in proper_name_starts):
+        if ul.startswith(get_proper_name_request_prefixes()):
             name_match = re.search(r"\b([A-Z][a-zA-Z0-9&'\-]+(?:\s+[A-Z][a-zA-Z0-9&'\-]+){1,3})\b", ui)
             if name_match and not re.search(r"\b(What|Which|Show|Give|Tell|Compare|For|Is|How)\b", name_match.group(1)):
                 return True
@@ -2572,35 +2532,31 @@ class GraphRouter:
         # Keep short text replies follow-up unless they clearly look like a fresh ask.
         is_value_like = bool(
             re.fullmatch(r"\d{1,5}", ui)
-            or (1 <= len(words) <= 3 and "?" not in ui and not any(w in ul for w in ("show", "list", "compare", "rank", "top", "tell", "what", "which")))
+            or (1 <= len(words) <= 3 and "?" not in ui and not any(w in ul for w in get_value_like_fresh_words()))
         )
         if is_value_like:
             return "followup"
 
         # Long imperative asks are usually fresh questions, even if they contain words
         # like "include/explain" that can appear in follow-ups.
-        if len(words) > 8 and ul.startswith(("show ", "show me", "list ", "find ", "compare ", "for ", "which ", "what ")):
+        if len(words) > 8 and ul.startswith(get_long_new_question_prefixes()):
             return "new_question"
 
-        followup_markers = (
-            "what about", "what else", "same", "also", "more", "details", "breakdown",
-            "explain", "why", "how", "include", "among",
-            "previously", "previous", "earlier", "before", "at that point", "from the start", "at the start",
-        )
-        has_coref = any(w in words for w in ("it", "its", "this", "that", "these", "those", "them", "they"))
+        followup_markers = get_generic_followup_markers()
+        has_coref = any(w in words for w in get_coreference_words())
         if any(m in ul for m in followup_markers) or has_coref:
             return "followup"
 
         # If we already have a result set, allow concise refinement operations as follow-ups.
-        if has_result_set and len(words) <= 10 and any(k in ul for k in ("top", "bottom", "highest", "lowest", "best", "worst", "better", "higher", "lower", "only", "just")):
+        if has_result_set and len(words) <= 10 and any(k in ul for k in get_result_set_refinement_extreme_terms()):
             return "followup"
 
         # Generic operation asks over an existing result set should remain follow-ups
         # even when phrased as longer natural sentences.
         if (
             has_result_set
-            and any(k in ul for k in ("show", "list", "give", "compare", "only", "just", "filter", "sort"))
-            and any(k in ul for k in ("port", "ports", "grade", "grades", "remark", "remarks", "pnl", "tce", "revenue", "expense", "commission", "offhire", "delay", "voyage"))
+            and any(k in ul for k in get_result_set_operation_verbs())
+            and any(k in ul for k in get_result_set_operation_fields())
             and len(words) <= 18
         ):
             return "followup"
@@ -2610,7 +2566,7 @@ class GraphRouter:
         if (
             session_family in ("voyage", "vessel", "port")
             and len(words) <= 7
-            and any(k in ul for k in ("port", "ports", "key ports", "remark", "remarks", "grade", "grades", "expense", "expenses", "revenue", "pnl", "tce", "commission", "offhire", "delay"))
+            and any(k in ul for k in get_short_contextual_followup_fields())
         ):
             return "followup"
 
@@ -2644,7 +2600,7 @@ class GraphRouter:
             return None
         if GraphRouter._looks_like_explicit_fresh_entity_request(ui):
             # Allow obvious thread references like "this voyage" / "this vessel" to continue.
-            if not any(p in ul for p in ("this voyage", "that voyage", "this vessel", "that vessel", "this ship", "that ship", "this one", "that one", "it ", " its", "it's")):
+            if not any(p in ul for p in get_direct_thread_reference_phrases()):
                 return None
 
         sess_slots = session_ctx.get("memory_slots") or session_ctx.get("slots") or {}
@@ -2672,53 +2628,17 @@ class GraphRouter:
         if family is None:
             return None
 
-        fleet_switch_markers = (
-            "across all", "across fleet", "fleet-wide", "all voyages", "all vessels",
-            "each vessel", "per vessel", "which vessels", "top vessels", "top 10",
-            "top 5", "show 10", "show top", "rank ", "ranking ",
-        )
-        if any(m in ul for m in fleet_switch_markers):
+        if any(m in ul for m in get_thread_override_fleet_switch_markers()):
             return None
 
-        rankingish = any(k in ul for k in (
-            "highest", "lowest", "best", "worst", "most", "least",
-            "compare", "vs", "versus", "variance", "between",
-        ))
-        explicit_entity_thread_markers = (
-            "this voyage", "that voyage", "this vessel", "that vessel", "this ship", "that ship",
-            "this one", "that one", "on this voyage", "for this voyage", "for this vessel",
-            "for that voyage", "for that vessel", "its ", "it's ", "same vessel", "same voyage",
-            "those remarks", "these remarks", "them", "they",
-        )
+        rankingish = any(k in ul for k in get_thread_override_ranking_terms())
+        explicit_entity_thread_markers = get_thread_override_explicit_entity_markers()
 
-        referential_markers = (
-            "this voyage", "that voyage", "this vessel", "that vessel", "this ship", "that ship",
-            "this one", "that one", "it", "its", "it's", "this trip",
-            "them", "they", "those", "these", "previously", "earlier", "before", "at that point",
-        )
-        vessel_keywords = (
-            "voyage history", "best voyage", "worst voyage", "how many voyages", "performing",
-            "overall", "trend", "best", "worst", "ports", "cargo grades", "cargo grade",
-            "remarks", "remark", "pnl", "revenue", "expense", "expenses", "tce",
-            "hire rate", "scrubber", "market type", "operational", "operating", "contract",
-            "owner", "duration", "cp date", "delivery", "passage type", "consumption",
-            "ballast", "laden", "ifo", "mgo", "account code", "tags",
-            "same vessel context", "still the same vessel", "same vessel",
-        )
-        voyage_keywords = (
-            "cargo", "cargo grade", "cargo grades", "shipper", "load port", "discharge port",
-            "ports", "route", "remarks", "remark", "charterer", "broker", "commission",
-            "cp date", "cp quantity", "demurrage", "laytime", "revenue lines", "expense items",
-            "expense", "expenses", "cost", "profitable", "pnl", "revenue", "tce",
-            "bunker", "cii", "co2", "sox", "nox", "projected", "compare to the fleet average",
-            "compare to fleet average", "fleet average",
-        )
-
-        keyword_hit = any(p in ul for p in referential_markers)
+        keyword_hit = any(p in ul for p in get_thread_override_referential_markers())
         if family == "voyage":
-            keyword_hit = keyword_hit or any(k in ul for k in voyage_keywords)
+            keyword_hit = keyword_hit or any(k in ul for k in get_thread_override_voyage_keywords())
         else:
-            keyword_hit = keyword_hit or any(k in ul for k in vessel_keywords)
+            keyword_hit = keyword_hit or any(k in ul for k in get_thread_override_vessel_keywords())
         if not keyword_hit:
             return None
 
@@ -2735,25 +2655,23 @@ class GraphRouter:
                 out_slots["vessel_name"] = sess_slots.get("vessel_name")
             if sess_slots.get("imo") not in (None, "", [], {}):
                 out_slots["imo"] = sess_slots.get("imo")
-            metadata_terms = (
-                "cargo", "grade", "shipper", "load port", "discharge port", "route", "remarks", "remark",
-                "charterer", "broker", "commission", "cp date", "cp quantity", "demurrage", "laytime",
-                "revenue lines", "expense items", "bunker", "cii", "co2", "sox", "nox", "projected",
-                "who added", "added by",
+            return (
+                "voyage.metadata"
+                if any(k in ul for k in get_thread_override_voyage_metadata_terms())
+                else "voyage.summary",
+                out_slots,
             )
-            return ("voyage.metadata" if any(k in ul for k in metadata_terms) else "voyage.summary", out_slots)
 
         for key in ("vessel_name", "imo"):
             val = sess_slots.get(key)
             if val not in (None, "", [], {}):
                 out_slots[key] = val
-        metadata_terms = (
-            "hire rate", "scrubber", "market type", "operational", "operating",
-            "contract", "owner", "duration", "cp date", "delivery",
-            "passage type", "consumption", "ballast", "laden", "ifo", "mgo",
-            "account code", "tags", "default", "defaults",
+        return (
+            "vessel.metadata"
+            if any(k in ul for k in get_thread_override_vessel_metadata_terms())
+            else "vessel.summary",
+            out_slots,
         )
-        return ("vessel.metadata" if any(k in ul for k in metadata_terms) else "vessel.summary", out_slots)
 
     @staticmethod
     def _parse_result_set_followup_action(*, user_input: str, session_ctx: Dict[str, Any]) -> Dict[str, Any] | None:
@@ -2780,7 +2698,7 @@ class GraphRouter:
             if "most frequently" in ul or "most often" in ul:
                 return None
             if re.search(r"\b(all|every)\s+voyages\b", ul) and not any(
-                p in ul for p in ("these voyages", "those voyages", "this list", "that list", "above list")
+                p in ul for p in get_corpus_guard_result_set_reference_phrases()
             ):
                 return None
 
@@ -2835,59 +2753,24 @@ class GraphRouter:
                     selected.append(key)
             return selected
 
-        singular_selection_markers = (
-            "best one",
-            "worst one",
-            "highest one",
-            "lowest one",
-            "top one",
-            "bottom one",
-            "first one",
-            "last one",
-            "best voyage",
-            "worst voyage",
-            "best vessel",
-            "worst vessel",
-            "for the best",
-            "for the worst",
-            "for the top",
-            "for the bottom",
-            "of the best",
-            "of the worst",
-            "on the best",
-            "on the worst",
-            "that one",
-            "this one",
-        )
+        def _first_matching_config_key(alias_map: dict[str, list[str]]) -> str | None:
+            for target, aliases in alias_map.items():
+                if any(alias in ul for alias in aliases):
+                    return target
+            return None
+
+        singular_selection_markers = get_singular_selection_markers()
         if (
-            any(k in ul for k in ("cargo grade", "cargo grades", "remarks", "remark", "key ports", "ports"))
-            and any(k in ul for k in ("best", "worst", "highest", "lowest", "most", "least", "top", "bottom"))
+            _first_matching_config_key(get_result_set_projection_field_terms()) is not None
+            and any(k in ul for k in get_result_set_metric_followup_exclusion_terms())
             and any(marker in ul for marker in singular_selection_markers)
         ):
-            field = "remarks"
-            if "remark" in ul:
-                field = "remarks"
-            elif "cargo" in ul or "grade" in ul:
-                field = "cargo_grades"
-            elif "port" in ul:
-                field = "key_ports"
-            metric = None
-            if "port call" in ul or "port calls" in ul:
-                metric = "port_calls"
-            elif "revenue" in ul:
-                metric = "revenue"
-            elif "expense" in ul or "cost" in ul:
-                metric = "total_expense"
-            elif "voyage count" in ul or re.search(r"\bcount\b", ul):
-                metric = "voyage_count"
-            elif "tce" in ul:
-                metric = "tce"
-            elif "pnl" in ul or "profit" in ul or "loss" in ul or "best voyage" in ul or "worst voyage" in ul:
-                metric = "pnl"
+            field = _first_matching_config_key(get_result_set_projection_field_terms()) or "remarks"
+            metric = _first_matching_config_key(get_result_set_extreme_metric_aliases())
             if metric is None:
                 preferred = str(rs_meta.get("primary_metric") or "").strip().lower()
                 metric = preferred if preferred and _has_field(preferred) else "pnl"
-            extreme = "low" if any(k in ul for k in ("worst", "lowest", "least", "bottom")) else "high"
+            extreme = "low" if any(k in ul for k in get_result_set_low_extreme_terms()) else "high"
             if field == "remarks" and not _has_field("remarks"):
                 return None
             if field == "cargo_grades" and not _has_field("cargo_grades"):
@@ -2897,102 +2780,59 @@ class GraphRouter:
             return {"action": "project_extreme_field", "field": field, "metric": metric, "extreme": extreme}
 
         if (
-            any(p in ul for p in ("that one", "this one", "that voyage", "this voyage", "that vessel", "this vessel", "top one", "first one", "bottom one", "last one"))
-            and any(k in ul for k in ("remark", "remarks", "cargo grade", "cargo grades", "key ports", "ports"))
+            any(p in ul for p in get_selected_row_reference_phrases())
+            and _first_matching_config_key(get_result_set_projection_field_terms()) is not None
         ):
             selector = "last_focus"
-            if any(p in ul for p in ("top one", "first one", "top result", "first result")):
+            if any(p in ul for p in get_first_selector_phrases()):
                 selector = "first"
-            elif any(p in ul for p in ("bottom one", "last one", "last result", "lowest one", "worst one")):
+            elif any(p in ul for p in get_last_selector_phrases()):
                 selector = "last"
-            field = "remarks"
-            if "cargo" in ul and "grade" in ul:
-                field = "cargo_grades"
-            elif "port" in ul:
-                field = "key_ports"
+            field = _first_matching_config_key(get_result_set_projection_field_terms()) or "remarks"
             return {"action": "project_selected_field", "field": field, "selector": selector}
 
-        if any(p in ul for p in ("that one", "this one", "that voyage", "this voyage", "that vessel", "this vessel", "top one", "first one", "bottom one", "last one")):
+        if any(p in ul for p in get_selected_row_reference_phrases()):
             selector = "last_focus"
-            if any(p in ul for p in ("top one", "first one", "top result", "first result")):
+            if any(p in ul for p in get_first_selector_phrases()):
                 selector = "first"
-            elif any(p in ul for p in ("bottom one", "last one", "last result", "lowest one", "worst one")):
+            elif any(p in ul for p in get_last_selector_phrases()):
                 selector = "last"
-            metric_alias = {
-                "revenue": "revenue",
-                "pnl": "pnl",
-                "profit": "pnl",
-                "tce": "tce",
-                "expense": "total_expense",
-                "cost": "total_expense",
-                "commission": "total_commission",
-                "voyage count": "voyage_count",
-                "count": "voyage_count",
-                "port count": "port_calls",
-                "port calls": "port_calls",
-                "vessel name": "vessel_name",
-                "port name": "port_name",
-            }
-            for raw_key, metric in metric_alias.items():
-                if raw_key in ul and any(k in ul for k in ("show", "what", "give", "just", "only", "and ")):
+            for metric, aliases in get_result_set_selected_metric_aliases().items():
+                if any(raw_key in ul for raw_key in aliases) and any(k in ul for k in get_result_set_selected_metric_triggers()):
                     return {"action": "project_selected_metric", "metric": metric, "selector": selector}
 
         if (
             len(ul.split()) <= 10
-            and any(k in ul for k in ("revenue", "pnl", "tce", "expense", "cost", "commission", "voyage count", "port count", "port calls", "vessel name"))
-            and any(k in ul for k in ("what about", "and ", "just", "only", "what ", "show "))
-            and not any(k in ul for k in ("top", "bottom", "highest", "lowest", "best", "worst", "most", "least"))
-            and not any(k in ul for k in ("for each", "of each", "every", "all ", "these", "them"))
+            and _first_matching_config_key(get_result_set_selected_metric_aliases()) is not None
+            and any(k in ul for k in get_result_set_selected_metric_context_terms())
+            and not any(k in ul for k in get_result_set_metric_followup_exclusion_terms())
+            and not any(k in ul for k in get_result_set_corpus_followup_exclusion_terms())
         ):
-            metric = "revenue"
-            if "avg revenue" in ul or "average revenue" in ul:
-                metric = "avg_revenue"
-            elif "avg pnl" in ul or "average pnl" in ul:
-                metric = "avg_pnl"
-            elif "avg tce" in ul or "average tce" in ul:
-                metric = "avg_tce"
-            elif "pnl" in ul or "profit" in ul:
-                metric = "pnl"
-            elif "pnl variance" in ul:
-                metric = "pnl_variance"
-            elif "tce variance" in ul:
-                metric = "tce_variance"
-            elif "variance" in ul:
+            metric = _first_matching_config_key(get_result_set_selected_metric_aliases()) or "revenue"
+            if "variance" in ul and metric not in ("pnl_variance", "tce_variance"):
                 preferred = str(rs_meta.get("primary_metric") or "").strip().lower()
                 metric = preferred if preferred else "variance_diff"
-            elif "tce" in ul:
-                metric = "tce"
-            elif "expense" in ul or "cost" in ul:
-                metric = "total_expense"
-            elif "commission" in ul:
-                metric = "total_commission"
-            elif "voyage count" in ul:
-                metric = "voyage_count"
-            elif "port count" in ul or "port calls" in ul:
-                metric = "port_calls"
-            elif "vessel name" in ul:
-                metric = "vessel_name"
             return {"action": "project_selected_metric", "metric": metric, "selector": "last_focus"}
 
         if (
             len(ul.split()) <= 6
-            and any(k in ul for k in ("remark", "remarks", "cargo grade", "cargo grades", "grade", "key ports", "ports"))
-            and any(k in ul for k in ("what about", "and ", "just", "only", "what ", "show "))
-            and not any(k in ul for k in ("top", "bottom", "highest", "lowest", "best", "worst", "most", "least"))
-            and not any(k in ul for k in ("for each", "of each", "every", "all ", "these", "them"))
+            and _first_matching_config_key(get_result_set_short_projection_field_terms()) is not None
+            and any(k in ul for k in get_result_set_selected_metric_context_terms())
+            and not any(k in ul for k in get_result_set_metric_followup_exclusion_terms())
+            and not any(k in ul for k in get_result_set_corpus_followup_exclusion_terms())
         ):
-            field = "remarks"
-            if "cargo" in ul or "grade" in ul:
-                field = "cargo_grades"
-            elif "port" in ul:
-                field = "key_ports"
+            field = _first_matching_config_key(get_result_set_short_projection_field_terms()) or "remarks"
             return {"action": "project_selected_field", "field": field, "selector": "last_focus"}
 
         inferred_fields = _infer_followup_fields()
         if (
             inferred_fields
-            and any(k in ul for k in ("show", "what about", "and ", "plus", "their", "those", "same", "for them"))
-            and not any(k in ul for k in ("top", "bottom", "highest", "lowest", "best", "worst", "most", "least", "variance", "ratio"))
+            and any(k in ul for k in get_result_set_list_fields_context_terms())
+            and not any(
+                k in ul
+                for k in get_result_set_metric_followup_exclusion_terms()
+                + get_result_set_list_fields_extra_exclusion_terms()
+            )
         ):
             return {"action": "list_fields", "fields": inferred_fields[:6]}
 
@@ -3437,12 +3277,9 @@ class GraphRouter:
 
         if intent_key == "ops.port_query" and not slots.get("port_name"):
             _ul = (state.get("user_input") or "").lower()
-            _is_fleet_port_aggregate = any(p in _ul for p in [
-                "most commonly visited", "most visited", "busiest port",
-                "busiest ports", "most frequent port", "all voyages",
-                "across all", "highest demurrage", "average demurrage",
-                "port frequency", "port count", "how many ports"
-            ])
+            _is_fleet_port_aggregate = any(
+                p in _ul for p in get_incomplete_entity_fleet_port_aggregate_markers()
+            )
             if _is_fleet_port_aggregate:
                 # Route to aggregate intent, not port lookup
                 intent_key = "ranking.ports"
@@ -3466,16 +3303,22 @@ class GraphRouter:
         if INTENT_REGISTRY.get(intent_key, {}).get("route") == "composite":
             missing = []
 
-        # Heuristic: treat "tell me about vessel" as missing vessel_name/imo.
+        # Heuristic: treat incomplete entity questions as missing their anchor.
         ui = (state.get("user_input") or "").lower()
         if intent_key == "vessel.summary" and not (slots.get("vessel_name") or slots.get("imo")):
-            if ("vessel" in ui or "ship" in ui) and any(p in ui for p in ("tell me about", "details", "information", "summary")):
+            topic_terms = get_incomplete_entity_topic_terms()
+            has_vessel_topic = any(
+                re.search(rf"\b{re.escape(term)}\b", ui)
+                for term in topic_terms.get("vessel", [])
+            )
+            if has_vessel_topic and any(p in ui for p in get_incomplete_entity_detail_markers()):
                 missing = ["vessel_name"]
 
         # Also treat extracted vessel_name="vessel"/"ship" as missing.
         if intent_key == "vessel.summary":
             vn = slots.get("vessel_name")
-            if isinstance(vn, str) and vn.strip().lower() in {"vessel", "ship", "the vessel", "a vessel"} and "vessel_name" not in missing:
+            placeholders = set(get_incomplete_entity_placeholder_slot_values().get("vessel_name", []))
+            if isinstance(vn, str) and vn.strip().lower() in placeholders and "vessel_name" not in missing:
                 missing = ["vessel_name"]
 
         state["missing_keys"] = missing
@@ -3591,6 +3434,9 @@ class GraphRouter:
         )
 
     def _suggest_ports(self, *, limit: int = 8) -> list[str]:
+        cached = self._get_cached_suggestions("ports", limit)
+        if cached is not None:
+            return [str(value) for value in cached[:limit]]
         sql = """
             SELECT p->>'port_name' AS port_name, COUNT(*) AS cnt
             FROM ops_voyage_summary ovs,
@@ -3608,11 +3454,15 @@ class GraphRouter:
             for r in rows or []:
                 if isinstance(r, dict) and r.get("port_name"):
                     out.append(str(r["port_name"]))
+            self._set_cached_suggestions("ports", out)
             return out[:limit]
         except Exception:
             return []
 
     def _suggest_vessels(self, *, limit: int = 8) -> list[str]:
+        cached = self._get_cached_suggestions("vessels", limit)
+        if cached is not None:
+            return [str(value) for value in cached[:limit]]
         sql = """
             SELECT vessel_name, COUNT(*) AS cnt
             FROM ops_voyage_summary
@@ -3627,11 +3477,15 @@ class GraphRouter:
             for r in rows or []:
                 if isinstance(r, dict) and r.get("vessel_name"):
                     out.append(str(r["vessel_name"]))
+            self._set_cached_suggestions("vessels", out)
             return out[:limit]
         except Exception:
             return []
 
     def _suggest_voyage_numbers(self, *, limit: int = 8) -> list[int]:
+        cached = self._get_cached_suggestions("voyage_numbers", limit)
+        if cached is not None:
+            return [int(value) for value in cached[:limit]]
         sql = """
             SELECT DISTINCT voyage_number
             FROM ops_voyage_summary
@@ -3648,9 +3502,26 @@ class GraphRouter:
                         out.append(int(r["voyage_number"]))
                     except Exception:
                         continue
+            self._set_cached_suggestions("voyage_numbers", out)
             return out[:limit]
         except Exception:
             return []
+
+    def _get_cached_suggestions(self, name: str, limit: int) -> list[Any] | None:
+        cached = self._suggestion_cache.get(name)
+        if not cached:
+            return None
+        expires_at, values = cached
+        if time.time() >= expires_at:
+            self._suggestion_cache.pop(name, None)
+            return None
+        return list(values[:limit])
+
+    def _set_cached_suggestions(self, name: str, values: list[Any]) -> None:
+        self._suggestion_cache[name] = (
+            time.time() + _SUGGESTION_CACHE_TTL_SECONDS,
+            list(values or []),
+        )
 
     # =========================================================
     # Planning Node
@@ -3712,8 +3583,7 @@ class GraphRouter:
             },
         )
 
-        # Debug
-        _dprint(f"\n🔍 PLAN CLASSIFICATION")
+        _dprint("\nPlan classification")
         _dprint(f"   Plan Type: {plan.plan_type}")
         _dprint(f"   Final Intent: {plan.intent_key}")
         _dprint(f"   Steps: {len(plan.steps)}")
@@ -3739,7 +3609,7 @@ class GraphRouter:
         user_input = state.get("user_input") or ""
         plan_type = str(state.get("plan_type") or (state.get("plan") or {}).get("plan_type") or "single").lower()
 
-        _dprint(f"\n▶️  SINGLE EXECUTION: {intent_key}")
+        _dprint(f"\nSingle execution: {intent_key}")
 
         def _registry_sql_from_result(res: Any) -> str | None:
             if not isinstance(res, dict):
@@ -3764,7 +3634,7 @@ class GraphRouter:
             rs = (session_context or {}).get("last_result_set") if isinstance(session_context, dict) else None
             rows = (rs or {}).get("rows") if isinstance(rs, dict) else None
             rows = rows if isinstance(rows, list) else []
-            # Thing 1 Phase 4A: optional in-memory refinement from structured follow-up (before action handlers).
+            # Optional in-memory refinement from structured follow-up before action handlers.
             si_fu = (session_context or {}).get("_structured_intent") if isinstance(session_context, dict) else None
             if isinstance(si_fu, dict) and si_fu.get("confidence") in ("high", "medium"):
                 scp = str(si_fu.get("scope") or "").strip().lower()
@@ -3859,7 +3729,7 @@ class GraphRouter:
 
             def _format_remarks_value(val: Any) -> str:
                 if val in (None, "", [], {}):
-                    return "No remarks recorded."
+                    return _result_set_text("no_remarks_recorded")
                 items = val if isinstance(val, list) else [val]
                 lines: list[str] = []
                 for item in items[:10]:
@@ -3889,7 +3759,7 @@ class GraphRouter:
                     line = " | ".join(parts).strip()
                     if line:
                         lines.append(f"- {line}")
-                return "\n".join(lines) if lines else "No remarks recorded."
+                return "\n".join(lines) if lines else _result_set_text("no_remarks_recorded")
 
             def _persist_result_set(new_rows: list[dict], *, primary_metric: str | None = None) -> None:
                 try:
@@ -3947,13 +3817,13 @@ class GraphRouter:
                 metric = str(metric or "").strip().lower()
                 if metric in ("vessel_name", "port_name"):
                     value = row.get(metric)
-                    return str(value).strip() if value not in (None, "", [], {}) else "Not available"
+                    return str(value).strip() if value not in (None, "", [], {}) else _result_set_text("not_available")
                 if metric == "port_calls":
                     value = self._result_row_metric_value(row, metric)
-                    return f"{int(value):,}" if value is not None else "Not available"
+                    return f"{int(value):,}" if value is not None else _result_set_text("not_available")
                 value = self._result_row_metric_value(row, metric)
                 if value is None:
-                    return "Not available"
+                    return _result_set_text("not_available")
                 return f"{value:,.2f}"
 
             def _selected_row(selector: str | None = None) -> dict | None:
@@ -4076,9 +3946,9 @@ class GraphRouter:
             # Per-row remarks projection from current result set.
             if action == "remarks_each":
                 if not rows:
-                    state["answer"] = "I don’t have a previous result set to read remarks from. Please run the base list query again."
+                    state["answer"] = _result_set_text("no_previous_result_set_read_remarks")
                     return state
-                lines = ["### Remarks for each voyage (from previous results)"]
+                lines = [_result_set_text("remarks_each_heading")]
                 for r in rows[:20]:
                     if not isinstance(r, dict):
                         continue
@@ -4094,7 +3964,7 @@ class GraphRouter:
                 field = str(slots.get("field") or "").strip()
                 filtered = [r for r in rows if isinstance(r, dict) and r.get(field) not in (None, "", [], {})]
                 if not filtered:
-                    state["answer"] = f"No rows in the previous result set had **{field}** populated."
+                    state["answer"] = _result_set_text("no_rows_field_populated", field=field)
                     return state
                 _persist_result_set(filtered)
                 _persist_focus(filtered[0])
@@ -4102,7 +3972,7 @@ class GraphRouter:
                 for r in filtered[:20]:
                     label = self._result_row_label(r)
                     val = r.get(field)
-                    preview = str(val).strip() if val not in (None, "", [], {}) else "Not available"
+                    preview = str(val).strip() if val not in (None, "", [], {}) else _result_set_text("not_available")
                     lines.append(f"- **{label}**: {preview}")
                 state["answer"] = "\n".join(lines)
                 return state
@@ -4111,14 +3981,14 @@ class GraphRouter:
                 field = str(slots.get("field") or "").strip()
                 chosen = _selected_row(str(slots.get("selector") or "last_focus"))
                 if not isinstance(chosen, dict):
-                    state["answer"] = "I couldn’t identify which row you meant from the previous result set."
+                    state["answer"] = _result_set_text("selected_row_not_identified")
                     return state
                 _persist_focus(chosen)
                 label = self._result_row_label(chosen)
                 if field == "remarks":
                     rem = chosen.get("remarks")
                     state["answer"] = (
-                        f"### Remarks for {label}\n"
+                        _result_set_text("remarks_for_label_heading", label=label) + "\n"
                         + _format_remarks_value(rem)
                     )
                     return state
@@ -4129,25 +3999,25 @@ class GraphRouter:
                         else chosen.get("most_common_grade")
                     )
                     state["answer"] = (
-                        f"### Cargo grades for {label}\n"
-                        + (", ".join(grades[:20]) if grades else "No cargo grades were available in the previous result set.")
+                        _result_set_text("cargo_grades_for_label_heading", label=label) + "\n"
+                        + (", ".join(grades[:20]) if grades else _result_set_text("no_cargo_grades_previous_result_set"))
                     )
                     return state
                 if field == "key_ports":
                     ports = _extract_ports(chosen.get("key_ports"))
                     state["answer"] = (
-                        f"### Key ports for {label}\n"
-                        + (", ".join(ports[:20]) if ports else "No key ports were available in the previous result set.")
+                        _result_set_text("key_ports_for_label_heading", label=label) + "\n"
+                        + (", ".join(ports[:20]) if ports else _result_set_text("no_key_ports_previous_result_set"))
                     )
                     return state
-                state["answer"] = f"I couldn’t project **{field}** from the previous result set."
+                state["answer"] = _result_set_text("cannot_project_field", field=field)
                 return state
 
             if action == "project_selected_metric":
                 metric = str(slots.get("metric") or "revenue").strip().lower()
                 chosen = _selected_row(str(slots.get("selector") or "last_focus"))
                 if not isinstance(chosen, dict):
-                    state["answer"] = "I couldn’t identify which row you meant from the previous result set."
+                    state["answer"] = _result_set_text("selected_row_not_identified")
                     return state
                 _persist_result_set(rows, primary_metric=metric)
                 _persist_focus(chosen)
@@ -4178,7 +4048,7 @@ class GraphRouter:
                 if field == "remarks":
                     rem = chosen.get("remarks")
                     state["answer"] = (
-                        f"### Remarks for {label}\n"
+                        _result_set_text("remarks_for_label_heading", label=label) + "\n"
                         + _format_remarks_value(rem)
                     )
                     return state
@@ -4189,33 +4059,33 @@ class GraphRouter:
                         else chosen.get("most_common_grade")
                     )
                     state["answer"] = (
-                        f"### Cargo grades for {label}\n"
-                        + (", ".join(grades[:20]) if grades else "No cargo grades were available in the previous result set.")
+                        _result_set_text("cargo_grades_for_label_heading", label=label) + "\n"
+                        + (", ".join(grades[:20]) if grades else _result_set_text("no_cargo_grades_previous_result_set"))
                     )
                     return state
                 if field == "key_ports":
                     ports = _extract_ports(chosen.get("key_ports"))
                     state["answer"] = (
-                        f"### Key ports for {label}\n"
-                        + (", ".join(ports[:20]) if ports else "No key ports were available in the previous result set.")
+                        _result_set_text("key_ports_for_label_heading", label=label) + "\n"
+                        + (", ".join(ports[:20]) if ports else _result_set_text("no_key_ports_previous_result_set"))
                     )
                     return state
-                state["answer"] = f"I couldn’t project **{field}** from the selected row in the previous result set."
+                state["answer"] = _result_set_text("cannot_project_selected_field", field=field)
                 return state
 
             # Per-row ports projection from current result set.
             if action == "list_ports":
                 if not rows:
-                    state["answer"] = "I don’t have a previous result set to list ports from. Please run the base query again."
+                    state["answer"] = _result_set_text("no_previous_result_set_list_ports")
                     return state
-                lines = ["### Key ports for current result set"]
+                lines = [_result_set_text("key_ports_current_result_set_heading")]
                 for r in rows[:20]:
                     if not isinstance(r, dict):
                         continue
                     vnum = r.get("voyage_number") or "N/A"
                     ports = _extract_ports(r.get("key_ports"))
                     if not ports:
-                        lines.append(f"- **Voyage {vnum}**: No key ports available.")
+                        lines.append(f"- **Voyage {vnum}**: {_result_set_text('no_key_ports_for_row')}")
                     else:
                         preview = ", ".join(ports[:12])
                         suffix = " (+more)" if len(ports) > 12 else ""
@@ -4225,16 +4095,16 @@ class GraphRouter:
 
             if action == "list_cargo_grades":
                 if not rows:
-                    state["answer"] = "I don’t have a previous result set to list cargo grades from. Please run the base query again."
+                    state["answer"] = _result_set_text("no_previous_result_set_list_cargo_grades")
                     return state
-                lines = ["### Cargo grades for current result set"]
+                lines = [_result_set_text("cargo_grades_current_result_set_heading")]
                 for r in rows[:20]:
                     if not isinstance(r, dict):
                         continue
                     vnum = r.get("voyage_number") or "N/A"
                     grades = _extract_grades(r.get("cargo_grades"))
                     if not grades:
-                        lines.append(f"- **Voyage {vnum}**: No cargo grades available.")
+                        lines.append(f"- **Voyage {vnum}**: {_result_set_text('no_cargo_grades_for_row')}")
                     else:
                         preview = ", ".join(grades[:12])
                         suffix = " (+more)" if len(grades) > 12 else ""
@@ -4263,9 +4133,9 @@ class GraphRouter:
                         if f == "passage_types" and isinstance(v, list):
                             v = ", ".join(str(x) for x in v if x not in (None, ""))
                         if isinstance(v, list):
-                            v = ", ".join(str(x) for x in v[:8]) if v else "Not available"
+                            v = ", ".join(str(x) for x in v[:8]) if v else _result_set_text("not_available")
                         if v in (None, "", [], {}):
-                            v = "Not available"
+                            v = _result_set_text("not_available")
                         vals.append(f"{f.replace('_', ' ')} {v}")
                     lines.append(f"- **{label}** - " + "; ".join(vals))
                 state["answer"] = "\n".join(lines)
@@ -4623,21 +4493,7 @@ class GraphRouter:
                 "agent": "mongo",
                 "description": "Fetch remarks, ports, cargo, fixture from MongoDB",
             })
-            projection = cfg.get("mongo_projection") or {
-                "_id": 0,
-                "voyageId": 1,
-                "voyageNumber": 1,
-                "vesselName": 1,
-                "fixtures": 1,
-                "legs": 1,
-                "revenues": 1,
-                "expenses": 1,
-                "bunkers": 1,
-                "emissions": 1,
-                "remarks": 1,
-                "projected_results": 1,
-                "startDateUtc": 1,
-            }
+            projection = cfg.get("mongo_projection") or get_mongo_projection("voyage_metadata_context")
             doc: Dict[str, Any] = {}
             mongo_docs: list[Dict[str, Any]] = []
             mongo_filter = None
@@ -4664,7 +4520,9 @@ class GraphRouter:
                         iv = int(vnum)
                         mongo_filter = {"voyageNumber": str(iv)}
                         batch = self.mongo_agent.adapter.list_voyages_by_number(
-                            iv, projection=projection, limit=40
+                            iv,
+                            projection=projection,
+                            limit=get_mongo_limit("voyage_metadata_context_batch", 40),
                         )
                         merge_sl = {**slots}
                         if selected_fin and not explicit_voyage_only:
@@ -4766,14 +4624,10 @@ class GraphRouter:
                 if mongo_down:
                     unavailable_parts.append("MongoDB on `localhost:27017`")
                 backend_list = " and ".join(unavailable_parts) if unavailable_parts else "the data backends"
-                answer = (
-                    "### Summary\n"
-                    f"- I can’t retrieve voyage details for **{vn}** right now because {backend_list} is unavailable.\n\n"
-                    "### What this means\n"
-                    "- The query routing is working and the voyage reference is being recognized.\n"
-                    "- The live data sources are not reachable, so the app has no finance or voyage-document rows to summarize.\n\n"
-                    "### Next step\n"
-                    "- Start the local database services, then retry the same question.\n"
+                answer = _router_fallback(
+                    "backend_unavailable_with_list",
+                    voyage_ref=vn,
+                    backend_list=backend_list,
                 )
                 mongo_safe = {"mode": "mongo_metadata", "ok": False, "rows": mongo_docs}
                 merged = {
@@ -4801,13 +4655,7 @@ class GraphRouter:
                 state["data"]["artifacts"] = merged.get("artifacts") or {"intent_key": intent_key, "slots": slots}
                 return state
 
-            system_prompt = """You are a voyage data analyst.
-You have been given data from TWO sources:
-1. FINANCIAL DATA (ACTUAL settled figures, use these for PnL/revenue/expense/TCE)
-2. METADATA (use these for ports, cargo, remarks, fixture, bunkers)
-Never mix the two sources. Always prefer FINANCIAL DATA for any financial figure.
-Write a clean business answer for end users. Do NOT mention internal source names, system/debug wording,
-or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dataset shows'."""
+            system_prompt = get_graph_router_multi_voyage_answer_system_prompt()
             user_prompt = (
                 "Context JSON:\n"
                 + json.dumps(
@@ -4827,7 +4675,7 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                 return_string=True,
             )
             if not answer:
-                answer = "### Summary\n- I found the voyage financial and operational details, but could not format the final response right now."
+                answer = _router_fallback("multi_voyage_formatting_failed")
 
             mongo_safe = {
                 "mode": "mongo_metadata",
@@ -5138,15 +4986,7 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
             )
             if not finance_ok and not ops_ok and not mongo_ok:
                 vn = voyage_number or slots.get("voyage_numbers") or voyage_id or "this voyage"
-                answer = (
-                    "### Summary\n"
-                    f"- I can’t retrieve voyage details for **{vn}** right now because the data backends are unavailable.\n\n"
-                    "### What’s needed to answer\n"
-                    "- **Postgres** (finance/ops): `localhost:5432`\n"
-                    "- **MongoDB** (remarks/fixtures): `localhost:27017`\n\n"
-                    "### Next step\n"
-                    "- Start the databases (or update `POSTGRES_DSN` / `MONGO_URI`), then ask again.\n"
-                )
+                answer = _router_fallback("backend_unavailable_generic", voyage_ref=vn)
                 state["merged"] = {"finance": finance_safe, "ops": ops_safe, "mongo": {}, "artifacts": {"intent_key": intent_key, "slots": slots}}
                 state["answer"] = answer
                 state["slots"] = slots
@@ -5168,7 +5008,7 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                     "ok": True,
                     "collection": "voyages",
                     "filter": {"voyageId": str(vid)} if vid else ({"voyageNumber": str(vnum)} if vnum else {}),
-                    "projection": {"_id": 0, "voyageId": 1, "voyageNumber": 1, "remarks": 1, "fixtures": 1},
+                    "projection": get_mongo_projection("single_path_mongo_payload"),
                     "limit": 1,
                     "rows": [
                         {
@@ -5192,8 +5032,7 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                 "dynamic_sql_agents": ["finance", "ops"] if isinstance(finance_safe, dict) and finance_safe.get("mode") == "dynamic_sql" else [],
             }
 
-            # Ensure single-path outputs also populate state["data"] so validators/debugging
-            # (e.g., scripts/C.py MONGO DEBUG) reflect what was actually fetched.
+            # Keep state["data"] aligned with the response payload for validators.
             state["data"]["finance"] = finance_safe
             state["data"]["ops"] = ops_safe
             state["data"]["mongo"] = mongo_llm_like
@@ -5233,14 +5072,11 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                     preview = ", ".join(vessel_labels[:5]) if vessel_labels else "N/A"
                     extra = (len(vessel_labels) - 5) if vessel_labels else 0
                     suffix = f" (+{extra} more)" if extra > 0 else ""
-                    answer = (
-                        "### Summary\n"
-                        f"- I found finance rows for voyage number **{vn}**, but they map to different vessel identities than Mongo's canonical voyage record.\n"
-                        "- I did not combine them into a single-voyage financial summary because that would be misleading.\n\n"
-                        "### Finance vessel candidates\n"
-                        f"- {preview}{suffix}\n\n"
-                        "### Next step\n"
-                        "- Query by voyage_id (or specify vessel name/IMO) to get one unambiguous financial summary.\n"
+                    answer = _router_fallback(
+                        "finance_identity_mismatch",
+                        voyage_ref=vn,
+                        candidate_preview=preview,
+                        candidate_suffix=suffix,
                     )
                     state["merged"] = merged
                     state["answer"] = answer
@@ -5252,14 +5088,10 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                 remarks_count = 0
                 if isinstance(mongo_safe, dict) and isinstance(mongo_safe.get("remarks"), list):
                     remarks_count = len(mongo_safe.get("remarks") or [])
-                answer = (
-                    "### Summary\n"
-                    f"- I could not find finance records in Postgres for voyage **{vn}**.\n"
-                    "- I will not infer financial KPIs from other voyages.\n\n"
-                    "### Available context\n"
-                    f"- Mongo voyage context is available ({remarks_count} remarks).\n\n"
-                    "### Next step\n"
-                    "- Verify this voyage exists in `finance_voyage_kpi` / `ops_voyage_summary` and retry.\n"
+                answer = _router_fallback(
+                    "missing_finance_records",
+                    voyage_ref=vn,
+                    remarks_count=remarks_count,
                 )
                 state["merged"] = merged
                 state["answer"] = answer
@@ -5285,7 +5117,7 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                     )
             except Exception as e:
                 _dprint(f"⚠️  LLM generation failed: {e}")
-                answer = f"Error generating summary: {e}"
+                answer = _router_fallback("llm_summary_error", error=e)
 
             # Populate state so it naturally bypasses the rest via routing
             state["merged"] = merged
@@ -5634,11 +5466,7 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
             shown = filtered[:limit]
 
             if not rows:
-                answer = (
-                    "### Summary\n"
-                    "- No vessel metadata was available from MongoDB.\n"
-                    "- These queries require vessel-level metadata from the `vessels` collection.\n"
-                )
+                answer = _router_fallback("vessel_metadata_empty")
             elif wants_count:
                 if wants_operating:
                     answer = f"There are **{len(filtered)}** vessels currently operating."
@@ -5929,8 +5757,8 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                     try:
                         batch = self.mongo_agent.adapter.list_voyages_by_number(
                             vnum,
-                            projection={"_id": 0, "voyageNumber": 1, "voyageId": 1, "vesselName": 1, "vesselImo": 1},
-                            limit=40,
+                            projection=get_mongo_projection("voyage_identity"),
+                            limit=get_mongo_limit("voyage_identity_batch", 40),
                         )
                     except Exception:
                         batch = []
@@ -5968,7 +5796,7 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                             "collection": "voyages",
                             "filter": {"voyageNumber": {"$in": voyage_filters}},
                             "projection": self._mongo_projection_for_trace(
-                                {"_id": 0, "voyageNumber": 1, "voyageId": 1, "vesselName": 1, "vesselImo": 1}
+                                get_mongo_projection("voyage_identity")
                             ),
                             "sort": None,
                             "limit": len(voyage_filters),
@@ -6040,11 +5868,7 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
             )
 
             if not records:
-                answer = (
-                    "### Summary\n"
-                    "- No metadata available for the requested vessel/voyage.\n"
-                    "- Try with vessel name, IMO, or a specific voyage number.\n"
-                )
+                answer = _router_fallback("voyage_or_vessel_metadata_empty")
             elif len(records) == 1:
                 rec = records[0]
                 doc = rec.get("doc") if isinstance(rec.get("doc"), dict) else {}
@@ -6397,24 +6221,7 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
         # Voyage metadata: Mongo-only deterministic summary
         # =========================================================
         if intent_key == "voyage.metadata":
-            projection = cfg.get("mongo_projection") or {
-                "voyageId": 1,
-                "voyageNumber": 1,
-                "vesselName": 1,
-                "tags": 1,
-                "url": 1,
-                "fixtures": 1,
-                "legs": 1,
-                "revenues": 1,
-                "expenses": 1,
-                "bunkers": 1,
-                "emissions": 1,
-                "remarks": 1,
-                "projected_results": 1,
-                "startDateUtc": 1,
-                "extracted_at": 1,
-                "_id": 0,
-            }
+            projection = cfg.get("mongo_projection") or get_mongo_projection("voyage_metadata_detail")
             records: list[Dict[str, Any]] = []
             mongo_rows: list[Dict[str, Any]] = []
             trace_queries: list[Dict[str, Any]] = []
@@ -6467,7 +6274,9 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
             for vnum in unique_vnums:
                 try:
                     batch = self.mongo_agent.adapter.list_voyages_by_number(
-                        vnum, projection=projection, limit=40
+                        vnum,
+                        projection=projection,
+                        limit=get_mongo_limit("voyage_metadata_detail_batch", 40),
                     )
                 except Exception:
                     batch = []
@@ -6490,11 +6299,7 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
             records = deduped
 
             if not records:
-                answer = (
-                    "### Summary\n"
-                    "- No voyage metadata found for the requested voyage.\n"
-                    "- Try with a specific voyage number.\n"
-                )
+                answer = _router_fallback("voyage_metadata_empty")
             else:
                 if len(records) == 1:
                     sections = select_voyage_sections(user_input, records[0], session_context)
@@ -6504,15 +6309,7 @@ or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dat
                     }
 
                 context_json = json.dumps(sections, default=str, indent=2)
-                system_prompt = """You are a voyage data analyst.
-Answer the user's question using ONLY the data provided in the JSON context below.
-Format money fields (revenue/expense/pnl/tce/commission/freight/demurrage) with $ and commas.
-Do NOT use currency formatting for non-monetary metrics (CO2, AER, EEOI, percentages, counts, speeds).
-Format dates as YYYY-MM-DD.
-If the context includes remarks, never print raw Python dict strings or JSON arrays.
-Format remarks as clean bullets like `YYYY-MM-DD | added by | text`.
-If the user asks who added remarks, list the distinct `modifiedByFull` names from the provided remarks.
-If a value is null, say "not recorded". Never invent values."""
+                system_prompt = get_graph_router_voyage_metadata_answer_system_prompt()
                 user_prompt = f"""Voyage Data:
 {context_json}
 
@@ -6527,7 +6324,7 @@ Question: {user_input}"""
                 except Exception:
                     answer = ""
                 if not answer:
-                    answer = "### Summary\n- Voyage metadata is available but I could not generate a formatted response right now."
+                    answer = _router_fallback("voyage_metadata_formatting_failed")
 
             mongo_safe = {"mode": "mongo_metadata", "ok": True, "rows": mongo_rows}
             current_trace = []
@@ -6921,7 +6718,7 @@ Question: {user_input}"""
 
         op = re.sub(r'([a-z])([A-Z])', r'\1_\2', op).lower()
 
-        _dprint(f"\n▶️  COMPOSITE STEP {idx + 1}/{len(steps)}: {agent}.{op}")
+        _dprint(f"\nComposite step {idx + 1}/{len(steps)}: {agent}.{op}")
 
         self._trace(
             state,
@@ -9032,7 +8829,7 @@ Question: {user_input}"""
     @staticmethod
     def _fallback_tabular_answer(*, question: str, intent_key: str, rows: list[Dict[str, Any]]) -> str:
         if not isinstance(rows, list) or not rows:
-            return "Not available in dataset."
+            return get_router_fallback_template("no_data_available")
 
         ql = (question or "").lower()
         top = rows[:10]
@@ -9722,9 +9519,29 @@ Question: {user_input}"""
 
     def handle(self, *, session_id: str, user_input: str) -> Dict[str, Any]:
         """Main entry point for query handling."""
-        out: GraphState = self.graph.invoke(
-            {"session_id": session_id, "user_input": user_input, "raw_user_input": user_input}
+        start = time.time()
+        role = str(session_id or "").split(":")[0] if ":" in str(session_id or "") else "unknown"
+        query_preview = " ".join(str(user_input or "").split())[:90]
+        logger.info(
+            "QUERY_IN | session=%s | role=%s | query_preview=%s | query_chars=%s",
+            session_id,
+            role,
+            query_preview,
+            len(user_input or ""),
         )
+        try:
+            out: GraphState = self.graph.invoke(
+                {"session_id": session_id, "user_input": user_input, "raw_user_input": user_input}
+            )
+        except Exception as exc:
+            logger.error(
+                "QUERY_ERROR | session=%s | role=%s | latency=%ss | error=%s",
+                session_id,
+                role,
+                round(time.time() - start, 3),
+                str(exc)[:200],
+            )
+            raise
 
         trace = []
         artifacts = out.get("artifacts") or {}
@@ -9732,6 +9549,13 @@ Question: {user_input}"""
             trace = artifacts.get("trace") or []
 
         if out.get("clarification"):
+            logger.info(
+                "QUERY_DONE | session=%s | role=%s | intent=%s | clarification=true | latency=%ss",
+                session_id,
+                role,
+                out.get("intent_key"),
+                round(time.time() - start, 3),
+            )
             return {
                 "intent_key": out.get("intent_key"),
                 "slots": out.get("slots") or {},
@@ -9741,6 +9565,20 @@ Question: {user_input}"""
             }
 
         merged = out.get("merged") or {}
+        agents = merged.get("dynamic_sql_agents", [])
+        logger.info(
+            "ROUTING | session=%s | intent=%s | agents=%s",
+            session_id,
+            out.get("intent_key"),
+            agents,
+        )
+        logger.info(
+            "QUERY_DONE | session=%s | role=%s | intent=%s | latency=%ss",
+            session_id,
+            role,
+            out.get("intent_key"),
+            round(time.time() - start, 3),
+        )
 
         return {
             "intent_key": out.get("intent_key"),

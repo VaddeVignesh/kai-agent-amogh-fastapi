@@ -4,6 +4,7 @@ import os
 import json
 import time
 import uuid
+import datetime
 from decimal import Decimal
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -131,6 +132,11 @@ class RedisStore:
        )
        # Fallback: if Redis is down, keep sessions in-memory so the chatbot can still run.
        self._fallback_sessions: Dict[str, Dict[str, Any]] = {}
+       self._fallback_idem: Dict[str, tuple[float, Dict[str, Any]]] = {}
+       self._fallback_query_counts: Dict[str, int] = {}
+       self._fallback_response_times: list[float] = []
+       self._fallback_audit_events: list[Dict[str, Any]] = []
+       self._fallback_execution_history: list[Dict[str, Any]] = []
        self._redis_available: Optional[bool] = None
 
    def _default_session(self) -> Dict[str, Any]:
@@ -280,6 +286,12 @@ class RedisStore:
        if sid in self._fallback_sessions:
            self._fallback_sessions.pop(sid, None)
            deleted_keys.append(self._session_key(sid) + " (fallback)")
+       if include_idem:
+           prefix = f"idem:{sid}:"
+           for key in list(self._fallback_idem.keys()):
+               if key.startswith(prefix):
+                   self._fallback_idem.pop(key, None)
+                   deleted_keys.append(key + " (fallback)")
 
        if self._redis_disabled() or self._redis_available is False:
            return {"ok": True, "deleted": len(deleted_keys), "deleted_keys": deleted_keys}
@@ -316,14 +328,347 @@ class RedisStore:
    def _idem_key(self, session_id: str, request_id: str) -> str:
        return f"idem:{session_id}:{request_id}"
    def idem_get(self, session_id: str, request_id: str) -> Optional[Dict[str, Any]]:
-       raw = self.client.get(self._idem_key(session_id, request_id))
-       return json.loads(raw) if raw else None
+       key = self._idem_key(session_id, request_id)
+       raw = self._safe_get(key)
+       if raw:
+           try:
+               cached = json.loads(raw)
+               return cached if isinstance(cached, dict) else None
+           except Exception:
+               return None
+       fallback = self._fallback_idem.get(key)
+       if not fallback:
+           return None
+       expires_at, cached = fallback
+       if expires_at <= time.time():
+           self._fallback_idem.pop(key, None)
+           return None
+       return dict(cached)
    def idem_set(self, session_id: str, request_id: str, response: Dict[str, Any]) -> None:
-       self.client.setex(
-           self._idem_key(session_id, request_id),
-           self.cfg.idem_ttl_sec,
-           json.dumps(response),
+       key = self._idem_key(session_id, request_id)
+       payload = json.dumps(_json_safe(response))
+       ok = self._safe_setex(key, self.cfg.idem_ttl_sec, payload)
+       if not ok:
+           self._fallback_idem[key] = (time.time() + self.cfg.idem_ttl_sec, dict(response))
+   # =========================================================
+   # Admin Metrics
+   # =========================================================
+   def record_query_metrics(self, elapsed_sec: float) -> None:
+       today = datetime.date.today().isoformat()
+       if self._redis_disabled() or self._redis_available is False:
+           self._fallback_query_counts[today] = self._fallback_query_counts.get(today, 0) + 1
+           self._fallback_response_times = [float(elapsed_sec), *self._fallback_response_times][:100]
+           return
+       try:
+           query_key = f"metrics:queries:{today}"
+           self.client.incr(query_key)
+           self.client.expire(query_key, 86400)
+           self.client.lpush("metrics:response_times", round(float(elapsed_sec), 3))
+           self.client.ltrim("metrics:response_times", 0, 99)
+           self._redis_available = True
+       except redis.exceptions.RedisError:
+           self._redis_available = False
+           self._fallback_query_counts[today] = self._fallback_query_counts.get(today, 0) + 1
+           self._fallback_response_times = [float(elapsed_sec), *self._fallback_response_times][:100]
+
+   def _user_query_key(self, today: str, role: str, username: str) -> str:
+       return f"metrics:user_queries:{today}:{role}:{username}"
+
+   def record_user_query(self, session_id: str) -> None:
+       parts = str(session_id or "").split(":")
+       if len(parts) < 3:
+           return
+       role, username = parts[0], parts[1]
+       today = datetime.date.today().isoformat()
+       key = self._user_query_key(today, role, username)
+       if self._redis_disabled() or self._redis_available is False:
+           self._fallback_query_counts[key] = self._fallback_query_counts.get(key, 0) + 1
+           return
+       try:
+           self.client.incr(key)
+           self.client.expire(key, 86400)
+           self._redis_available = True
+       except redis.exceptions.RedisError:
+           self._redis_available = False
+           self._fallback_query_counts[key] = self._fallback_query_counts.get(key, 0) + 1
+
+   def get_admin_metrics(self, *, total_users: Optional[int] = None) -> Dict[str, Any]:
+       today = datetime.date.today().isoformat()
+       session_keys: list[str] = []
+
+       # Include fallback sessions so tests/local degraded mode still show useful metrics.
+       session_keys.extend(self._session_key(sid) for sid in self._fallback_sessions.keys())
+
+       queries_today = self._fallback_query_counts.get(today, 0)
+       response_times = list(self._fallback_response_times)
+
+       if not self._redis_disabled() and self._redis_available is not False:
+           try:
+               session_keys.extend(str(k) for k in self.client.scan_iter(match="session:*", count=200))
+               raw_queries = self.client.get(f"metrics:queries:{today}")
+               queries_today = int(raw_queries or 0)
+               response_times = [float(t) for t in self.client.lrange("metrics:response_times", 0, -1)]
+               self._redis_available = True
+           except (redis.exceptions.RedisError, ValueError, TypeError):
+               self._redis_available = False
+
+       unique_users: set[tuple[str, str]] = set()
+       for key in session_keys:
+           # Expected key shape: session:{role}:{username}:{uuid}
+           parts = str(key).split(":")
+           if len(parts) >= 4 and parts[0] == "session":
+               unique_users.add((parts[1], parts[2]))
+
+       avg_response = round(sum(response_times) / len(response_times), 2) if response_times else 0.0
+       return {
+           "total_users": int(total_users) if total_users is not None else len(unique_users),
+           "active_sessions": len(set(session_keys)),
+           "queries_today": queries_today,
+           "avg_response_time": avg_response,
+       }
+
+   def get_admin_users(self, configured_users: Dict[str, Dict[str, Any]]) -> list[Dict[str, Any]]:
+       today = datetime.date.today().isoformat()
+       sessions_by_user: Dict[tuple[str, str], list[Dict[str, Any]]] = {}
+       query_counts: Dict[tuple[str, str], int] = {}
+
+       def _append_session(session_id: str, session: Dict[str, Any]) -> None:
+           parts = str(session_id or "").split(":")
+           if len(parts) < 3:
+               return
+           role, username = parts[0], parts[1]
+           sessions_by_user.setdefault((role, username), []).append(session)
+
+       for sid, session in self._fallback_sessions.items():
+           if isinstance(session, dict):
+               _append_session(sid, session)
+
+       for key, count in self._fallback_query_counts.items():
+           prefix = f"metrics:user_queries:{today}:"
+           if key.startswith(prefix):
+               rest = key[len(prefix):].split(":")
+               if len(rest) >= 2:
+                   query_counts[(rest[0], rest[1])] = int(count)
+
+       if not self._redis_disabled() and self._redis_available is not False:
+           try:
+               for raw_key in self.client.scan_iter(match="session:*", count=200):
+                   key = str(raw_key)
+                   session_id = key[len("session:"):] if key.startswith("session:") else key
+                   raw = self.client.get(key)
+                   try:
+                       session = json.loads(raw) if raw else {}
+                   except Exception:
+                       session = {}
+                   if isinstance(session, dict):
+                       _append_session(session_id, session)
+
+               for raw_key in self.client.scan_iter(match=f"metrics:user_queries:{today}:*", count=200):
+                   key = str(raw_key)
+                   rest = key[len(f"metrics:user_queries:{today}:"):].split(":")
+                   if len(rest) >= 2:
+                       try:
+                           query_counts[(rest[0], rest[1])] = int(self.client.get(key) or 0)
+                       except (ValueError, TypeError):
+                           query_counts[(rest[0], rest[1])] = 0
+               self._redis_available = True
+           except redis.exceptions.RedisError:
+               self._redis_available = False
+
+       rows: list[Dict[str, Any]] = []
+       now = time.time()
+       for username, cfg in sorted(configured_users.items()):
+           role = str((cfg or {}).get("role") or "")
+           user_sessions = sessions_by_user.get((role, username), [])
+           active_sessions = len(user_sessions)
+           last_ts = 0.0
+           for session in user_sessions:
+               for key in ("last_updated_ts", "login_ts", "updated_at"):
+                   value = session.get(key)
+                   try:
+                       last_ts = max(last_ts, float(value))
+                   except (TypeError, ValueError):
+                       pass
+
+           rows.append({
+               "username": username,
+               "role": role,
+               "status": "Active" if active_sessions else "Offline",
+               "active_sessions": active_sessions,
+               "last_active": self._format_relative_time(now - last_ts) if last_ts else "Never",
+               "queries_today": query_counts.get((role, username), 0),
+           })
+
+       rows.sort(key=lambda row: (row["status"] != "Active", row["role"], row["username"]))
+       return rows
+
+   @staticmethod
+   def _format_relative_time(age_seconds: float) -> str:
+       if age_seconds < 0:
+           age_seconds = 0
+       if age_seconds < 60:
+           return "just now"
+       minutes = int(age_seconds // 60)
+       if minutes < 60:
+           return f"{minutes}m ago"
+       hours = int(minutes // 60)
+       if hours < 24:
+           return f"{hours}h ago"
+       days = int(hours // 24)
+       return f"{days}d ago"
+
+   def _audit_log_key(self) -> str:
+       return "admin:audit_log"
+
+   def _actor_from_session_id(self, session_id: str) -> tuple[str, str]:
+       parts = str(session_id or "").split(":")
+       if len(parts) >= 3:
+           return parts[1], parts[0]
+       return "unknown", "unknown"
+
+   def _query_preview(self, query: str, limit: int = 90) -> str:
+       text = " ".join(str(query or "").split())
+       if len(text) <= limit:
+           return text
+       return text[: limit - 3].rstrip() + "..."
+
+   def record_audit_event(
+       self,
+       *,
+       actor: str,
+       role: str,
+       action: str,
+       status: str = "completed",
+       session_id: str = "",
+       query: str = "",
+       intent_key: Optional[str] = None,
+       duration_seconds: Optional[float] = None,
+   ) -> None:
+       event = {
+           "timestamp": time.time(),
+           "actor": str(actor or "unknown"),
+           "role": str(role or "unknown"),
+           "action": str(action or "activity"),
+           "status": str(status or "completed"),
+           "session_id": str(session_id or ""),
+       }
+       if query:
+           event["query_preview"] = self._query_preview(query)
+           event["query_length"] = len(str(query))
+       if intent_key:
+           event["intent_key"] = str(intent_key)
+       if duration_seconds is not None:
+           event["duration_seconds"] = round(float(duration_seconds), 2)
+
+       if self._redis_disabled() or self._redis_available is False:
+           self._fallback_audit_events.insert(0, event)
+           self._fallback_audit_events = self._fallback_audit_events[:50]
+           return
+       try:
+           key = self._audit_log_key()
+           self.client.lpush(key, json.dumps(_json_safe(event)))
+           self.client.ltrim(key, 0, 49)
+           self._redis_available = True
+       except redis.exceptions.RedisError:
+           self._redis_available = False
+           self._fallback_audit_events.insert(0, event)
+           self._fallback_audit_events = self._fallback_audit_events[:50]
+
+   def record_login_audit(self, username: str, role: str, session_id: str) -> None:
+       self.record_audit_event(
+           actor=username,
+           role=role,
+           action="login",
+           session_id=session_id,
        )
+
+   def record_logout_audit(self, session_id: str) -> None:
+       actor, role = self._actor_from_session_id(session_id)
+       self.record_audit_event(
+           actor=actor,
+           role=role,
+           action="logout",
+           session_id=session_id,
+       )
+
+   def record_query_audit(
+       self,
+       *,
+       session_id: str,
+       query: str,
+       intent_key: Optional[str],
+       duration_seconds: float,
+       status: str = "completed",
+   ) -> None:
+       actor, role = self._actor_from_session_id(session_id)
+       self.record_audit_event(
+           actor=actor,
+           role=role,
+           action="query",
+           status=status,
+           session_id=session_id,
+           query=query,
+           intent_key=intent_key,
+           duration_seconds=duration_seconds,
+       )
+
+   def get_admin_audit_log(self, limit: int = 10) -> list[Dict[str, Any]]:
+       events = list(self._fallback_audit_events)
+       if not self._redis_disabled() and self._redis_available is not False:
+           try:
+               raw_events = self.client.lrange(self._audit_log_key(), 0, max(0, limit - 1))
+               events = []
+               for raw in raw_events:
+                   try:
+                       event = json.loads(raw)
+                   except Exception:
+                       continue
+                   if isinstance(event, dict):
+                       events.append(event)
+               self._redis_available = True
+           except redis.exceptions.RedisError:
+               self._redis_available = False
+
+       events = sorted(events, key=lambda event: float(event.get("timestamp") or 0), reverse=True)
+       return events[:limit]
+
+   def _execution_history_key(self) -> str:
+       return "execution:history"
+
+   def record_execution_history(self, record: Dict[str, Any]) -> None:
+       clean_record = _json_safe(dict(record or {}))
+       if self._redis_disabled() or self._redis_available is False:
+           self._fallback_execution_history.insert(0, clean_record)
+           self._fallback_execution_history = self._fallback_execution_history[:100]
+           return
+       try:
+           key = self._execution_history_key()
+           self.client.lpush(key, json.dumps(clean_record))
+           self.client.ltrim(key, 0, 99)
+           self._redis_available = True
+       except redis.exceptions.RedisError:
+           self._redis_available = False
+           self._fallback_execution_history.insert(0, clean_record)
+           self._fallback_execution_history = self._fallback_execution_history[:100]
+
+   def get_execution_history(self, limit: int = 100) -> list[Dict[str, Any]]:
+       events = list(self._fallback_execution_history)
+       if not self._redis_disabled() and self._redis_available is not False:
+           try:
+               raw_events = self.client.lrange(self._execution_history_key(), 0, max(0, limit - 1))
+               events = []
+               for raw in raw_events:
+                   try:
+                       event = json.loads(raw)
+                   except Exception:
+                       continue
+                   if isinstance(event, dict):
+                       events.append(event)
+               self._redis_available = True
+           except redis.exceptions.RedisError:
+               self._redis_available = False
+
+       return events[:limit]
    # =========================================================
    # Optional: Distributed Lock (per session)
    # =========================================================

@@ -6,6 +6,12 @@ SQL Allowlist - Defines allowed tables and columns for dynamic SQL
 from dataclasses import dataclass
 from typing import Dict, List, Set
 
+from app.config.sql_rules_loader import (
+    get_allowed_columns as get_config_allowed_columns,
+    get_allowed_tables as get_config_allowed_tables,
+    get_forbidden_patterns,
+)
+
 
 @dataclass
 class SQLAllowlist:
@@ -20,75 +26,9 @@ AllowlistConfig = SQLAllowlist
 
 
 DEFAULT_ALLOWLIST = SQLAllowlist(
-    allowed_tables={
-        "finance_voyage_kpi",
-        "ops_voyage_summary",
-        "jsonb_array_elements_text",
-        "jsonb_array_elements",
-    },
-    allowed_columns={
-        "finance_voyage_kpi": {
-            "voyage_id",
-            "voyage_number",
-            "vessel_imo",
-            "scenario",
-            "revenue",
-            "total_expense",
-            "pnl",
-            "tce",
-            "total_commission",
-            "bunker_cost",
-            "port_cost",
-            "voyage_days",
-            "voyage_start_date",
-            "voyage_end_date",
-            "modified_by",
-            "modified_date",
-            "extracted_at",
-        },
-        "ops_voyage_summary": {
-            "voyage_id",
-            "voyage_number",
-            "vessel_id",
-            "vessel_imo",
-            "vessel_name",
-            "module_type",
-            "fixture_count",
-            "offhire_days",
-            "is_delayed",
-            "delay_reason",
-            "voyage_start_date",
-            "voyage_end_date",
-            "ports_json",
-            "grades_json",
-            "activities_json",
-            "remarks_json",
-            "tags",
-            "url",
-            "extracted_at",
-        },
-    },
-    forbidden_patterns=[
-        r"--",
-        r"/\*.*\*/",
-        r";.*$",
-        r"\bEXEC\b",
-        r"\bEXECUTE\b",
-        r"\bCREATE\b",
-        r"\bDROP\b",
-        r"\bALTER\b",
-        r"\bTRUNCATE\b",
-        r"\bRENAME\b",
-        r"\bINSERT\b",
-        r"\bUPDATE\b",
-        r"\bDELETE\b",
-        r"\bMERGE\b",
-        r"\bxp_cmdshell\b",
-        r"\bdbms_\w+\b",
-        r"\butl_file\b",
-        r"\binformation_schema\b",
-        r"\bpg_catalog\b",
-    ],
+    allowed_tables=get_config_allowed_tables(),
+    allowed_columns=get_config_allowed_columns(),
+    forbidden_patterns=get_forbidden_patterns(),
 )
 
 

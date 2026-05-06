@@ -1,0 +1,1734 @@
+# Routing policy data.
+# Python should execute routing logic; this file owns tunable keyword sets.
+
+planner_source_keywords:
+  finance:
+    - pnl
+    - p&l
+    - profit
+    - loss
+    - revenue
+    - expense
+    - expenses
+    - tce
+    - time charter equivalent
+    - commission
+    - financial
+    - financials
+    - financial summary
+    - financial result
+    - executive summary
+    - earnings
+    - cost
+    - costs
+  mongo:
+    - remark
+    - remarks
+    - cargo
+    - grade
+    - port
+    - ports
+    - route
+    - fixture
+    - charterer
+    - broker
+    - bunker
+    - bunkers
+    - cii
+    - emissions
+    - projected
+    - legs
+    - laytime
+    - demurrage
+    - who added
+    - added by
+
+planner_default_primary_source: postgres
+
+planner_entity_to_fleet_intent_map:
+  vessel.summary: ranking.vessels
+  vessel.entity: ranking.vessels
+  voyage.summary: ranking.voyages
+  voyage.entity: ranking.voyages
+
+planner_rankingish_terms:
+  - top
+  - rank
+  - compare
+  - vs
+  - versus
+  - variance
+  - including
+  - include
+
+planner_port_rankingish_terms:
+  - top
+  - rank
+  - compare
+  - vs
+  - versus
+  - variance
+
+planner_voyage_metadata_terms:
+  - metadata
+  - fixture
+  - charterer
+  - broker
+  - commission
+  - cp date
+  - demurrage
+  - laytime
+  - time bar
+  - bill of lading
+  - cargo grade
+  - load port
+  - discharge port
+  - route
+  - leg
+  - arrival
+  - departure
+  - bunker
+  - hsbf
+  - lsgo
+  - rob
+  - stems
+  - cii
+  - co2
+  - sox
+  - nox
+  - emissions
+  - eeoi
+  - aer
+  - remark
+  - projected
+
+planner_single_vessel_composite_terms:
+  - over time
+  - trend
+  - most frequent
+  - frequent ports
+  - ports visited
+
+planner_text_composite_overrides:
+  - name: text_offhire_composite
+    all:
+      - offhire
+    any:
+      - pnl
+      - tce
+    confidence: 0.95
+  - name: text_delayed_composite
+    all:
+      - delayed
+    any:
+      - pnl
+      - expense
+    confidence: 0.95
+  - name: text_trend_composite
+    any:
+      - over time
+      - trend
+    confidence: 0.92
+  - name: text_cargo_port_composite
+    all:
+      - cargo
+      - port
+    confidence: 0.92
+
+voyage_topic_keywords:
+  commissions:
+    - charterer
+    - broker
+    - commission
+    - rate
+    - agent
+    - co broker
+  cargo:
+    - cargo
+    - grade
+    - "bl "
+    - shipper
+    - naphtha
+    - bill of lading
+    - quantity
+    - "mt "
+    - bbls
+  fixture:
+    - cp date
+    - laytime
+    - demurrage
+    - time bar
+    - fixture
+    - overage
+    - lay can
+  ports:
+    - port
+    - load port
+    - discharge port
+    - bilbao
+    - antwerp
+    - activity
+  legs:
+    - route
+    - leg
+    - arrival
+    - departure
+    - distance
+    - passage
+    - speed
+    - ballast
+    - laden
+    - draft
+    - eca
+  revenues:
+    - revenue
+    - freight
+    - rebill
+    - "ws "
+    - worldscale
+    - flat rate
+    - revenue line
+  expenses:
+    - expense
+    - miscellaneous
+    - ets
+    - expense line
+  bunkers:
+    - bunker
+    - hsbf
+    - lsgo
+    - rob
+    - consumption
+    - stem
+    - fuel
+    - refill
+  emissions:
+    - cii
+    - co2
+    - sox
+    - nox
+    - emission
+    - eeoi
+    - aer
+    - band
+  projected:
+    - projected
+    - tce
+    - pnl
+    - efficiency
+    - estimated
+    - projection
+    - forecast
+  remarks:
+    - remark
+    - note
+    - who added
+    - comment
+    - added by
+    - modified by
+
+scenario_keyword_aliases:
+  when_fixed: WHEN_FIXED
+  when fixed: WHEN_FIXED
+  wf: WHEN_FIXED
+  actual: ACTUAL
+  act: ACTUAL
+  budget: BUDGET
+  forecast: FORECAST
+  projected: PROJECTED
+
+scenario_comparison_words:
+  - compare
+  - vs
+  - versus
+  - v/s
+  - v.s.
+  - difference
+  - variance
+  - gap
+  - between
+  - against
+  - comparison
+
+followup_backward_markers:
+  - previously
+  - previous
+  - earlier
+  - before
+  - at that point
+  - at the start
+  - from the start
+  - starting
+
+older_vessel_markers:
+  - asked vessel
+  - previous vessel
+  - earlier vessel
+  - before vessel
+  - last vessel
+
+simple_voyage_analytical_markers:
+  - compare
+  - " vs "
+  - versus
+  - "top "
+  - "bottom "
+  - highest
+  - lowest
+  - trend
+  - average
+  - avg
+  - all voyages
+  - which voyages
+  - list
+  - negative
+  - positive
+  - "low "
+  - "high "
+  - ratio
+  - rank
+
+vessel_mention_stop_first_words:
+  - can
+  - you
+  - what
+  - which
+  - show
+  - tell
+  - give
+  - find
+  - list
+  - the
+  - a
+  - an
+  - how
+  - why
+  - when
+  - where
+  - who
+  - are
+  - is
+  - does
+  - do
+  - did
+  - was
+  - were
+  - there
+  - these
+  - those
+  - this
+  - that
+  - any
+  - some
+  - each
+  - every
+  - all
+  - most
+  - customer
+  - usage
+  - historical
+  - commercial
+  - technical
+  - standard
+  - key
+  - full
+  - profile
+  - details
+  - vessel
+  - vessels
+  - ship
+  - ships
+  - fleet
+  - best
+  - worst
+  - top
+  - bottom
+  - long
+  - term
+  - charter
+  - active
+  - inactive
+  - another
+  - other
+
+vessel_mention_descriptor_suffixes:
+  - pool
+  - segment
+  - class
+  - type
+
+vessel_mention_false_prefixes:
+  - IMO
+  - ECO
+  - MR
+
+fresh_fleet_markers:
+  - across all
+  - across fleet
+  - fleet-wide
+  - all voyages
+  - all vessels
+  - each vessel
+  - each port
+  - each cargo grade
+  - per vessel
+  - per port
+  - per cargo grade
+  - by vessel
+  - by voyage
+  - by port
+  - for all vessels
+  - for all voyages
+  - whole fleet
+  - entire fleet
+
+explicit_result_set_reference_phrases:
+  - among these
+  - among them
+  - among this
+  - from above
+  - from the above
+  - from this
+  - in that list
+  - in the list
+  - above list
+  - the above
+  - those voyages
+  - these voyages
+
+new_request_prefixes:
+  - "show "
+  - show me
+  - "list "
+  - "rank "
+  - "find "
+  - "give "
+  - "tell "
+  - summarize
+  - "compare "
+  - "for "
+  - "which "
+  - "what "
+  - "if "
+  - "is "
+  - "how "
+  - "does "
+  - "did "
+  - "are "
+  - "was "
+  - "were "
+  - "ports "
+  - "port "
+  - "cargo "
+  - "vessels "
+  - "vessel "
+  - "voyages "
+  - "voyage "
+  - "average "
+  - "avg "
+  - "top "
+  - "bottom "
+  - "highest "
+  - "lowest "
+  - "most "
+  - "least "
+  - "total "
+  - "count "
+  - calculate
+
+session_thread_context_markers:
+  - same vessel
+  - same voyage
+  - still the same vessel
+  - still the same voyage
+
+fresh_ranking_phrases:
+  - most profitable
+  - loss-making
+  - loss making
+
+fresh_ranking_trend_words:
+  - trend
+
+fresh_ranking_trend_context_words:
+  - month
+  - average
+
+result_set_explain_verbs:
+  - explain
+  - why
+  - what went wrong
+  - went wrong
+
+result_set_fresh_start_prefixes:
+  - "is "
+  - for vessel
+  - how is
+  - show me
+  - which vessel
+  - find vessel
+
+result_set_extreme_keywords:
+  - highest
+  - lowest
+  - max
+  - min
+  - best
+  - worst
+  - better
+  - higher
+  - lower
+
+result_set_scope_phrases:
+  - out of it
+  - out of them
+  - among these
+  - among them
+
+result_set_question_prefixes:
+  - which was
+  - what was
+
+polite_followup_prefixes:
+  - "can u "
+  - "can you "
+  - "could you "
+  - "please "
+
+concise_followup_keywords:
+  - best
+  - worst
+  - highest
+  - lowest
+  - changed the most
+  - what about
+  - cargo grade
+  - grade
+  - remarks
+  - remark
+  - that one
+  - that voyage
+
+result_set_refinement_phrases:
+  - best voyage
+  - worst voyage
+  - top voyage
+  - lowest voyage
+  - highest voyage
+  - top one
+  - bottom one
+  - best one
+  - worst one
+  - highest one
+  - lowest one
+  - first one
+  - last one
+
+operational_followup_keywords:
+  - operational
+  - operating
+  - is it operational
+  - is it operating
+  - status
+
+same_entity_reference_words:
+  - that
+  - this
+  - same
+
+cargo_grade_terms:
+  - cargo grade
+  - cargo grades
+  - grade
+
+cargo_grade_voyage_terms:
+  - voyage
+  - voyages
+
+incomplete_entity_question_markers:
+  - tell me
+  - what is
+  - what's
+  - summary
+  - summarize
+  - details
+  - information
+  - explain
+  - "show "
+  - "list "
+  - "find "
+
+incomplete_entity_detail_markers:
+  - tell me about
+  - details
+  - detail
+  - information
+  - info
+  - summary
+  - summarize
+  - what is
+  - what's
+  - describe
+  - define
+
+incomplete_entity_topic_terms:
+  port:
+    - port
+  vessel:
+    - vessel
+    - ship
+  voyage:
+    - voyage
+
+incomplete_entity_topic_phrases:
+  vessel:
+    - tell me about vessel
+    - tell me about ship
+    - vessel summary
+    - ship details
+    - vessel details
+  voyage:
+    - tell me about voyage
+    - voyage summary
+    - voyage details
+    - details about voyage
+    - information about voyage
+
+incomplete_entity_fleet_port_aggregate_markers:
+  - all voyages
+  - across all
+  - fleet
+  - most visited
+  - most commonly visited
+  - most common port
+  - most frequent port
+  - busiest port
+  - busiest ports
+  - top port
+  - port frequency
+  - port count
+  - how many ports
+  - highest average
+  - highest demurrage
+  - average demurrage
+
+incomplete_entity_placeholder_slot_values:
+  vessel_name:
+    - vessel
+    - ship
+    - port
+    - voyage
+    - the vessel
+    - a vessel
+  port_name:
+    - port
+    - ports
+  voyage_number:
+    - voyage
+    - voyages
+
+incomplete_entity_fastpath_queries:
+  port.details:
+    - tell me about port
+    - port details
+    - port summary
+    - information about port
+  vessel.summary:
+    - tell me about vessel
+    - tell me about ship
+    - vessel details
+    - ship details
+    - vessel summary
+  voyage.summary:
+    - tell me about voyage
+    - voyage details
+    - voyage summary
+    - information about voyage
+
+proper_name_request_prefixes:
+  - "is "
+  - "how is "
+  - "tell me about "
+  - "show "
+  - "show me "
+  - "give "
+  - "what is "
+  - "for "
+
+value_like_fresh_words:
+  - show
+  - list
+  - compare
+  - rank
+  - top
+  - tell
+  - what
+  - which
+
+long_new_question_prefixes:
+  - "show "
+  - show me
+  - "list "
+  - "find "
+  - "compare "
+  - "for "
+  - "which "
+  - "what "
+
+generic_followup_markers:
+  - what about
+  - what else
+  - same
+  - also
+  - more
+  - details
+  - breakdown
+  - explain
+  - why
+  - how
+  - include
+  - among
+  - previously
+  - previous
+  - earlier
+  - before
+  - at that point
+  - from the start
+  - at the start
+
+coreference_words:
+  - it
+  - its
+  - this
+  - that
+  - these
+  - those
+  - them
+  - they
+
+result_set_refinement_extreme_terms:
+  - top
+  - bottom
+  - highest
+  - lowest
+  - best
+  - worst
+  - better
+  - higher
+  - lower
+  - only
+  - just
+
+result_set_operation_verbs:
+  - show
+  - list
+  - give
+  - compare
+  - only
+  - just
+  - filter
+  - sort
+
+result_set_operation_fields:
+  - port
+  - ports
+  - grade
+  - grades
+  - remark
+  - remarks
+  - pnl
+  - tce
+  - revenue
+  - expense
+  - commission
+  - offhire
+  - delay
+  - voyage
+
+short_contextual_followup_fields:
+  - port
+  - ports
+  - key ports
+  - remark
+  - remarks
+  - grade
+  - grades
+  - expense
+  - expenses
+  - revenue
+  - pnl
+  - tce
+  - commission
+  - offhire
+  - delay
+
+direct_thread_reference_phrases:
+  - this voyage
+  - that voyage
+  - this vessel
+  - that vessel
+  - this ship
+  - that ship
+  - this one
+  - that one
+  - "it "
+  - " its"
+  - it's
+
+corpus_guard_result_set_reference_phrases:
+  - these voyages
+  - those voyages
+  - this list
+  - that list
+  - above list
+
+singular_selection_markers:
+  - best one
+  - worst one
+  - highest one
+  - lowest one
+  - top one
+  - bottom one
+  - first one
+  - last one
+  - best voyage
+  - worst voyage
+  - best vessel
+  - worst vessel
+  - for the best
+  - for the worst
+  - for the top
+  - for the bottom
+  - of the best
+  - of the worst
+  - on the best
+  - on the worst
+  - that one
+  - this one
+
+selected_row_reference_phrases:
+  - that one
+  - this one
+  - that voyage
+  - this voyage
+  - that vessel
+  - this vessel
+  - top one
+  - first one
+  - bottom one
+  - last one
+
+first_selector_phrases:
+  - top one
+  - first one
+  - top result
+  - first result
+
+last_selector_phrases:
+  - bottom one
+  - last one
+  - last result
+  - lowest one
+  - worst one
+
+result_set_projection_field_terms:
+  remarks:
+    - remark
+    - remarks
+  cargo_grades:
+    - cargo grade
+    - cargo grades
+  key_ports:
+    - port
+    - ports
+    - key ports
+
+result_set_extreme_metric_aliases:
+  port_calls:
+    - port call
+    - port calls
+  revenue:
+    - revenue
+  total_expense:
+    - expense
+    - cost
+  voyage_count:
+    - voyage count
+    - count
+  tce:
+    - tce
+  pnl:
+    - pnl
+    - profit
+    - loss
+    - best voyage
+    - worst voyage
+
+result_set_low_extreme_terms:
+  - worst
+  - lowest
+  - least
+  - bottom
+
+result_set_selected_metric_aliases:
+  avg_revenue:
+    - avg revenue
+    - average revenue
+  avg_pnl:
+    - avg pnl
+    - average pnl
+  avg_tce:
+    - avg tce
+    - average tce
+  pnl_variance:
+    - pnl variance
+  tce_variance:
+    - tce variance
+  revenue:
+    - revenue
+  pnl:
+    - pnl
+    - profit
+  tce:
+    - tce
+  total_expense:
+    - expense
+    - cost
+  total_commission:
+    - commission
+  voyage_count:
+    - voyage count
+    - count
+  port_calls:
+    - port count
+    - port calls
+  vessel_name:
+    - vessel name
+  port_name:
+    - port name
+
+result_set_short_projection_field_terms:
+  remarks:
+    - remark
+    - remarks
+  cargo_grades:
+    - cargo
+    - grade
+    - cargo grade
+    - cargo grades
+  key_ports:
+    - port
+    - ports
+    - key ports
+
+result_set_selected_metric_triggers:
+  - show
+  - what
+  - give
+  - just
+  - only
+  - "and "
+
+result_set_selected_metric_context_terms:
+  - what about
+  - "and "
+  - just
+  - only
+  - "what "
+  - "show "
+
+result_set_metric_followup_exclusion_terms:
+  - top
+  - bottom
+  - highest
+  - lowest
+  - best
+  - worst
+  - most
+  - least
+
+result_set_corpus_followup_exclusion_terms:
+  - for each
+  - of each
+  - every
+  - "all "
+  - these
+  - them
+
+result_set_list_fields_context_terms:
+  - show
+  - what about
+  - "and "
+  - plus
+  - their
+  - those
+  - same
+  - for them
+
+result_set_list_fields_extra_exclusion_terms:
+  - variance
+  - ratio
+
+thread_override_fleet_switch_markers:
+  - across all
+  - across fleet
+  - fleet-wide
+  - all voyages
+  - all vessels
+  - each vessel
+  - per vessel
+  - which vessels
+  - top vessels
+  - top 10
+  - top 5
+  - show 10
+  - show top
+  - "rank "
+  - "ranking "
+
+thread_override_ranking_terms:
+  - highest
+  - lowest
+  - best
+  - worst
+  - most
+  - least
+  - compare
+  - vs
+  - versus
+  - variance
+  - between
+
+thread_override_explicit_entity_markers:
+  - this voyage
+  - that voyage
+  - this vessel
+  - that vessel
+  - this ship
+  - that ship
+  - this one
+  - that one
+  - on this voyage
+  - for this voyage
+  - for this vessel
+  - for that voyage
+  - for that vessel
+  - "its "
+  - "it's "
+  - same vessel
+  - same voyage
+  - those remarks
+  - these remarks
+  - them
+  - they
+
+thread_override_referential_markers:
+  - this voyage
+  - that voyage
+  - this vessel
+  - that vessel
+  - this ship
+  - that ship
+  - this one
+  - that one
+  - it
+  - its
+  - it's
+  - this trip
+  - them
+  - they
+  - those
+  - these
+  - previously
+  - earlier
+  - before
+  - at that point
+
+thread_override_vessel_keywords:
+  - voyage history
+  - best voyage
+  - worst voyage
+  - how many voyages
+  - performing
+  - overall
+  - trend
+  - best
+  - worst
+  - ports
+  - cargo grades
+  - cargo grade
+  - remarks
+  - remark
+  - pnl
+  - revenue
+  - expense
+  - expenses
+  - tce
+  - hire rate
+  - scrubber
+  - market type
+  - operational
+  - operating
+  - contract
+  - owner
+  - duration
+  - cp date
+  - delivery
+  - passage type
+  - consumption
+  - ballast
+  - laden
+  - ifo
+  - mgo
+  - account code
+  - tags
+  - same vessel context
+  - still the same vessel
+  - same vessel
+
+thread_override_voyage_keywords:
+  - cargo
+  - cargo grade
+  - cargo grades
+  - shipper
+  - load port
+  - discharge port
+  - ports
+  - route
+  - remarks
+  - remark
+  - charterer
+  - broker
+  - commission
+  - cp date
+  - cp quantity
+  - demurrage
+  - laytime
+  - revenue lines
+  - expense items
+  - expense
+  - expenses
+  - cost
+  - profitable
+  - pnl
+  - revenue
+  - tce
+  - bunker
+  - cii
+  - co2
+  - sox
+  - nox
+  - projected
+  - compare to the fleet average
+  - compare to fleet average
+  - fleet average
+
+thread_override_voyage_metadata_terms:
+  - cargo
+  - grade
+  - shipper
+  - load port
+  - discharge port
+  - route
+  - remarks
+  - remark
+  - charterer
+  - broker
+  - commission
+  - cp date
+  - cp quantity
+  - demurrage
+  - laytime
+  - revenue lines
+  - expense items
+  - bunker
+  - cii
+  - co2
+  - sox
+  - nox
+  - projected
+  - who added
+  - added by
+
+thread_override_vessel_metadata_terms:
+  - hire rate
+  - scrubber
+  - market type
+  - operational
+  - operating
+  - contract
+  - owner
+  - duration
+  - cp date
+  - delivery
+  - passage type
+  - consumption
+  - ballast
+  - laden
+  - ifo
+  - mgo
+  - account code
+  - tags
+  - default
+  - defaults
+
+comparison_followup_terms:
+  - compare
+  - vs
+  - versus
+  - difference
+
+result_set_stale_delay_guard_terms:
+  all:
+    - delayed
+    - offhire
+  any:
+    - negative
+    - pnl
+  scope:
+    - for voyages
+    - voyages flagged
+
+structured_followup_scopes:
+  - follow_up
+  - followup
+
+structured_followup_operations:
+  - follow_up_filter
+
+metric_followup_override_actions:
+  - project_selected_metric
+  - top_n
+  - bottom_n
+  - compare_extremes
+  - project_extreme_field
+
+fresh_ranking_pnl_terms:
+  - most profitable
+
+fresh_ranking_segment_terms:
+  - loss-making
+  - loss making
+
+fresh_ranking_trend_terms:
+  - trend
+
+llm_mongo_only_voyage_fields:
+  - charterer
+  - broker
+  - commission
+  - commission rate
+  - commission rates
+  - cp date
+  - cp quantity
+  - demurrage rate
+  - laytime
+  - time bar
+  - fixture
+  - fixture terms
+  - bill of lading
+  - bl quantity
+  - shipper
+  - cargo grade
+  - grade
+  - cargo
+  - route
+  - leg
+  - legs
+  - arrival
+  - departure
+  - load port
+  - discharge port
+  - port call
+  - distance
+  - passage days
+  - freight rate
+  - revenue line
+  - expense line
+  - rebill
+  - worldscale
+  - "ws "
+  - bunker consumption
+  - bunker cost
+  - bunker grade
+  - hsbf
+  - lsgo
+  - rob
+  - stems
+  - bunker
+  - cii
+  - cii band
+  - co2
+  - sox
+  - nox
+  - emissions
+  - eeoi
+  - aer
+  - remark
+  - remarks
+  - who added
+  - added by
+  - projected
+  - projected pnl
+  - projected revenue
+  - projected tce
+  - tce projection
+  - metadata
+  - voyage metadata
+  - source link
+  - url
+
+llm_out_of_scope_greeting_exact:
+  - hi
+  - hello
+  - hey
+  - hiya
+  - yo
+  - good morning
+  - good afternoon
+  - good evening
+  - help
+  - start
+
+llm_out_of_scope_greeting_prefixes:
+  - "hi "
+  - "hello "
+  - "hey "
+
+llm_out_of_scope_identity_phrases:
+  - who are you
+  - who r you
+  - who are u
+  - who r u
+  - what are you
+  - what are u
+  - what can you do
+  - what can u do
+  - what do you do
+  - what do u do
+
+llm_out_of_scope_weather_keywords:
+  - weather
+  - temperature
+  - rain
+  - forecast
+  - climate
+
+llm_answer_narrative_triggers:
+  - what happened
+  - summarize
+  - summary of what happened
+  - what went wrong
+  - root cause
+  - brief me
+  - give me
+  - executive summary
+  - explain
+  - explaining
+  - walk me through
+  - overview of
+  - what are the
+  - what were
+  - generate
+
+llm_answer_financial_first_terms:
+  - revenue
+  - expense
+  - expenses
+  - pnl
+  - tce
+  - commission
+
+llm_answer_port_terms:
+  - port
+  - ports
+  - route
+  - routing
+
+llm_answer_grade_terms:
+  - grade
+  - grades
+  - cargo
+
+llm_answer_remark_terms:
+  - remark
+  - remarks
+  - issue
+  - issues
+  - delay
+  - delays
+
+llm_vessel_performance_terms:
+  - overall
+  - performing
+  - voyage history
+  - trend
+
+llm_voyage_resolved_vessel_metadata_terms:
+  - operating status
+  - operational status
+  - is operating
+  - is operational
+  - hire rate
+  - hirerate
+  - scrubber
+  - passage type
+  - passage types
+  - account code
+  - market type
+
+llm_average_voyage_duration_terms:
+  - average voyage duration
+  - average voyage days
+  - voyage duration in days
+
+llm_per_vessel_terms:
+  - per vessel
+  - each vessel
+  - by vessel
+
+llm_cargo_subject_terms:
+  - cargo grade
+  - cargo grades
+  - grade
+  - grades
+  - cargo
+
+llm_cargo_aggregate_terms:
+  - highest
+  - top
+  - most
+  - average
+  - avg
+  - overall
+  - profit
+  - profitable
+  - pnl
+  - revenue
+
+llm_cargo_frequency_terms:
+  - frequent
+  - frequency
+  - most common
+  - most commonly
+  - appears most
+  - appears the most
+  - most carried
+
+llm_cargo_non_primary_subject_terms:
+  - voyages
+  - for voyage
+  - voyage-by-voyage
+  - vessel
+  - vessels
+  - module type
+  - module types
+
+llm_cargo_profitability_metric_terms:
+  - average pnl
+  - avg pnl
+  - highest average pnl
+  - average revenue
+  - avg revenue
+
+llm_cargo_profitability_terms:
+  - profitable
+  - profit
+  - pnl
+  - revenue
+  - overall
+
+llm_cargo_negative_profit_terms:
+  - negative pnl
+  - negative pn
+  - loss-making
+  - loss making
+  - loss-making voyages
+  - negative profit
+
+llm_scenario_comparison_terms:
+  - when-fixed
+  - when fixed
+
+llm_comparison_terms:
+  - compare
+  - vs
+  - versus
+  - difference
+  - which is better
+
+llm_voyage_port_listing_terms:
+  - which ports
+  - ports were visited
+  - ports visited
+  - visited ports
+  - port list
+
+llm_entity_summary_terms:
+  - tell me about
+  - details about
+  - information about
+  - summary
+  - summarize
+
+llm_vessel_fleet_exclusion_terms:
+  - which vessel
+  - per vessel
+  - each vessel
+  - vessels have
+  - vessel have
+
+llm_vessel_ranking_signals:
+  - which vessel
+  - which vessels
+  - top vessel
+  - top vessels
+  - vessel has
+  - vessels have
+  - per vessel
+  - each vessel
+  - across all voyages
+  - fleet
+
+llm_vessel_metric_signals:
+  - pnl
+  - profit
+  - profitability
+  - revenue
+  - tce
+  - expense
+  - cost
+  - voyage count
+  - number of voyage
+  - speed
+  - hire rate
+  - contract
+  - offhire
+
+llm_voyage_profitability_phrases:
+  - most profitable voyages
+  - top profitable voyages
+  - top performing voyages
+
+llm_ranking_order_terms:
+  - top
+  - highest
+  - rank
+
+llm_profit_metric_terms:
+  - pnl
+  - profit
+
+llm_emissions_terms:
+  - co2
+  - emission
+  - emissions
+  - eeoi
+  - aer
+  - sox
+  - nox
+  - cii
+
+llm_emissions_ranking_terms:
+  - top
+  - highest
+  - worst
+  - lowest
+  - most
+  - least
+  - high
+
+llm_voyage_performance_phrases:
+  - top performing voyages
+  - most profitable voyages
+  - top performing voyage
+  - most profitable voyage
+  - least profitable voyage
+
+llm_voyage_extreme_phrases:
+  - best voyage
+  - worst voyage
+
+llm_port_call_terms:
+  - port call
+  - port calls
+  - port count
+  - port counts
+  - port stops
+  - port visits
+
+llm_port_call_ranking_terms:
+  - top
+  - most
+  - highest
+  - rank
+  - visited
+
+llm_port_fleet_signals:
+  - most visit
+  - most common
+  - most commonly
+  - most frequent
+  - commonly visit
+  - frequently visit
+  - busiest port
+  - popular port
+  - which port
+  - top port
+
+llm_port_broad_visit_terms:
+  - visit
+  - common
+  - frequent
+  - busy
+
+llm_voyage_count_per_vessel_terms:
+  - each vessel
+  - per vessel
+  - how many voyage
+  - number of voyage
+  - vessel have
+  - vessels have
+
+llm_fleet_vessel_terms:
+  - which vessel
+  - which vessels
+  - top vessels
+  - vessels with
+  - show vessels
+  - operating vessels
+  - active vessels
+  - scrubber vessels
+  - non-scrubber vessels
+  - market type has
+  - fastest on ballast
+  - fastest on laden
+  - longest contract
+  - highest hire rate
+  - expensive to operate
+
+llm_vessel_metadata_agg_terms:
+  - operating
+  - operational
+  - active vessels
+  - scrubber
+  - non-scrubber
+  - non scrubber
+  - hire rate
+  - hirerate
+  - ballast
+  - laden
+  - default ballast speed
+  - default laden speed
+  - contract
+  - duration
+  - current contract
+  - pool
+  - short pool
+  - long pool
+  - market type
+
+llm_metadata_keywords:
+  - passage type
+  - passage types
+  - consumption profile
+  - consumption profiles
+  - consumption
+  - default consumption
+  - speed
+  - ifo
+  - mgo
+  - ballast
+  - laden
+  - non passage
+  - non-passage
+  - idle
+  - load
+  - discharge
+  - heat
+  - clean
+  - inert
+  - hire rate
+  - hirerate
+  - hire_rate
+  - hire-rate
+  - scrubber
+  - market type
+  - contract history
+  - contract
+  - tags
+  - account code
+  - is vessel operating
+  - operating status
+  - operational
+  - is operating
+  - owner
+  - duration
+  - cp date
+  - delivery
+  - extracted at
+  - fixture
+  - charterer
+  - laycan
+  - demurrage
+  - freight
+  - cargo quantity
+  - cargoes
+  - leg
+  - legs
+  - route leg
+  - bunker
+  - bunkers
+  - emission
+  - emissions
+  - co2
+  - projected result
+  - projected pnl
+  - url
+  - source link
+  - commercial metadata
+  - voyage metadata
+  - vessel metadata
+  - metadata
+
+llm_metadata_fleet_wide_markers:
+  - which vessels
+  - which vessel has the
+  - top vessels
+  - vessels with
+  - market type has
+  - across all
+  - across fleet
+  - fleet-wide
+  - all vessels
+  - most vessels
+  - highest voyage count
+  - lowest voyage count
+
+llm_generic_agg_terms:
+  - highest
+  - lowest
+  - top
+  - most
+  - least
+  - best
+  - worst
+  - count
+  - average
+  - avg
+  - total
+  - longest
+  - fastest
+
+llm_delay_terms:
+  - delay
+  - waiting cost
+  - waiting
+  - offhire
+
+llm_delay_ranking_terms:
+  - highest
+  - biggest
+  - most
+  - worst
+  - top

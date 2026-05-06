@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from app.config.prompt_rules_loader import get_mongo_query_builder_system_prompt
 from app.llm.llm_client import LLMClient
 
 
@@ -21,16 +22,7 @@ class MongoQueryBuilder:
         self.llm = llm
 
     def build(self, *, question: str, schema_hint: Dict[str, Any], slots: Dict[str, Any]) -> MongoQuerySpec:
-        system = (
-            "You generate SAFE MongoDB find() specs.\n"
-            "Return ONLY valid JSON. No markdown. No extra text.\n"
-            "Hard rules:\n"
-            "- Use only collections in schema_hint.\n"
-            "- Use only allowed operators.\n"
-            "- Always set projection to minimal required fields.\n"
-            "- Always include _id: 0 in projection.\n"
-            "- Limit must be <= 50.\n"
-        )
+        system = get_mongo_query_builder_system_prompt()
         payload = {
             "task": "mongo_find_spec",
             "question": question,

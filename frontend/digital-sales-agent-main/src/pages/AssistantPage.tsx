@@ -35,23 +35,6 @@ const seedMessages: Message[] = [
       { label: "Avg Order Value", value: "$39.74", change: "+3.1%", positive: true },
       { label: "Top Category", value: "Electronics", change: "62% share", positive: true },
     ],
-    trace: {
-      intent: "product_revenue_ranking",
-      filters: [
-        { key: "period", value: "April 2026" },
-        { key: "metric", value: "revenue" },
-        { key: "limit", value: "top 5" },
-      ],
-      sources: ["orders_db", "product_catalog", "analytics_warehouse"],
-      steps: [
-        "Detected intent: product ranking by revenue",
-        "Resolved date filter → 2026-04-01 to 2026-04-30",
-        "Aggregated orders.line_items grouped by product_id",
-        "Joined product_catalog for names + prices",
-        "Ranked by SUM(line_total) DESC, limited to 5",
-        "Generated insight summary + MoM comparison",
-      ],
-    },
   },
 ];
 
@@ -62,7 +45,7 @@ export default function AssistantPage() {
       subtitle="Conversational analytics powered by your ecommerce data"
       breadcrumb="Digital Sales Agent"
     >
-      <AnalyticsChat seed={seedMessages} />
+      <AnalyticsChat seed={seedMessages} showExecutionTrace={false} />
     </DashboardLayout>
   );
 }

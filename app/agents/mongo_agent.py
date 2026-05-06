@@ -7,12 +7,22 @@ Uses minimal projections to reduce token usage.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any, Dict, Optional, Literal
 
 from app.adapters.mongo_adapter import MongoAdapter, narrow_voyage_rows_by_entity_slots
+from app.config.mongo_rules_loader import (
+    get_mongo_agent_output_fields,
+    get_mongo_agent_scoring,
+    get_mongo_limit,
+    get_mongo_projection,
+)
+from app.core.logger import get_logger
 from app.llm.mongo_query_builder import MongoQueryBuilder
 from app.mongo.mongo_guard import validate_mongo_spec
 from app.orchestration.mongo_schema import mongo_schema_hint
+
+logger = get_logger("mongo_agent")
 
 # ---------------------------------------
 # Types
@@ -60,24 +70,13 @@ class MongoAgent:
             vn_int = None
 
         if vn_int is not None:
-            proj = {
-                "voyageId": 1,
-                "voyageNumber": 1,
-                "vesselName": 1,
-                "vesselImo": 1,
-                "startDateUtc": 1,
-                "extracted_at": 1,
-                "remarks": 1,
-                "remarkList": 1,
-                "fixtures": 1,
-                "legs": 1,
-                "revenues": 1,
-                "expenses": 1,
-            }
+            proj = get_mongo_projection("full_voyage_context")
             doc = self.adapter.get_voyage_by_number(vn_int, projection=proj)
             if not doc:
                 batch = self.adapter.list_voyages_by_number(
-                    vn_int, projection=proj, limit=40
+                    vn_int,
+                    projection=proj,
+                    limit=get_mongo_limit("full_voyage_context_batch", 40),
                 )
                 narrowed = narrow_voyage_rows_by_entity_slots(batch, entity_slots or {})
                 if len(narrowed) == 1:
@@ -87,45 +86,38 @@ class MongoAgent:
                     def _score(d: Dict[str, Any]) -> tuple[str, int, int, str]:
                         if not isinstance(d, dict):
                             return ("", -1, -1, "")
-                        # Prefer more recent voyage snapshots first (ISO-8601 strings are lex-sortable).
-                        recency = str(d.get("startDateUtc") or d.get("extracted_at") or "")
-                        anchor = int(bool(str(d.get("vesselImo") or "").strip())) + int(bool(str(d.get("vesselName") or "").strip()))
-                        payload = int(bool(d.get("fixtures"))) + int(bool(d.get("legs"))) + int(bool(d.get("expenses"))) + int(bool(d.get("revenues")))
-                        vid = str(d.get("voyageId") or "")
+                        scoring = get_mongo_agent_scoring("full_voyage_context_scoring")
+                        recency = next(
+                            (str(d.get(field) or "") for field in scoring.get("recency_fields", []) if d.get(field)),
+                            "",
+                        )
+                        anchor = sum(int(bool(str(d.get(field) or "").strip())) for field in scoring.get("anchor_fields", []))
+                        payload = sum(int(bool(d.get(field))) for field in scoring.get("payload_fields", []))
+                        vid = str(d.get(scoring.get("id_field", "")) or "")
                         return (recency, anchor, payload, vid)
                     doc = sorted(narrowed, key=_score, reverse=True)[0]
 
         elif voyage_id:
             doc = self.adapter.fetch_voyage(
                 voyage_id,
-                projection={
-                    "voyageId": 1,
-                    "voyageNumber": 1,
-                    "vesselName": 1,
-                    "vesselImo": 1,
-                    "remarks": 1,
-                    "remarkList": 1,
-                    "fixtures": 1,
-                    "legs": 1,
-                    "revenues": 1,
-                    "expenses": 1,
-                },
+                projection=get_mongo_projection("full_voyage_context_by_id"),
             )
 
         if not doc:
             return {}
 
-        return {
-            "voyage_id": doc.get("voyageId"),
-            "voyage_number": doc.get("voyageNumber"),
-            "vessel_name": doc.get("vesselName"),
-            "vessel_imo": doc.get("vesselImo"),
-            "remarks": doc.get("remarks") or doc.get("remarkList", []),
-            "fixtures": doc.get("fixtures", []),
-            "legs": doc.get("legs", []),
-            "revenues": doc.get("revenues", []),
-            "expenses": doc.get("expenses", []),
-        }
+        output: Dict[str, Any] = {}
+        for target, rule in get_mongo_agent_output_fields("full_voyage_context_output_fields").items():
+            if isinstance(rule, str):
+                output[target] = doc.get(rule)
+            elif isinstance(rule, dict) and isinstance(rule.get("first_of"), list):
+                output[target] = next(
+                    (doc.get(field) for field in rule["first_of"] if doc.get(field) is not None),
+                    rule.get("default"),
+                )
+            elif isinstance(rule, dict):
+                output[target] = doc.get(rule.get("source"), rule.get("default"))
+        return output
 
     def run_llm_find(
         self,
@@ -139,6 +131,11 @@ class MongoAgent:
         if self.builder is None:
             raise ValueError("MongoAgent.run_llm_find requires llm_client")
 
+        start = time.time()
+        logger.info(
+            "AGENT_START | agent=mongo | mode=mongo_llm | query_chars=%s",
+            len(question or ""),
+        )
         hint = mongo_schema_hint()
 
         # Normalize slots for Mongo conventions without disturbing the SQL pipeline:
@@ -193,6 +190,13 @@ class MongoAgent:
         )
 
         if not guard.ok:
+            elapsed = round(time.time() - start, 3)
+            logger.error(
+                "AGENT_ERROR | agent=mongo | mode=mongo_llm | collection=%s | latency=%ss | error=%s",
+                spec.collection,
+                elapsed,
+                str(guard.reason)[:200],
+            )
             return {"mode": "mongo_llm", "ok": False, "reason": guard.reason, "rows": []}
 
         rows = self.mongo.find_many(
@@ -203,6 +207,13 @@ class MongoAgent:
             limit=guard.limit,
         )
 
+        elapsed = round(time.time() - start, 3)
+        logger.info(
+            "AGENT_END | agent=mongo | mode=mongo_llm | collection=%s | rows=%s | latency=%ss",
+            guard.collection,
+            len(rows or []),
+            elapsed,
+        )
         return {
             "mode": "mongo_llm",
             "ok": True,
@@ -244,9 +255,19 @@ class MongoAgent:
             MongoAgentResponse with anchor_type, anchor_id, and document
         """
         session_context = session_context or {}
+        start = time.time()
+        logger.info(
+            "AGENT_START | agent=mongo | mode=anchor_fetch | intent=%s",
+            intent_key,
+        )
         
         # Skip mongo entirely
         if intent_key == "entity.skip":
+            logger.info(
+                "AGENT_END | agent=mongo | mode=anchor_fetch | intent=%s | rows=0 | latency=%ss",
+                intent_key,
+                round(time.time() - start, 3),
+            )
             return MongoAgentResponse(
                 anchor_type="VOYAGE",
                 anchor_id="SKIP",
@@ -266,6 +287,13 @@ class MongoAgent:
             projection=projection,
         )
 
+        logger.info(
+            "AGENT_END | agent=mongo | mode=anchor_fetch | intent=%s | anchor_type=%s | found=%s | latency=%ss",
+            intent_key,
+            anchor_type,
+            bool(document),
+            round(time.time() - start, 3),
+        )
         return MongoAgentResponse(
             anchor_type=anchor_type,
             anchor_id=anchor_id,
@@ -404,35 +432,15 @@ class MongoAgent:
         
         # Use minimal projection if none specified
         if projection is None:
-            # Default to MINIMAL fields only - NOT everything!
-            proj = {
-                "_id": 0,
-                # Voyage fields
-                "voyageId": 1,
-                "voyageNumber": 1,
-                "vesselName": 1,
-                "voyageStatus": 1,
-                # Vessel fields
-                "imo": 1,
-                "name": 1,
-                "vesselStatus": 1,
-                # ⚠️ DO NOT include by default:
-                # - itinerary (huge array of ports)
-                # - cargoDetails (massive nested objects)
-                # - portCalls (100+ events)
-                # - events (thousands of entries)
-                # - financials (large nested structures)
-                # - operations (large nested data)
-            }
-            self._safe_print("   🔍 Using MINIMAL projection (6 fields)")
+            proj = get_mongo_projection("minimal_document")
+            self._safe_print("Using minimal projection")
         else:
-            # Use provided projection
             proj = projection
-            self._safe_print(f"   🔍 Using custom projection ({len(projection)} fields)")
+            self._safe_print(f"Using custom projection ({len(projection)} fields)")
 
         # Handle fleet-wide list
         if anchor_type == "VESSEL" and anchor_id == "ALL":
-            vessels = list(self.mongo.vessels.find({}, proj).limit(200))
+            vessels = list(self.mongo.vessels.find({}, proj).limit(get_mongo_limit("fleet_vessel_list", 200)))
             self._safe_print(f"   ✅ Fetched {len(vessels)} vessels")
             return {"vessels": vessels, "count": len(vessels)}
 
@@ -443,7 +451,7 @@ class MongoAgent:
                     self.mongo.voyages.find(
                         {"vesselName": {"$regex": anchor_id, "$options": "i"}},
                         proj,
-                    ).limit(50)
+                    ).limit(get_mongo_limit("voyages_by_vessel_name", 50))
                 )
                 self._safe_print(f"   ✅ Fetched {len(voyages)} voyages for vessel {anchor_id}")
                 return {"voyages": voyages, "vessel_name": anchor_id, "count": len(voyages)}

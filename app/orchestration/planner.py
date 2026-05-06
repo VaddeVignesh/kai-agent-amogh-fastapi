@@ -5,26 +5,25 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Dict, List, Optional
 
-from app.registries.intent_registry import (
-    INTENT_REGISTRY,
-    resolve_intent,
+from app.config.routing_rules_loader import (
+    get_planner_entity_to_fleet_intent_map,
+    get_planner_finance_keywords,
+    get_planner_mongo_keywords,
+    get_planner_port_rankingish_terms,
+    get_planner_rankingish_terms,
+    get_planner_single_vessel_composite_terms,
+    get_planner_text_composite_overrides,
+    get_planner_voyage_metadata_terms,
 )
+from app.registries.intent_loader import get_yaml_registry_facade
 
-# DEPRECATED Phase 5C — active only as fallback. Remove after 2-week stability window.
-FINANCE_KEYWORDS = frozenset([
-    "pnl", "p&l", "profit", "loss", "revenue", "expense", "expenses",
-    "tce", "time charter equivalent", "commission", "financial",
-    "financials", "financial summary", "financial result",
-    "executive summary", "earnings", "cost", "costs",
-])
+_INTENT_FACADE = get_yaml_registry_facade(validate_parity=True)
+INTENT_REGISTRY = _INTENT_FACADE["INTENT_REGISTRY"]
+resolve_intent = _INTENT_FACADE["resolve_intent"]
 
-# DEPRECATED Phase 5C — active only as fallback. Remove after 2-week stability window.
-MONGO_KEYWORDS = frozenset([
-    "remark", "remarks", "cargo", "grade", "port", "ports", "route",
-    "fixture", "charterer", "broker", "bunker", "bunkers", "cii",
-    "emissions", "projected", "legs", "laytime", "demurrage",
-    "who added", "added by",
-])
+# DEPRECATED Phase 5C — active only as fallback. Values now live in routing_rules.yaml.
+FINANCE_KEYWORDS = get_planner_finance_keywords()
+MONGO_KEYWORDS = get_planner_mongo_keywords()
 
 logger = logging.getLogger(__name__)
 
@@ -138,12 +137,7 @@ class Planner:
         # When zero-row escalation fires in n_run_single with no entity anchor,
         # remap entity-level intents to their fleet-wide equivalents so the
         # composite path generates the right SQL (e.g. vessel.summary → ranking.vessels).
-        _ENTITY_TO_FLEET = {
-            "vessel.summary": "ranking.vessels",
-            "vessel.entity":  "ranking.vessels",
-            "voyage.summary": "ranking.voyages",
-            "voyage.entity":  "ranking.voyages",
-        }
+        entity_to_fleet = get_planner_entity_to_fleet_intent_map()
         _has_entity_anchor = bool(
             slots.get("voyage_number")
             or slots.get("voyage_numbers")
@@ -152,7 +146,7 @@ class Planner:
             or slots.get("imo")
         )
         if force_composite and not _has_entity_anchor:
-            intent_key = _ENTITY_TO_FLEET.get(intent_key, intent_key)
+            intent_key = entity_to_fleet.get(intent_key, intent_key)
 
         if force_composite:
             return _with_plan_log(
@@ -257,18 +251,11 @@ class Planner:
 
         # SINGLE voyage only
         if slots.get("voyage_numbers") and len(slots["voyage_numbers"]) == 1:
-            rankingish = any(k in text_lower for k in ("top", "rank", "compare", "vs", "versus", "variance", "including", "include"))
+            rankingish = any(k in text_lower for k in get_planner_rankingish_terms())
             if not rankingish and ("voyage" in text_lower or (intent_key or "").startswith("voyage.")):
                 voyage_intent = intent_key if (intent_key or "").startswith("voyage.") else "voyage.summary"
                 if voyage_intent == "voyage.summary":
-                    _voyage_metadata_terms = (
-                        "metadata", "fixture", "charterer", "broker", "commission", "cp date",
-                        "demurrage", "laytime", "time bar", "bill of lading", "cargo grade",
-                        "load port", "discharge port", "route", "leg", "arrival", "departure",
-                        "bunker", "hsbf", "lsgo", "rob", "stems", "cii", "co2", "sox", "nox",
-                        "emissions", "eeoi", "aer", "remark", "projected",
-                    )
-                    if any(k in text_lower for k in _voyage_metadata_terms):
+                    if any(k in text_lower for k in get_planner_voyage_metadata_terms()):
                         voyage_intent = "voyage.metadata"
                 return _with_plan_log(ExecutionPlan(
                     plan_type="single",
@@ -282,7 +269,7 @@ class Planner:
         if (
             slots.get("vessel_name")
             and (intent_key or "").startswith("vessel.")
-            and not any(k in text_lower for k in ("over time", "trend", "most frequent", "frequent ports", "ports visited"))
+            and not any(k in text_lower for k in get_planner_single_vessel_composite_terms())
         ):
             vessel_intent = intent_key if intent_key in ("vessel.summary", "vessel.entity", "vessel.metadata") else "vessel.summary"
             return _with_plan_log(ExecutionPlan(
@@ -295,7 +282,7 @@ class Planner:
 
         # SINGLE port query
         if intent_key in ("ops.port_query", "ops.voyages_by_port") and slots.get("port_name"):
-            rankingish = any(k in text_lower for k in ("top", "rank", "compare", "vs", "versus", "variance"))
+            rankingish = any(k in text_lower for k in get_planner_port_rankingish_terms())
             if not rankingish:
                 return _with_plan_log(ExecutionPlan(
                     plan_type="single",
@@ -316,29 +303,15 @@ class Planner:
             )
 
         # Text-based composite overrides
-        if not _sources_resolved and "offhire" in text_lower and ("pnl" in text_lower or "tce" in text_lower):
-            return _with_plan_log(
-                self._build_composite(intent_key, text, slots, confidence=0.95),
-                "text_offhire_composite",
-            )
-
-        if not _sources_resolved and "delayed" in text_lower and ("pnl" in text_lower or "expense" in text_lower):
-            return _with_plan_log(
-                self._build_composite(intent_key, text, slots, confidence=0.95),
-                "text_delayed_composite",
-            )
-
-        if not _sources_resolved and ("over time" in text_lower or "trend" in text_lower):
-            return _with_plan_log(
-                self._build_composite(intent_key, text, slots, confidence=0.92),
-                "text_trend_composite",
-            )
-
-        if not _sources_resolved and "cargo" in text_lower and "port" in text_lower:
-            return _with_plan_log(
-                self._build_composite(intent_key, text, slots, confidence=0.92),
-                "text_cargo_port_composite",
-            )
+        if not _sources_resolved:
+            for override in get_planner_text_composite_overrides():
+                all_terms = override.get("all") or []
+                any_terms = override.get("any") or []
+                if all(term in text_lower for term in all_terms) and (not any_terms or any(term in text_lower for term in any_terms)):
+                    return _with_plan_log(
+                        self._build_composite(intent_key, text, slots, confidence=float(override.get("confidence") or 0.90)),
+                        override.get("name") or "text_composite",
+                    )
 
         # -----------------------------------------------------
         # 3️⃣ Default: Single

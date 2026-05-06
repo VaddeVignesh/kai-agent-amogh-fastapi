@@ -10,13 +10,25 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from app.config.sql_rules_loader import (
+    get_column_fixes,
+    get_finance_only_columns,
+    get_invalid_columns,
+    get_jsonb_functions,
+    get_ops_only_columns,
+    get_sql_guard_invalid_column_message,
+    get_sql_guard_rewrite_patterns,
+    get_sql_guard_table_domains,
+    get_sql_guard_default_limit,
+    get_table_fixes,
+)
 from app.sql.sql_allowlist import (
     SQLAllowlist,
     DEFAULT_ALLOWLIST,
     is_table_allowed,
 )
 
-DEFAULT_ENFORCED_LIMIT = int(os.getenv("SQL_GUARD_DEFAULT_LIMIT", "50"))
+DEFAULT_ENFORCED_LIMIT = int(os.getenv("SQL_GUARD_DEFAULT_LIMIT", str(get_sql_guard_default_limit())))
 
 # =========================================================
 # RESULT MODEL
@@ -34,55 +46,15 @@ class ValidationResult:
 # FIX MAPS
 # =========================================================
 
-_COLUMN_FIXES = {
-    "costs": "total_expense",
-    "commission": "total_commission",
-    # Common user/LLM synonyms
-    "profit": "pnl",
-    "profitability": "pnl",
-    "expense": "total_expense",
-    "expenses": "total_expense",
-    "start_date": "voyage_start_date",
-    "end_date": "voyage_end_date",
-    "voyage_start": "voyage_start_date",
-    "voyage_end": "voyage_end_date",
-}
-
-_TABLE_FIXES = {
-    "ops_voyage": "ops_voyage_summary",
-    "voyage_kpi": "finance_voyage_kpi",
-    "finance_voyage": "finance_voyage_kpi",
-    "finance_voyage_summary": "finance_voyage_kpi",
-}
-
-_INVALID_COLUMNS = {
-    "cargo_grade",
-    "cargograde",
-    "portname",
-    "port_name",
-    "port",
-    "remarks",
-    "voyage_profitability",
-    "key_ports_visited",
-    "cost",
-    "imo",
-    "total_cost",
-    "vessel_id",
-}
-
-_FINANCE_ONLY_COLUMNS = {
-    "pnl", "revenue", "tce",
-    "bunker_cost", "port_cost",
-    "total_expense", "total_commission",
-    "scenario",
-}
-
-_OPS_ONLY_COLUMNS = {
-    "offhire_days", "is_delayed",
-    "delay_reason", "module_type",
-    "fixture_count", "grades_json",
-    "ports_json", "remarks_json",
-}
+_COLUMN_FIXES = get_column_fixes()
+_TABLE_FIXES = get_table_fixes()
+_INVALID_COLUMNS = get_invalid_columns()
+_FINANCE_ONLY_COLUMNS = get_finance_only_columns()
+_OPS_ONLY_COLUMNS = get_ops_only_columns()
+_JSONB_FUNCTIONS = get_jsonb_functions()
+_TABLE_DOMAINS = get_sql_guard_table_domains()
+_REWRITE_PATTERNS = get_sql_guard_rewrite_patterns()
+_INVALID_COLUMN_MESSAGE = get_sql_guard_invalid_column_message()
 
 
 # =========================================================
@@ -140,21 +112,13 @@ def _apply_simple_fixes(sql: str) -> str:
     for wrong, right in _TABLE_FIXES.items():
         fixed = re.sub(rf"\b{wrong}\b", right, fixed, flags=re.IGNORECASE)
 
-    # JSONB @> 'text' → ::text ILIKE
-    fixed = re.sub(
-        r"(\w+_json)\s*@>\s*'([^']*)'",
-        r"\1::text ILIKE '%\2%'",
-        fixed,
-        flags=re.IGNORECASE,
-    )
-
-    # IN %(param)s → = ANY(%(param)s)
-    fixed = re.sub(
-        r"\bIN\s+(%\(\w+\)s)",
-        r"= ANY(\1)",
-        fixed,
-        flags=re.IGNORECASE,
-    )
+    for rewrite in _REWRITE_PATTERNS:
+        fixed = re.sub(
+            rewrite["pattern"],
+            rewrite.get("replacement", ""),
+            fixed,
+            flags=re.IGNORECASE,
+        )
 
     return fixed
 
@@ -165,8 +129,9 @@ def _apply_simple_fixes(sql: str) -> str:
 
 def _clean_order_by(sql: str, tables: set) -> str:
 
-    has_finance = any("finance" in t for t in tables)
-    has_ops = any("ops" in t for t in tables)
+    domains = {_TABLE_DOMAINS.get(str(t).lower(), "") for t in tables}
+    has_finance = "finance" in domains
+    has_ops = "ops" in domains
 
     def _strip(match: re.Match) -> str:
         col = match.group(1).split(".")[-1].lower()
@@ -233,15 +198,8 @@ def validate_and_prepare_sql(
             if tname not in cte_names:
                 tables.add(tname)
 
-        JSONB_FUNCTIONS = {
-            "jsonb_array_elements_text",
-            "jsonb_array_elements",
-            "jsonb_each",
-            "jsonb_each_text",
-            "jsonb_object_keys",
-        }
         for t in tables:
-            if t in JSONB_FUNCTIONS:
+            if t in _JSONB_FUNCTIONS:
                 continue
             if not is_table_allowed(t, allowlist):
                 return ValidationResult(
@@ -302,7 +260,7 @@ def validate_and_prepare_sql(
                         ok=False,
                         sql=sql,
                         params=params,
-                        reason=f"Column '{col_name}' does not exist. Use grades_json / ports_json instead.",
+                        reason=_INVALID_COLUMN_MESSAGE.format(column=col_name),
                     )
 
         # ---------------------------------------------

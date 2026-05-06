@@ -24,11 +24,14 @@ export default function LoginPage() {
       return;
     }
     setLoading(true);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 10000);
     try {
       const res = await fetch("http://localhost:8010/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: email, password: password })
+        body: JSON.stringify({ username: email, password: password }),
+        signal: controller.signal,
       });
       const data = await res.json();
       if (!data.success) {
@@ -41,9 +44,16 @@ export default function LoginPage() {
       toast({ title: "Welcome!", description: `Logged in as ${data.role}` });
       navigate(data.role === "admin" ? "/admin" : "/assistant", { replace: true });
     } catch (err) {
-      toast({ title: "Error", description: "Could not reach backend.", variant: "destructive" });
+      const timedOut = err instanceof DOMException && err.name === "AbortError";
+      toast({
+        title: timedOut ? "Login timed out" : "Error",
+        description: timedOut ? "Backend did not respond within 10 seconds. Please retry." : "Could not reach backend.",
+        variant: "destructive",
+      });
+    } finally {
+      window.clearTimeout(timeout);
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const isAdmin = false;

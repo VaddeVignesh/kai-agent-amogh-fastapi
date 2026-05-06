@@ -12,6 +12,7 @@ from psycopg2 import OperationalError
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2.extras import RealDictCursor
 
+from app.config.domain_loader import get_default_limit
 from app.registries.sql_registry import SQL_REGISTRY, QuerySpec
 
 
@@ -73,7 +74,7 @@ class PostgresQueryError(RuntimeError):
 class PostgresAdapter:
 
     MAX_ROWS: int = 500
-    DEFAULT_LIMIT: int = 10
+    DEFAULT_LIMIT: int = get_default_limit()
     MAX_LIMIT: int = 200
 
     def __init__(self, cfg: PostgresConfig):
@@ -143,10 +144,6 @@ class PostgresAdapter:
         sql_stripped = sql.strip()
         sql_lower = sql_stripped.lower()
 
-        # -----------------------------------------------------
-        # 🔐 STRICT SECURITY
-        # -----------------------------------------------------
-
         # Allow CTE-based selects (WITH ... SELECT ...)
         if not (sql_lower.startswith("select") or sql_lower.startswith("with")):
             raise PostgresQueryError("Only SELECT queries are allowed.")
@@ -155,7 +152,7 @@ class PostgresAdapter:
         if any(word in sql_lower for word in forbidden):
             raise PostgresQueryError("Unsafe SQL detected.")
 
-        # 🚨 BLOCK positional parameters ($1, $2, ...)
+        # Block positional parameters; generated SQL must use named params.
         if re.search(r"\$\d+", sql_stripped):
             raise PostgresQueryError(
                 "Positional parameters ($1, $2...) are not supported. "
@@ -184,7 +181,7 @@ class PostgresAdapter:
         sql_param_names = re.findall(r"%\((\w+)\)s", sql)
         filtered_params = {k: v for k, v in params.items() if k in sql_param_names}
 
-        _dprint(f"🔍 Params filter: {len(params)} → {len(filtered_params)} (SQL has: {sql_param_names})")
+        _dprint(f"Params filter: {len(params)} -> {len(filtered_params)} (SQL has: {sql_param_names})")
 
         return self._execute_fetch_all(sql, filtered_params)
 
@@ -252,9 +249,7 @@ class PostgresAdapter:
             conn = pool.getconn()
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
-                _dprint(f"🔍 DEBUG _execute_fetch_all: params={params}")
-
-                # ALWAYS pass params
+                _dprint(f"_execute_fetch_all params={params}")
                 cur.execute(sql, params or {})
 
                 rows: List[Dict[str, Any]] = []

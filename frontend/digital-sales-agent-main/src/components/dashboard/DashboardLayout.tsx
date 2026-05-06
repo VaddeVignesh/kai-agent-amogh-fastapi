@@ -14,8 +14,33 @@ export default function DashboardLayout({ children, title, subtitle }: Dashboard
   const { theme, toggle } = useTheme();
   const navigate = useNavigate();
 
-  const handleSignOut = () => {
+  const handleSignOut = async () => {
+    let sessionId = "";
+    try {
+      const raw = sessionStorage.getItem("dsa_session");
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        sessionId = String(parsed?.session_id || "");
+      }
+    } catch {}
+
+    if (sessionId) {
+      try {
+        await fetch("http://localhost:8010/session/clear", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: sessionId,
+            include_idem: true,
+            include_lock: true,
+          }),
+        });
+      } catch {}
+    }
+
     localStorage.removeItem("dsa_auth");
+    sessionStorage.removeItem("dsa_session");
+    window.__dsa_session = undefined;
     navigate("/login", { replace: true });
   };
 
