@@ -9,7 +9,7 @@ requests>=2.31.0
 # NOTE: Keep versions pinned to avoid Python 3.12 forward-ref issues.
 langgraph==0.0.26
 langchain-core==1.2.22
-langsmith==0.1.81
+langsmith==0.8.0
 
 # LLM client + data stores
 groq>=1.0.0
@@ -25,4 +25,4 @@ pandas>=2.2.0
 pytest>=8.0.0
 
 # UI
-streamlit>=1.33.0
+streamlit==1.43.2
