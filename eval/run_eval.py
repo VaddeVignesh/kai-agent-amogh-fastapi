@@ -2,15 +2,35 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List
+from urllib.parse import urlparse, urlunparse
+
+
+def _validate_url(url: str) -> str:
+    try:
+        if "/../" in url or re.search(r"/%2e%2e/", url, re.IGNORECASE):
+            raise ValueError("Invalid path")
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("Invalid protocol")
+        if not parsed.hostname:
+            raise ValueError("Invalid host")
+        allowed_domains = ["example.com"]  # add your allowed domains here
+        if parsed.hostname.lower() not in allowed_domains:
+            raise ValueError("Invalid host")
+        return urlunparse(parsed)
+    except Exception:
+        raise ValueError("Invalid URL")
 
 
 def _post_json(url: str, payload: Dict[str, Any], timeout_sec: int) -> Dict[str, Any]:
+    validated_url = _validate_url(url)
     req = urllib.request.Request(
-        url=url,
+        url=validated_url,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
