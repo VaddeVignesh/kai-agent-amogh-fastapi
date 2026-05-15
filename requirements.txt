@@ -8,7 +8,7 @@ requests>=2.31.0
 # Orchestration
 # NOTE: Keep versions pinned to avoid Python 3.12 forward-ref issues.
 langgraph==0.0.26
-langchain-core==1.2.22
+langchain-core==1.3.3
 langsmith==0.8.0
 
 # LLM client + data stores
