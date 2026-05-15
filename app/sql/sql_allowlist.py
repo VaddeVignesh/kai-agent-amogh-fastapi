@@ -11,6 +11,7 @@ from app.config.sql_rules_loader import (
     get_allowed_tables as get_config_allowed_tables,
     get_forbidden_patterns,
 )
+from app.auth import get_session_postgres_table_allowlist
 
 
 @dataclass
@@ -30,6 +31,31 @@ DEFAULT_ALLOWLIST = SQLAllowlist(
     allowed_columns=get_config_allowed_columns(),
     forbidden_patterns=get_forbidden_patterns(),
 )
+
+
+def build_allowlist_for_session(
+    session_context: dict | None,
+    base: SQLAllowlist = DEFAULT_ALLOWLIST,
+) -> SQLAllowlist:
+    """
+    Intersect the global allowlist with role_access.postgres_tables when present.
+    """
+    restricted = get_session_postgres_table_allowlist(session_context)
+    if not restricted:
+        return base
+    restrict_set = {str(x).lower() for x in restricted}
+    new_tables = {t for t in base.allowed_tables if str(t).lower() in restrict_set}
+    if not new_tables:
+        new_tables = set(base.allowed_tables) & restrict_set
+    allowed_lower = {str(t).lower() for t in new_tables}
+    new_cols = {
+        k: v for k, v in base.allowed_columns.items() if str(k).lower() in allowed_lower
+    }
+    return SQLAllowlist(
+        allowed_tables=new_tables,
+        allowed_columns=new_cols,
+        forbidden_patterns=list(base.forbidden_patterns),
+    )
 
 
 def is_table_allowed(table_name: str, allowlist: SQLAllowlist = DEFAULT_ALLOWLIST) -> bool:

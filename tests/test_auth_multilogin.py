@@ -26,9 +26,14 @@ def test_multiple_customer_logins_get_unique_customer_sessions() -> None:
 
     for username, password in CUSTOMER_USERS.items():
         role = login(username, password)
-        assert role == "customer"
-        session_id = generate_session_id(username, role)
-        assert session_id.startswith(f"customer:{username}:")
+        if username == "customer5":
+            assert role == "customer_ops_only"
+            session_id = generate_session_id(username, role)
+            assert session_id.startswith(f"customer_ops_only:{username}:")
+        else:
+            assert role == "customer"
+            session_id = generate_session_id(username, role)
+            assert session_id.startswith(f"customer:{username}:")
         sessions.append(session_id)
 
     assert len(set(sessions)) == len(CUSTOMER_USERS)

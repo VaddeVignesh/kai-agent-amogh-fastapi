@@ -1,507 +1,639 @@
-# Low-Level Design: End-to-End Query Execution
+# Low-Level Design: Query Execution
 
-![LLD Query Execution Flow](assets/LLD_QUERY_EXECUTION.png)
-
-This document describes the current end-to-end execution flow from HTTP request to HTTP response, based on the updated runtime behavior now implemented in the system.
+This document focuses on the current query execution path from HTTP request to final answer.
 
 ---
 
 ## 1. Scope
 
-- request entry
-- session load
-- turn classification
+Covered:
+
+- `/query` request handling
+- session and idempotency
 - intent and slot extraction
-- validation and clarification
-- single or composite planning
-- finance / ops / mongo execution
-- deterministic merge
-- summarization
-- response and session persistence
+- clarification
+- planning
+- single and composite execution
+- finance/ops/mongo agents
+- merge and compact payload
+- source reconciliation
+- business reasoning
+- answer generation
+- response, trace, and persistence
 
 ---
 
-## 2. Runtime Overview
+## 2. Request Entry
 
-- **Role**: maritime analytics chatbot for voyages, vessels, ports, cargo grades, profitability, delays, offhire, metadata, rankings, and scenario comparisons
-- **Data stores**:
-  - PostgreSQL: `finance_voyage_kpi`, `ops_voyage_summary`
-  - MongoDB: voyages, vessels, nested remarks/fixtures/metadata
-  - Redis: session memory, clarification state, result-set follow-up state
-- **LLM responsibilities**:
-  - intent and slot extraction
-  - guarded dynamic SQL generation
-  - final answer drafting
-- **Constraint**: the LLM never talks directly to the databases
+The frontend sends:
+
+```http
+POST /query
+```
+
+Payload:
+
+```json
+{
+  "query": "Which voyages have high revenue but weak business quality?",
+  "session_id": "customer-session",
+  "request_id": "unique-request-id",
+  "chat_history": []
+}
+```
+
+FastAPI:
+
+1. Creates session id if missing.
+2. Checks idempotency if `request_id` is present.
+3. Calls `router.handle(session_id, query)`.
+4. Schedules query side effects in background tasks.
+5. Returns `QueryResponse`.
 
 ---
 
-## 3. Entry Points
+## 3. Query Response Contract
 
-### API
-`app/main.py`
+Response:
 
-- `POST /query`
-- `POST /session/clear`
+```json
+{
+  "session_id": "customer-session",
+  "answer": "...",
+  "clarification": null,
+  "trace": [],
+  "intent_key": "analysis.high_revenue_low_pnl",
+  "slots": {},
+  "dynamic_sql_used": true,
+  "dynamic_sql_agents": ["finance", "ops"]
+}
+```
 
-`POST /query` calls:
-- `router.handle(session_id=..., user_input=req.query)`
+If clarification is needed:
 
-It returns:
-- `answer`
-- `clarification`
-- `trace`
+```json
+{
+  "answer": "",
+  "clarification": "### Quick question ...",
+  "intent_key": "vessel.summary",
+  "slots": {}
+}
+```
+
+---
+
+## 4. Query Execution Sequence
+
+```mermaid
+sequenceDiagram
+    participant API as FastAPI
+    participant Router as GraphRouter
+    participant Redis
+    participant LLM
+    participant Planner
+    participant Finance
+    participant Ops
+    participant Mongo
+    participant Merger
+
+    API->>Router: handle(session_id, user_input)
+    Router->>Redis: load_session()
+    Router->>Router: fast paths + deterministic routing
+    Router->>LLM: extract_intent_slots if needed
+    Router->>Router: validate required slots
+    alt missing slots
+        Router->>Redis: save pending clarification
+        Router-->>API: clarification
+    else executable
+        Router->>Planner: build_plan()
+        alt single
+            Router->>Finance: registry/direct query if needed
+            Router->>Ops: registry/direct query if needed
+            Router->>Mongo: metadata/context if needed
+        else composite
+            Router->>Finance: registry or guarded dynamic SQL
+            Router->>Ops: ops enrichment by voyage_id
+            Router->>Mongo: optional context
+        end
+        Router->>Merger: merge + compact
+        Merger->>Merger: reconciliation + business reasoning
+        Router->>LLM: summarize_answer()
+        Router->>Redis: save_session()
+        Router-->>API: answer + trace
+    end
+```
+
+---
+
+## 5. Step 1: Session Load
+
+Node:
+
+`n_load_session`
+
+Reads Redis session:
+
+- stored slots
+- last intent
+- previous result set
+- focus slots
+- pending clarification
+- clarification options
+- turn count
+
+If Redis is unavailable, `RedisStore` can fall back to in-memory storage depending on configuration/runtime behavior.
+
+---
+
+## 6. Step 2: Intent And Slot Extraction
+
+Node:
+
+`n_extract_intent`
+
+Extraction order:
+
+1. Incomplete-entity exact fast paths.
+2. Simple voyage shortcut.
+3. Pending clarification resolution.
+4. Chitchat/out-of-scope handling.
+5. Result-set follow-up fast paths.
+6. Deterministic routing rules.
+7. LLM extraction if deterministic routing is insufficient.
+8. Slot sanitization and placeholder cleanup.
+
+Output:
+
 - `intent_key`
 - `slots`
-- `dynamic_sql_used`
-- `dynamic_sql_agents`
-
-### UI
-`app/UI/UX/streamlit_app.py`
-
-The Streamlit UI:
-- keeps a stable `session_id`
-- sends user text to `/query`
-- renders answer and execution trace
-
----
-
-## 4. Graph Invocation
-
-### `GraphRouter.handle()`
-Location:
-- `app/orchestration/graph_router.py`
-
-Runtime action:
-- invokes the compiled graph with initial state:
-  - `session_id`
-  - `user_input`
-  - `raw_user_input`
-
-After graph completion:
-- if `clarification` exists, return it immediately
-- otherwise return:
-  - final `answer`
-  - `trace`
-  - `intent_key`
-  - `slots`
-  - `dynamic_sql_used`
-  - `dynamic_sql_agents`
-
----
-
-## 5. GraphState
-
-Main fields carried through the graph:
-- `session_id`
-- `user_input`
-- `raw_user_input`
-- `session_ctx`
-- `intent_key`
-- `slots`
-- `missing_keys`
-- `clarification`
-- `plan_type`
-- `plan`
-- `step_index`
-- `mongo`
-- `finance`
-- `ops`
-- `data`
-- `merged`
-- `answer`
-- `artifacts`
-
-Important `artifacts` contents:
-- `trace`
-- `merged_rows`
-- `coverage`
-- `voyage_ids`
-- result-set metadata for follow-ups
-
----
-
-## 6. Graph Structure
-
-Nodes:
-- `load_session`
-- `extract`
-- `validate`
-- `clarify`
-- `build_plan`
-- `run_single`
-- `execute_step`
-- `merge`
-- `summarize`
-
-Conditional routing:
-- after validate:
-  - `clarify`
-  - `plan`
-  - or edge-case `summarize`
-- after plan:
-  - `single`
-  - `composite`
-- after single:
-  - `done`
-  - `merge`
-  - `escalate` to composite
-- after composite execution:
-  - `more`
-  - `done`
-
----
-
-## 7. Node-by-Node Lifecycle
-
-### 7.1 `n_load_session`
-Loads prior session memory from Redis.
-
-Typical data restored:
-- previous slots
-- previous intent
-- pending clarification state
-- `last_result_set`
-- `last_focus_slots`
-- previous user input
-
-### 7.2 `n_extract_intent`
-This is the main normalization stage before planning.
-
-It currently handles:
-- clarification-follow-up resolution
-- follow-up result-set fast paths
-- placeholder slot cleanup
-- deterministic routing overrides
-- session-aware slot carry-forward
-- `LLMClient.extract_intent_slots(...)`
-
-Important recent behavior now reflected in code:
-- stronger fresh-question vs follow-up classification
-- explicit `followup.result_set` fast path
-- voyage-linked vessel metadata detection
-- metadata-first routing for correct source selection
-
-### 7.3 `n_validate_slots`
-Checks required slots from `INTENT_REGISTRY`.
-
-Important behavior:
-- treats placeholders such as generic `vessel`, `voyage`, or `port` as missing
-- avoids unnecessary clarification for fleet-wide composite intents
-
-### 7.4 `n_make_clarification`
-Builds the clarification message and persists pending clarification context to Redis.
-
-Execution stops after this node for that turn.
-
-### 7.5 `n_plan`
-Calls `Planner.build_plan(...)`.
-
-Planner output:
-- `plan_type`
-- `intent_key`
-- `confidence`
-- ordered execution `steps`
-
-### 7.6 `n_run_single`
-Used for direct entity or metadata questions.
-
-Typical intents handled here:
-- `voyage.summary`
-- `vessel.summary`
-- `voyage.metadata`
-- `vessel.metadata`
-- `ranking.vessel_metadata`
-- `followup.result_set`
-
-Important updated behavior:
-- single-path result-set persistence
-- dedicated Mongo-backed metadata handlers
-- single-path clarification support
-- zero-row escalation trigger if a fleet-style question was misclassified as single
-
-### 7.7 `n_execute_step`
-Runs one composite step at a time.
-
-Typical step sequence:
-1. optional `mongo.resolveAnchor`
-2. `finance.dynamicSQL`
-3. `ops.dynamicSQL`
-4. optional `mongo.fetchRemarks`
-5. deterministic merge step
-
-Important behavior:
-- normalizes operation names such as `dynamicSQL -> dynamic_sql`
-- extracts `voyage_ids` from finance output for downstream ops/mongo steps
-- records trace per step
-
-### 7.8 `n_merge`
-Copies normalized data into `state["merged"]` and marks:
-- `dynamic_sql_used`
-- `dynamic_sql_agents`
-
-### 7.9 `n_summarize`
-Builds the final answer using:
-- merged data
-- `compact_payload(...)`
-- payload sanitization
-- `LLMClient.summarize_answer(...)`
-
-It also persists:
-- updated session memory
-- result-set memory for follow-ups
-
----
-
-## 8. Planner Details
-
-Planner file:
-- `app/orchestration/planner.py`
-
-Important current behaviors:
-- deterministic planner, no second planning LLM call
-- alias resolution through `resolve_intent(...)`
-- entity-anchored questions stay on `single`
-- registry-declared analytical intents go to `composite`
-- `force_composite` supports zero-row escalation
-- text-driven composite triggers include:
-  - `offhire + pnl`
-  - `delayed + expense`
-  - `trend`
-  - `over time`
-  - `cargo + port`
-
-Composite builder now generally produces:
-- finance first
-- ops second
-- Mongo enrichment when allowed
-- merge last
-
----
-
-## 9. Single Path Details
-
-Single path is used for:
-- direct voyage summaries
-- direct vessel summaries
-- metadata-heavy entity questions
-- Mongo-backed metadata views
-- result-set follow-up actions
-
-Single path sources can include:
-- registry SQL
-- direct Mongo document fetch
-- mixed finance + ops + Mongo assembly for summary-style responses
-
-Updated single-path special handling:
-- `vessel.metadata`
-- `voyage.metadata`
-- `ranking.vessel_metadata`
-- single-path result-set persistence
-- zero-row escalation into composite when needed
-
----
-
-## 10. Composite Path Details
-
-Composite path is used for:
-- rankings
-- aggregates
-- trends
-- scenario comparisons
-- high-revenue/low-PnL analytics
-- offhire and delay analysis
-
-### Finance step
-`FinanceAgent.run_dynamic(...)`
-
-Pipeline:
-1. generate SQL through `SQLGenerator`
-2. validate through `sql_guard`
-3. execute through `PostgresAdapter.execute_dynamic_select`
-4. attempt repair if recoverable
-5. store rows and `voyage_ids`
-
-### Ops step
-`OpsAgent.run_dynamic(...)`
-
-Pipeline:
-1. consume `voyage_ids` from finance when available
-2. use canonical ops fetches where possible
-3. otherwise use guarded ops SQL
-4. return ports, grades, offhire, delays, remarks-related context
-
-### Mongo enrichment
-Mongo can be used for:
-- anchor resolution
-- remarks enrichment
-- metadata context when enabled by intent
-
-### Deterministic merge
-The row-level merge is handled by orchestration logic and produces:
-- `merged_rows`
-- `coverage`
-
-This is where finance, ops, and Mongo-derived fields are combined before summarization.
-
----
-
-## 11. Metadata Paths
-
-Current low-level metadata handling is more explicit than before.
-
-### `vessel.metadata`
-Mongo-backed entity metadata for:
-- hire rate
-- scrubber
-- market type
-- operating status
-- account code
-- passage types
-- consumption profiles
-- tags
-- contract history
-
-### `voyage.metadata`
-Voyage-anchored Mongo metadata for:
-- fixture/commercial fields
-- ports and route details
-- cargo details
-- bunkers and emissions fields
-- remarks and projected fields
-
-### `ranking.vessel_metadata`
-Fleet-wide vessel metadata ranking/listing from Mongo only.
+- trace event
 
 Examples:
-- currently operating vessels
-- scrubber / non-scrubber vessels
-- highest hire rate
-- ballast/laden speed
-- short/long pool
-- contract duration
+
+| Query | Expected behavior |
+| --- | --- |
+| `tell me about vessel` | `vessel.summary`, missing `vessel_name`, clarification |
+| `tell me about vesssl` | typo variant, same vessel clarification |
+| `tell me about voyage` | `voyage.summary`, missing `voyage_number`, clarification |
+| `tell me about port` | `port.details`, missing `port_name`, clarification |
+| `Which vessels are profitable but operationally risky?` | `ranking.vessels`, composite finance+ops |
 
 ---
 
-## 12. Follow-Up Handling
+## 7. Step 3: Slot Validation And Clarification
 
-The router now has a dedicated result-set follow-up layer.
+Node:
 
-Supported actions include:
-- top/bottom filtering
-- compare extremes
-- choose selected row
-- show remarks for selected row
-- project ports or grades from selected row
-- filter rows having a field
+`n_validate_slots`
 
-This depends on session fields such as:
-- `last_result_set`
-- `last_focus_slots`
-- `last_user_input`
+The router checks required slots from `INTENT_REGISTRY`.
 
-This is one of the major architectural updates relative to the earlier flow.
+Examples:
 
----
+- `voyage.summary` requires `voyage_number`.
+- `port.details` requires `port_name`.
+- `vessel.summary` accepts `vessel_name` or `imo` and treats missing/placeholder values as missing.
 
-## 13. SQL Layer
+If missing:
 
-### `sql_generator.py`
-Responsible for:
-- building schema-aware prompts
-- appending registry-driven SQL hints
-- producing finance or ops SQL
+1. `n_make_clarification` builds a message.
+2. Suggestions are fetched where possible.
+3. Redis stores pending context.
+4. Execution stops.
 
-Updated guidance now includes:
-- stronger aggregate patterns
-- `NULLS LAST` guidance for ranked numeric metrics
-- better intent-specific hints for vessel ranking and cargo profitability
+Clarification examples:
 
-### `sql_guard.py`
-Responsible for:
-- SELECT-only enforcement
-- allowlist validation
-- param sanitation
-- `LIMIT` enforcement
-- rejection of unsupported tables or columns
-
-### `sql_allowlist.py`
-Constrains dynamic SQL to allowed tables and columns.
+- "You asked about a vessel, but didn’t specify which one."
+- "You asked about a voyage, but didn’t specify the voyage number."
+- "You asked about a port, but didn’t specify which one."
 
 ---
 
-## 14. Summarization Layer
+## 8. Step 4: Planning
 
-Final answer generation happens in `LLMClient.summarize_answer(...)`.
+Node:
 
-Pipeline:
-1. prepare compact JSON-safe merged payload
-2. build strict answer-format prompt
-3. get LLM draft answer
-4. apply deterministic post-processing and answer guards
+`n_plan`
 
-Important current answer guards:
-- ranking-voyage answer repair
-- ranking-vessel answer repair
-- cargo-profitability answer repair
+Planner input:
 
-These are used to stabilize aggregate outputs when the raw LLM summary is weaker than the available data.
+- `intent_key`
+- `slots`
+- `user_input`
+- `session_ctx`
+- optional `force_composite`
 
----
+Planner output:
 
-## 15. Execution Trace
-
-Trace is emitted into `artifacts.trace`.
-
-Current trace events include:
-- `intent_extraction`
-- `planning`
-- `composite_step_start`
-- `composite_step_result`
-- `token_usage`
-
-UI-visible trace information includes:
-- agent
-- operation
-- inputs
-- SQL when present
-- row counts
-- voyage-id extraction
-- skip/escalation reasons
+```json
+{
+  "plan_type": "composite",
+  "intent_key": "analysis.high_revenue_low_pnl",
+  "steps": [
+    {"agent": "finance", "operation": "dynamicSQL"},
+    {"agent": "ops", "operation": "dynamicSQL"},
+    {"agent": "llm", "operation": "merge"}
+  ]
+}
+```
 
 ---
 
-## 16. Design Constraints
+## 9. Step 5A: Single Execution
 
-### 1. The LLM never queries databases directly
-All DB access is routed through agents and adapters.
+Node:
 
-### 2. Dynamic SQL is always guarded
-Prompt generation alone is never trusted.
+`n_run_single`
 
-### 3. Merge happens before narration
-The system first retrieves and joins data, then explains it.
+Used for:
 
-### 4. Session memory is explicit
-Only useful conversational state is preserved, and stale anchors are cleared when intent families change.
+- direct voyage summary
+- direct vessel summary
+- metadata lookup
+- port details
+- result-set follow-ups that can be answered directly
+- out-of-scope templates
+
+Typical behavior:
+
+1. Select the relevant agent.
+2. Run registry SQL or direct Mongo fetch.
+3. Store result in state.
+4. Either return directly or route to merge/summarize.
 
 ---
 
-## 17. Summary
+## 10. Step 5B: Composite Execution
 
-The updated low-level request flow is:
+Node:
 
-1. request enters FastAPI
-2. `GraphRouter` loads session state
-3. turn is classified
-4. intent and slots are extracted
-5. required slots are validated
-6. clarification is generated if needed
-7. planner chooses `single` or `composite`
-8. agents query Postgres and Mongo
-9. router merges results deterministically
-10. summarizer drafts the final answer
-11. session state and result-set memory are saved
-12. response plus trace are returned
+`n_execute_step`
 
-This is the current implemented flow and should be used as the authoritative LLD for end-to-end request execution.
+Composite steps run in a loop.
+
+Typical analytics query:
+
+1. Finance step:
+   - registry SQL or dynamic SQL.
+   - returns rows and voyage ids when row-level.
+
+2. Ops step:
+   - resolves `$finance.voyage_ids`.
+   - fetches ports, cargo grades, delays, offhire, remarks by `voyage_id`.
+   - skips when finance result is aggregate-only and self-contained.
+
+3. Mongo step:
+   - optional metadata/remarks enrichment where allowed.
+
+4. Merge step:
+   - deterministic merge and artifact preparation.
+
+---
+
+## 11. Finance Dynamic SQL Detail
+
+Flow:
+
+```text
+question + intent + slots
+  -> SQLGenerator.generate(agent="finance")
+  -> LLMClient.generate_sql()
+  -> sql_guard.validate_and_prepare_sql()
+  -> PostgresAdapter.execute_dynamic_select()
+```
+
+Guarded properties:
+
+- read-only
+- allowed tables
+- allowed columns
+- required limit
+- placeholder params
+- invalid columns rejected
+- dangerous patterns blocked
+
+Finance dynamic SQL should use `finance_voyage_kpi` and only join ops when config/intent permits it. Finance/ops joins should use `f.voyage_id = o.voyage_id`.
+
+---
+
+## 12. Ops Dynamic SQL Detail
+
+OpsAgent prefers canonical paths:
+
+- if `voyage_ids` exists:
+  - `SELECT ... FROM ops_voyage_summary WHERE voyage_id = ANY(%(voyage_ids)s)`
+
+- if `voyage_number` exists:
+  - resolve matching voyage id
+  - rerun by voyage ids
+
+- if vessel summary:
+  - deterministic vessel ops summary
+
+Only when canonical paths do not apply does it use guarded dynamic SQL.
+
+Ops dynamic SQL is not allowed to include finance-only metrics such as PnL/revenue unless the finance agent is responsible for those values.
+
+---
+
+## 13. Mongo Execution Detail
+
+Mongo paths:
+
+1. Direct anchor fetch:
+   - vessel by name/IMO
+   - voyage by number/id
+
+2. Full voyage context:
+   - remarks
+   - fixtures
+   - route/legs
+   - projected fields
+
+3. Dynamic Mongo find:
+   - LLM creates JSON spec
+   - Mongo guard validates
+   - MongoAdapter executes read-only find
+
+---
+
+## 14. Merge And Identity
+
+The merge layer combines finance, ops, and Mongo context.
+
+Primary identity:
+
+- `voyage_id`
+
+Display identity:
+
+- `voyage_number`
+- vessel name
+- vessel IMO
+
+Reason:
+
+- `voyage_number` alone may not be safe across vessels or sources.
+
+Output:
+
+- `artifacts.merged_rows`
+- coverage metadata
+- dynamic SQL metadata
+- source sections
+
+---
+
+## 15. Compact Payload
+
+Function:
+
+`compact_payload(merged)`
+
+Purpose:
+
+- reduce token size
+- keep only decision-relevant fields
+- avoid overwhelming the summarizer
+
+Preserved:
+
+- voyage/vessel identity
+- PnL
+- revenue
+- total expense
+- TCE
+- commission
+- margin
+- cost ratio
+- commission ratio
+- offhire days
+- delay reason
+- ports
+- cargo grades
+- remarks
+- source reconciliation
+- business reasoning
+
+Trimmed:
+
+- large raw finance rows
+- large raw ops rows
+- large Mongo docs
+- long remarks
+- long port/cargo lists
+
+---
+
+## 16. Source Reconciliation
+
+Function:
+
+`reconcile_merged_row(row)`
+
+Config:
+
+`config/business_rules.yaml`
+
+Checks fields such as:
+
+- `voyage_id`
+- `vessel_imo`
+- `imo`
+- `vessel_name`
+- `voyage_number`
+
+Result:
+
+```json
+{
+  "status": "aligned",
+  "severity": "info",
+  "canonical_fields": {},
+  "caveats": [],
+  "matched_fields": [],
+  "missing_or_single_source_fields": [],
+  "mismatches": []
+}
+```
+
+The answer prompt uses mismatch/blocking severity as a data caveat.
+
+---
+
+## 17. Business Reasoning
+
+Function:
+
+`enrich_row_with_business_reasoning(row)`
+
+Config:
+
+`config/business_rules.yaml`
+
+Adds:
+
+- derived metrics
+- signals
+- unavailable metrics
+
+Example derived metrics:
+
+- margin
+- cost ratio
+- commission ratio
+
+Example signals:
+
+- inefficient revenue
+- loss-making
+- delay exposure
+- profitable but operationally risky
+- weak business quality
+
+---
+
+## 18. Answer Generation
+
+Function:
+
+`LLMClient.summarize_answer(...)`
+
+Inputs:
+
+- question
+- plan
+- compacted merged data
+- merged rows
+- answer style flags
+- business answer contract
+
+Prompt:
+
+`config/prompt_rules.yaml`
+
+Rules:
+
+- use only provided JSON
+- prefer `data.artifacts.merged_rows`
+- include relevant KPIs
+- include margin/cost ratio when relevant
+- use reasoning signals for impact
+- mention source caveats when relevant
+- avoid irrelevant missing-field caveats
+- return readable markdown
+
+---
+
+## 19. Trace Output
+
+Trace events may include:
+
+- intent extraction
+- planning
+- composite step start
+- composite step result
+- resolved voyage ids
+- generated SQL
+- Mongo query spec
+- token usage
+- merge summary
+
+Frontend diagnostics consume this trace to show how the answer was produced.
+
+---
+
+## 20. Persistence After Answer
+
+After answer generation:
+
+- Redis session is updated.
+- last intent and slots are persisted.
+- result-set memory can be saved for follow-ups.
+- background tasks record metrics, audit, user query records, and execution history.
+- idempotency response can be cached by request id.
+
+---
+
+## 21. Query Execution Examples
+
+### Incomplete Vessel Query
+
+Input:
+
+```text
+tell me about vesssl
+```
+
+Flow:
+
+1. Incomplete-entity fast path recognizes typo variant.
+2. Intent becomes `vessel.summary`.
+3. No vessel name/IMO exists.
+4. Router returns clarification with vessel suggestions.
+
+### Business Quality Query
+
+Input:
+
+```text
+Which voyages have high revenue but weak business quality?
+```
+
+Flow:
+
+1. Intent extracted as business/finance analysis.
+2. Planner chooses composite.
+3. Finance retrieves high-revenue weak-quality candidates.
+4. Ops enriches rows by `voyage_id`.
+5. Merge builds `merged_rows`.
+6. Business reasoning computes margin/cost ratio and weak-quality signals.
+7. LLM explains why revenue alone is not enough.
+
+### Profitable But Risky Vessel Query
+
+Input:
+
+```text
+Which vessels are profitable but operationally risky?
+```
+
+Flow:
+
+1. Routing avoids metadata-only path because finance/risk terms are present.
+2. Intent becomes `ranking.vessels`.
+3. Finance+ops aggregate by vessel.
+4. Response includes PnL and delay/offhire risk context.
+
+---
+
+## 22. Failure Handling
+
+Common handled cases:
+
+- missing slots -> clarification
+- generated SQL invalid -> guard failure/retry path where configured
+- unsupported Mongo spec -> guard error
+- zero rows from wrong single route -> composite escalation where safe
+- Redis unavailable -> fallback behavior
+- source mismatch -> reconciliation caveat
+- empty payload -> configured fallback answer
+
+---
+
+## 23. LLD Summary
+
+Low-level query execution is controlled by a graph:
+
+1. Load session.
+2. Extract intent and slots.
+3. Validate or clarify.
+4. Plan.
+5. Execute agents.
+6. Merge by `voyage_id`.
+7. Reconcile sources.
+8. Add business reasoning.
+9. Compact payload.
+10. Summarize through LLM.
+11. Persist session and trace.
+12. Return response.

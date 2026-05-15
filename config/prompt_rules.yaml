@@ -133,8 +133,7 @@ sql_generator:
       cargo_grade (derive from grades_json instead)
 
     JOIN condition — always use this exact form:
-      f.voyage_number = o.voyage_number
-      AND REPLACE(f.vessel_imo::TEXT,'.0','') = REPLACE(o.vessel_imo::TEXT,'.0','')
+      f.voyage_id = o.voyage_id
 
     ═══════════════════════════════════════
     PARAMETERS — %(name)s placeholders only, NEVER hardcode any value
@@ -328,8 +327,7 @@ sql_generator:
       cargo_grade (derive from grades_json)
 
     JOIN condition:
-      f.voyage_number = o.voyage_number
-      AND REPLACE(f.vessel_imo::TEXT,'.0','') = REPLACE(o.vessel_imo::TEXT,'.0','')
+      f.voyage_id = o.voyage_id
 
     ═══════════════════════════════════════
     PARAMETERS — %(name)s placeholders only, never hardcode values
@@ -501,6 +499,7 @@ llm_client:
     - TABLE RULE: Never put a conclusion, summary sentence, or explanatory text as a row inside a markdown table. All conclusions MUST appear BELOW the table as plain text. A table row contains only data values.
     - VESSEL ID RULE: The vessel_name field is ALWAYS populated in the merged data. Use vessel_name as the row identifier. If you see a column called vessel_id or voyage_id containing a long hex string, do NOT show that column - drop it entirely. The column header must be 'Vessel' or 'Vessel Name', never 'Vessel ID'.
     - AMBIGUOUS VOYAGE RULE: If the data contains multiple rows with the same voyage_number but different vessel_name values, do NOT silently pick one. Open the response with exactly this pattern: 'Voyage [X] exists across [N] vessels in the dataset. Showing all results below - specify a vessel name to narrow down.' Then show a table with voyage_number, vessel_name, PnL, revenue as the first columns so the user can identify which vessel they meant. Never merge rows from different vessels even if voyage_number matches.
+    - DECISION-GRADE CONTRACT: For non-trivial analytical answers, make the response cover What happened, Why it matters, Business impact, and Data caveats. Do not force these as headings for clarifications, greetings, out-of-scope responses, or single-value factual answers.
 
     DATA PRIORITY:
     - If data.artifacts.merged_rows exists, it is the PRIMARY joined dataset (one item per voyage).
@@ -509,6 +508,16 @@ llm_client:
     - In merged_rows, ops enrichment may appear as cargo_grades, key_ports, and remarks (even if ops.rows is empty).
     - When grades/ports/remarks exist in the JSON, include them. Do NOT claim they are unavailable.
     - If data.artifacts.coverage is present, use it to avoid false "Not available" claims.
+    - If a row has source_reconciliation.status="mismatch", do NOT treat the merged row as fully reliable. Mention the mismatch as a data caveat and avoid drawing causal conclusions from that row.
+    - If a row has source_reconciliation.severity="blocking", explicitly lower confidence in any recommendation for that row.
+    - If a row has business_reasoning.signals, use those signals as decision context for "why it matters" and "business impact"; do not invent causes beyond the available data.
+    - If a row has business_reasoning.derived_metrics.margin or a top-level margin, include Margin in the answer when the user asks about margin, revenue conversion, efficiency, commercial quality, or business quality.
+    - If a row has business_reasoning.derived_metrics.cost_ratio or a top-level cost_ratio, include Cost ratio in the answer when the user asks about cost efficiency, weak quality, or revenue conversion.
+    - When the user asks about cargo attractiveness from a margin perspective, the Results table MUST include a Margin column if any margin value exists in merged_rows.
+    - When the user asks about weak business quality, the answer MUST explicitly name PnL and include PnL values when present.
+    - Do not mention missing cargo grades, ports, remarks, or other unavailable fields unless the user specifically asked for those fields. Keep data caveats relevant to the question.
+    - If the user asks for caveats and no source mismatch exists, still include a short Data caveat line using source_reconciliation.caveats, coverage, sample size, missing fields, or "no caveat beyond the provided data" if nothing else is present.
+    - If business_answer_contract is present in the payload, use it as the answer-quality checklist for analytical responses.
     - For ranking.* intents: each item in merged_rows HAS pnl, revenue, total_expense at the top level. You MUST include PnL and Revenue (and Total expense when present) as columns in the Results table.
 
     STYLE / STRUCTURE (always follow):
@@ -615,6 +624,10 @@ llm_client:
   default_sql_json_prompt: Return SQL JSON only.
   ranking_answer_hint: |
     Each object in merged_rows has numeric fields pnl, revenue, total_expense at the top level. You MUST include PnL and Revenue (and Total expense when present) as columns in the Results table. Do NOT say financial metrics are not available.
+  ops_only_voyage_answer_instruction: |
+    HARD CONSTRAINT: This login cannot read canonical financial KPI tables (revenue, total expenses, PnL, TCE, commission).
+    Do NOT estimate, derive, infer, or calculate those figures from fixtures, hire rates, legs, bills of lading, remarks, or any other operational text.
+    If the user asks for financial totals, say that commercial financial KPIs are not available for this workspace and answer with operational facts only (ports, delays, grades, remarks, module type) that appear explicitly in the payload.
   out_of_scope_responses:
     greeting: |
       ### Hello
@@ -678,6 +691,8 @@ llm_client:
     - REMARKS RULE: Never quote full contract text or long raw remarks verbatim. Summarize each remark in 1 short sentence max. Cap at 3 remarks.
     - TABLE RULE: Never put a conclusion sentence as a row inside a markdown table. Conclusions go BELOW the table as plain text.
     - VESSEL RULE: Always show vessel name clearly, not a raw database ID or UUID.
+    - DECISION-GRADE RULE: For analytical answers, preserve the meaning of What happened, Why it matters, Business impact, and Data caveats even if you do not use those exact headings.
+    - Use business_reasoning.signals and source_reconciliation metadata as evidence. If source_reconciliation.severity is blocking, mention the caveat and avoid overconfident conclusions.
   answer_generation_fallbacks:
     no_recent_context: No recent conversational context.
     empty_answer: Not available in dataset.

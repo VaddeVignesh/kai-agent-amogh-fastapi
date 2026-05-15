@@ -26,12 +26,15 @@ queries:
                     o.activities_json
                   FROM finance_voyage_kpi f
                   LEFT JOIN ops_voyage_summary o
-                    ON f.voyage_number = o.voyage_number
-                    AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+                    ON f.voyage_id = o.voyage_id
                   WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
                     AND (
-                      (%(voyage_number)s IS NOT NULL AND f.voyage_number::TEXT = %(voyage_number)s::TEXT)
-                      OR (%(voyage_id)s IS NOT NULL AND f.voyage_id::TEXT = %(voyage_id)s::TEXT)
+                      (%(voyage_id)s IS NOT NULL AND f.voyage_id::TEXT = %(voyage_id)s::TEXT)
+                      OR (
+                        %(voyage_id)s IS NULL
+                        AND %(voyage_number)s IS NOT NULL
+                        AND f.voyage_number::TEXT = %(voyage_number)s::TEXT
+                      )
                     )
                     AND (
                       %(vessel_imo)s IS NULL
@@ -64,8 +67,7 @@ queries:
                     o.grades_json
                   FROM finance_voyage_kpi f
                   LEFT JOIN ops_voyage_summary o
-                    ON f.voyage_number = o.voyage_number
-                    AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+                    ON f.voyage_id = o.voyage_id
                   WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
                     AND (%(voyage_number)s IS NULL OR f.voyage_number = %(voyage_number)s)
                     AND (%(port_name)s IS NULL OR o.ports_json::text ILIKE '%%' || %(port_name)s || '%%')
@@ -181,8 +183,7 @@ queries:
                     o.remarks_json
                   FROM finance_voyage_kpi f
                   LEFT JOIN ops_voyage_summary o
-                    ON f.voyage_number = o.voyage_number
-                    AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+                    ON f.voyage_id = o.voyage_id
                   WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
                     AND o.grades_json IS NOT NULL
                     AND o.grades_json::text ILIKE '%%' || %(cargo_grade)s || '%%'
@@ -214,8 +215,7 @@ queries:
                     o.grades_json
                   FROM finance_voyage_kpi f
                   LEFT JOIN ops_voyage_summary o
-                    ON f.voyage_number = o.voyage_number
-                    AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+                    ON f.voyage_id = o.voyage_id
                   WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
                     AND (
                       o.vessel_name ILIKE '%%' || %(vessel_ref)s || '%%'
@@ -241,8 +241,7 @@ queries:
                     AVG(o.offhire_days) AS avg_offhire_days
                   FROM finance_voyage_kpi f
                   LEFT JOIN ops_voyage_summary o
-                    ON f.voyage_number = o.voyage_number
-                    AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+                    ON f.voyage_id = o.voyage_id
                   WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
                     AND f.pnl IS NOT NULL
                   GROUP BY f.vessel_imo
@@ -296,13 +295,7 @@ queries:
                       lower(trim(jsonb_array_elements_text(o.grades_json))) AS cargo_grade
                     FROM finance_voyage_kpi f
                     JOIN ops_voyage_summary o
-                      ON (
-                        (f.voyage_id IS NOT NULL AND o.voyage_id IS NOT NULL AND f.voyage_id = o.voyage_id)
-                        OR (
-                          f.voyage_number = o.voyage_number
-                          AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
-                        )
-                      )
+                      ON f.voyage_id = o.voyage_id
                     WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
                       AND o.grades_json IS NOT NULL
                       AND o.grades_json::text != '[]'
@@ -341,8 +334,7 @@ queries:
                     AVG(o.offhire_days) AS avg_offhire_days
                   FROM finance_voyage_kpi f
                   JOIN ops_voyage_summary o
-                    ON f.voyage_number = o.voyage_number
-                    AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+                    ON f.voyage_id = o.voyage_id
                   WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
                     AND o.module_type IS NOT NULL
                   GROUP BY o.module_type
@@ -371,8 +363,7 @@ queries:
                     o.voyage_end_date
                   FROM finance_voyage_kpi f
                   JOIN ops_voyage_summary o
-                    ON f.voyage_number = o.voyage_number
-                    AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+                    ON f.voyage_id = o.voyage_id
                   WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
                     AND o.ports_json::text ILIKE '%%' || %(port_name)s || '%%'
                   ORDER BY f.pnl DESC NULLS LAST
@@ -403,7 +394,74 @@ queries:
                   WHERE o.ports_json::text ILIKE '%%' || %(port_name)s || '%%'
                   ORDER BY o.voyage_end_date DESC NULLS LAST
                   LIMIT %(limit)s;
-              
+
+  ops.voyage_by_reference:
+    description: 'Voyage by voyage_id or voyage_number — ops_voyage_summary only (RBAC ops-only tenants)'
+    required_params: []
+    sql: |
+                  SELECT
+                    o.voyage_id,
+                    o.voyage_number,
+                    o.vessel_imo,
+                    o.vessel_name,
+                    o.module_type,
+                    o.fixture_count,
+                    o.is_delayed,
+                    o.delay_reason,
+                    o.offhire_days,
+                    o.ports_json,
+                    o.grades_json,
+                    o.activities_json,
+                    o.remarks_json,
+                    o.voyage_start_date,
+                    o.voyage_end_date
+                  FROM ops_voyage_summary o
+                  WHERE (
+                      (%(voyage_id)s IS NOT NULL AND o.voyage_id::TEXT = %(voyage_id)s::TEXT)
+                      OR (
+                        %(voyage_id)s IS NULL
+                        AND %(voyage_number)s IS NOT NULL
+                        AND o.voyage_number::TEXT = %(voyage_number)s::TEXT
+                      )
+                    )
+                    AND (
+                      %(vessel_imo)s IS NULL
+                      OR REPLACE(o.vessel_imo::TEXT, '.0', '') = %(vessel_imo)s::TEXT
+                    )
+                  ORDER BY o.voyage_end_date DESC NULLS LAST
+                  LIMIT COALESCE(%(limit)s, 10);
+
+  ops.vessel_voyages_by_reference:
+    description: 'All voyages for a vessel — ops_voyage_summary only (RBAC ops-only tenants)'
+    required_params:
+      - vessel_ref
+      - limit
+    sql: |
+                  SELECT
+                    o.voyage_id,
+                    o.voyage_number,
+                    o.vessel_imo,
+                    o.vessel_name,
+                    o.module_type,
+                    o.fixture_count,
+                    o.offhire_days,
+                    o.is_delayed,
+                    o.delay_reason,
+                    o.ports_json,
+                    o.grades_json,
+                    o.activities_json,
+                    o.remarks_json,
+                    o.voyage_start_date,
+                    o.voyage_end_date
+                  FROM ops_voyage_summary o
+                  WHERE (
+                      o.vessel_name ILIKE '%%' || %(vessel_ref)s || '%%'
+                      OR REPLACE(o.vessel_imo::TEXT, '.0', '') = REPLACE(%(vessel_ref)s::TEXT, '.0', '')
+                      OR o.vessel_imo::TEXT = %(vessel_ref)s::TEXT
+                    )
+                  ORDER BY o.voyage_end_date DESC NULLS LAST
+                  LIMIT %(limit)s;
+                  
   kpi.delayed_voyages_analysis:
     description: 'Get delayed voyages with finance impact'
     required_params:
@@ -426,8 +484,7 @@ queries:
                     o.voyage_end_date
                   FROM finance_voyage_kpi f
                   JOIN ops_voyage_summary o
-                    ON f.voyage_number = o.voyage_number
-                    AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+                    ON f.voyage_id = o.voyage_id
                   WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
                     AND o.is_delayed = TRUE
                     AND (%(min_offhire)s IS NULL OR o.offhire_days >= %(min_offhire)s::NUMERIC)
@@ -456,8 +513,7 @@ queries:
                     o.voyage_end_date
                   FROM finance_voyage_kpi f
                   JOIN ops_voyage_summary o
-                    ON f.voyage_number = o.voyage_number
-                    AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+                    ON f.voyage_id = o.voyage_id
                   WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
                   ORDER BY o.offhire_days DESC NULLS LAST, f.voyage_number DESC
                   LIMIT %(limit)s;
@@ -473,8 +529,8 @@ queries:
                   per_pair AS (
                       SELECT
                         f.voyage_number,
+                        f.voyage_id,
                         REPLACE(f.vessel_imo::TEXT, '.0', '') AS vessel_imo_key,
-                        MAX(f.voyage_id) AS voyage_id,
                         MAX(CASE WHEN f.scenario = COALESCE(%(scenario_actual)s, 'ACTUAL') THEN f.pnl END) AS pnl_actual_by_pair,
                         MAX(CASE WHEN f.scenario = 'WHEN_FIXED' THEN f.pnl END) AS pnl_when_fixed_by_pair,
                         MAX(CASE WHEN f.scenario = COALESCE(%(scenario_actual)s, 'ACTUAL') THEN f.tce END) AS tce_actual_by_pair,
@@ -487,22 +543,44 @@ queries:
                         COALESCE(%(scenario_actual)s, 'ACTUAL'),
                         COALESCE(%(scenario_when_fixed)s, 'WHEN_FIXED')
                       )
-                      GROUP BY f.voyage_number, REPLACE(f.vessel_imo::TEXT, '.0', '')
+                      GROUP BY f.voyage_id, f.voyage_number, REPLACE(f.vessel_imo::TEXT, '.0', '')
+                  ),
+                  distinct_imos AS (
+                    SELECT d.voyage_number,
+                           STRING_AGG(d.vessel_imo_key, ', ' ORDER BY d.vessel_imo_key) AS vessel_imo
+                    FROM (SELECT DISTINCT voyage_number, vessel_imo_key FROM per_pair) d
+                    GROUP BY d.voyage_number
+                  ),
+                  rolled AS (
+                    SELECT
+                      p.voyage_number,
+                      MAX(p.voyage_id) AS voyage_id,
+                      SUM(COALESCE(p.pnl_actual_by_pair, 0)) AS pnl_actual,
+                      SUM(COALESCE(p.pnl_when_fixed_by_pair, 0)) AS pnl_when_fixed,
+                      (SUM(COALESCE(p.pnl_when_fixed_by_pair, 0)) - SUM(COALESCE(p.pnl_actual_by_pair, 0))) AS pnl_variance,
+                      AVG(p.tce_actual_by_pair) AS tce_actual,
+                      AVG(p.tce_when_fixed_by_pair) AS tce_when_fixed,
+                      (AVG(p.tce_when_fixed_by_pair) - AVG(p.tce_actual_by_pair)) AS tce_variance,
+                      SUM(COALESCE(p.revenue_actual_by_pair, 0)) AS revenue_actual,
+                      MAX(p.voyage_end_date) AS voyage_end_date
+                    FROM per_pair p
+                    GROUP BY p.voyage_number
                   )
                   SELECT
-                    MAX(voyage_id) AS voyage_id,
-                    voyage_number,
-                    SUM(COALESCE(pnl_actual_by_pair, 0)) AS pnl_actual,
-                    SUM(COALESCE(pnl_when_fixed_by_pair, 0)) AS pnl_when_fixed,
-                    (SUM(COALESCE(pnl_when_fixed_by_pair, 0)) - SUM(COALESCE(pnl_actual_by_pair, 0))) AS pnl_variance,
-                    AVG(tce_actual_by_pair) AS tce_actual,
-                    AVG(tce_when_fixed_by_pair) AS tce_when_fixed,
-                    (AVG(tce_when_fixed_by_pair) - AVG(tce_actual_by_pair)) AS tce_variance,
-                    SUM(COALESCE(revenue_actual_by_pair, 0)) AS revenue_actual,
-                    MAX(voyage_end_date) AS voyage_end_date
-                  FROM per_pair
-                  GROUP BY voyage_number
-                  ORDER BY voyage_number;
+                    r.voyage_id,
+                    r.voyage_number,
+                    i.vessel_imo,
+                    r.pnl_actual,
+                    r.pnl_when_fixed,
+                    r.pnl_variance,
+                    r.tce_actual,
+                    r.tce_when_fixed,
+                    r.tce_variance,
+                    r.revenue_actual,
+                    r.voyage_end_date
+                  FROM rolled r
+                  INNER JOIN distinct_imos i ON i.voyage_number = r.voyage_number
+                  ORDER BY r.voyage_number;
               
   finance.compare_voyages:
     description: 'Compare specific voyages side-by-side by voyage numbers'
@@ -531,8 +609,7 @@ queries:
                     o.remarks_json
                   FROM finance_voyage_kpi f
                   LEFT JOIN ops_voyage_summary o
-                    ON f.voyage_number = o.voyage_number
-                    AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+                    ON f.voyage_id = o.voyage_id
                   WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
                     AND f.voyage_number = ANY(%(voyage_numbers)s::INT[])
                   ORDER BY f.voyage_number ASC

@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 
 from groq import Groq
 
+from app.utils.ops_llm_shrink import shrink_ops_row_json_fields
 from app.config.prompt_rules_loader import (
     get_answer_generation_fallback,
     get_answer_polish_system_prompt,
@@ -34,9 +35,11 @@ from app.config.prompt_rules_loader import (
     get_llm_answer_generation_system_prompt,
     get_llm_conversation_memory_label,
     get_llm_intent_classifier_system_prompt_template,
+    get_llm_ops_only_voyage_answer_instruction,
     get_llm_ranking_answer_hint,
     get_out_of_scope_response_template,
 )
+from app.config.business_rules_loader import get_answer_contract_sections
 from app.config.routing_rules_loader import (
     get_llm_answer_financial_first_terms,
     get_llm_answer_grade_terms,
@@ -61,6 +64,7 @@ from app.config.routing_rules_loader import (
     get_llm_generic_agg_terms,
     get_llm_metadata_fleet_wide_markers,
     get_llm_metadata_keywords,
+    get_llm_metadata_override_blocking_metric_terms,
     get_llm_mongo_only_voyage_fields,
     get_llm_out_of_scope_greeting_exact,
     get_llm_out_of_scope_greeting_prefixes,
@@ -569,10 +573,11 @@ class LLMClient:
         # Allow metadata override when early deterministic pick is summary intent.
         fleet_wide_markers = get_llm_metadata_fleet_wide_markers()
         looks_fleet_wide = any(m in tl for m in fleet_wide_markers)
+        blocks_metadata_override = any(k in tl for k in get_llm_metadata_override_blocking_metric_terms())
 
         if any(k in tl for k in metadata_keywords) and (
             not deterministic or deterministic in ("voyage.summary", "vessel.summary", "ranking.vessels")
-        ):
+        ) and not blocks_metadata_override:
             has_vessel_anchor = bool(slots.get("vessel_name") or slots.get("imo"))
             has_voyage_anchor = bool(slots.get("voyage_number") or slots.get("voyage_id"))
             vnums = slots.get("voyage_numbers")
@@ -1084,11 +1089,26 @@ class LLMClient:
         if intent_key and str(intent_key).startswith("ranking.") and merged_rows:
             ranking_hint = get_llm_ranking_answer_hint()
 
+        ops_only_hint = None
+        if intent_key == "voyage.summary" and isinstance(merged_safe, dict):
+            art = merged_safe.get("artifacts")
+            if isinstance(art, dict) and art.get("finance_kpi_unavailable") is True:
+                t = get_llm_ops_only_voyage_answer_instruction().strip()
+                if t:
+                    ops_only_hint = t
+
         style = self._derive_answer_style(question=question, intent_key=intent_key)
         recent_context_turns = self._recent_turns_for_context(session_context, limit=2)
         recent_context_text = self._recent_turns_prompt(session_context, limit=2)
 
         system = get_llm_answer_generation_system_prompt()
+
+        instruction_parts: List[str] = []
+        if ranking_hint:
+            instruction_parts.append(ranking_hint)
+        if ops_only_hint:
+            instruction_parts.append(ops_only_hint)
+        combined_instruction = "\n\n".join(instruction_parts) if instruction_parts else None
 
         result = self._call_with_retry(
             system=system,
@@ -1101,7 +1121,8 @@ class LLMClient:
                     "recent_context_text": recent_context_text,
                     "data": {**(merged_safe if isinstance(merged_safe, dict) else {}), "style": style},
                     "merged_rows": merged_rows,
-                    **({("instruction"): ranking_hint} if ranking_hint else {}),
+                    "business_answer_contract": get_answer_contract_sections(),
+                    **({"instruction": combined_instruction} if combined_instruction else {}),
                 }
             ),
             operation="answer_generation",
@@ -2125,12 +2146,12 @@ class LLMClient:
 
         ops = out.get("ops")
         if isinstance(ops, dict) and isinstance(ops.get("rows"), list):
+            _ik = str((((out.get("artifacts") or {}) if isinstance(out.get("artifacts"), dict) else {}) or {}).get("intent_key") or "").strip()
+            _voy_sum = _ik == "voyage.summary"
             for r in ops["rows"]:
                 if not isinstance(r, dict):
                     continue
-                r["ports_json"] = _cap_list(r.get("ports_json"), 20)
-                r["grades_json"] = _cap_list(r.get("grades_json"), 20)
-                r["remarks_json"] = _cap_list(r.get("remarks_json"), 10)
+                shrink_ops_row_json_fields(r, voyage_summary=_voy_sum)
 
         artifacts = out.get("artifacts")
         if isinstance(artifacts, dict) and isinstance(artifacts.get("merged_rows"), list):

@@ -112,6 +112,8 @@ projections:
     voyageNumber: 1
     vesselName: 1
     vesselImo: 1
+    vessel_imo: 1
+    imo: 1
     startDateUtc: 1
     extracted_at: 1
     remarks: 1
@@ -125,6 +127,8 @@ projections:
     voyageNumber: 1
     vesselName: 1
     vesselImo: 1
+    vessel_imo: 1
+    imo: 1
     remarks: 1
     remarkList: 1
     fixtures: 1
@@ -145,6 +149,9 @@ projections:
     voyageId: 1
     voyageNumber: 1
     vesselName: 1
+    vesselImo: 1
+    vessel_imo: 1
+    imo: 1
     fixtures: 1
     legs: 1
     revenues: 1
@@ -158,6 +165,9 @@ projections:
     voyageId: 1
     voyageNumber: 1
     vesselName: 1
+    vesselImo: 1
+    vessel_imo: 1
+    imo: 1
     tags: 1
     url: 1
     fixtures: 1
@@ -177,6 +187,8 @@ projections:
     voyageId: 1
     vesselName: 1
     vesselImo: 1
+    vessel_imo: 1
+    imo: 1
   single_path_mongo_payload:
     _id: 0
     voyageId: 1
@@ -199,7 +211,12 @@ agent:
     voyage_id: voyageId
     voyage_number: voyageNumber
     vessel_name: vesselName
-    vessel_imo: vesselImo
+    vessel_imo:
+      first_of:
+        - vesselImo
+        - vessel_imo
+        - imo
+      default: null
     remarks:
       first_of:
         - remarks

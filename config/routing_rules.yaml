@@ -576,23 +576,48 @@ incomplete_entity_topic_terms:
     - port
   vessel:
     - vessel
+    - vessels
     - ship
+    - ships
+    - vesssl
+    - vesssel
+    - vessle
+    - vesel
   voyage:
     - voyage
+    - voyages
+    - voyge
+    - voyag
 
 incomplete_entity_topic_phrases:
   vessel:
     - tell me about vessel
+    - tell me about vessels
+    - tell me about vesssl
+    - tell me about vesssel
+    - tell me about vessle
+    - tell me about vesel
     - tell me about ship
+    - tell me about ships
     - vessel summary
+    - vessels summary
     - ship details
+    - ships details
     - vessel details
+    - vessels details
   voyage:
     - tell me about voyage
+    - tell me about voyages
+    - tell me about voyge
+    - tell me about voyag
     - voyage summary
+    - voyages summary
     - voyage details
+    - voyages details
     - details about voyage
+    - details about voyages
     - information about voyage
+    - information about voyages
 
 incomplete_entity_fleet_port_aggregate_markers:
   - all voyages
@@ -615,9 +640,16 @@ incomplete_entity_fleet_port_aggregate_markers:
 incomplete_entity_placeholder_slot_values:
   vessel_name:
     - vessel
+    - vessels
     - ship
+    - ships
     - port
     - voyage
+    - voyages
+    - vesssl
+    - vesssel
+    - vessle
+    - vesel
     - the vessel
     - a vessel
   port_name:
@@ -626,6 +658,8 @@ incomplete_entity_placeholder_slot_values:
   voyage_number:
     - voyage
     - voyages
+    - voyge
+    - voyag
 
 incomplete_entity_fastpath_queries:
   port.details:
@@ -635,15 +669,30 @@ incomplete_entity_fastpath_queries:
     - information about port
   vessel.summary:
     - tell me about vessel
+    - tell me about vessels
+    - tell me about vesssl
+    - tell me about vesssel
+    - tell me about vessle
+    - tell me about vesel
     - tell me about ship
+    - tell me about ships
     - vessel details
+    - vessels details
     - ship details
+    - ships details
     - vessel summary
+    - vessels summary
   voyage.summary:
     - tell me about voyage
+    - tell me about voyages
+    - tell me about voyge
+    - tell me about voyag
     - voyage details
+    - voyages details
     - voyage summary
+    - voyages summary
     - information about voyage
+    - information about voyages
 
 proper_name_request_prefixes:
   - "is "
@@ -732,6 +781,10 @@ result_set_operation_verbs:
 result_set_operation_fields:
   - port
   - ports
+  - voyage
+  - voyages
+  - vessel
+  - vessels
   - grade
   - grades
   - remark
@@ -743,7 +796,6 @@ result_set_operation_fields:
   - commission
   - offhire
   - delay
-  - voyage
 
 short_contextual_followup_fields:
   - port
@@ -1609,7 +1661,6 @@ llm_fleet_vessel_terms:
 
 llm_vessel_metadata_agg_terms:
   - operating
-  - operational
   - active vessels
   - scrubber
   - non-scrubber
@@ -1704,6 +1755,20 @@ llm_metadata_fleet_wide_markers:
   - most vessels
   - highest voyage count
   - lowest voyage count
+
+llm_metadata_override_blocking_metric_terms:
+  - pnl
+  - profit
+  - profitable
+  - profitability
+  - revenue
+  - tce
+  - offhire
+  - delay
+  - risk
+  - operational risk
+  - business quality
+  - commercial quality
 
 llm_generic_agg_terms:
   - highest

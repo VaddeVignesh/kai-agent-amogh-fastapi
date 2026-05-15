@@ -1,0 +1,1035 @@
+{
+  "suite": "config_refactor_golden_suite",
+  "generated_at": 1778081503,
+  "base_url": "http://127.0.0.1:8010/query",
+  "run_id": "business-decision-upgrade-pass",
+  "session_isolation": "unique_run_suffix",
+  "count": 5,
+  "results": [
+    {
+      "id": "BIZ_001",
+      "category": "business_decision",
+      "turn_index": 1,
+      "query": "Which voyages look commercially inefficient and why? Focus on revenue conversion, margin, cost ratio, and any operational caveats.",
+      "session_id": "customer:golden:biz_001:business-decision-upgrade-pass",
+      "status_code": 200,
+      "elapsed_sec": 16.4,
+      "intent_key": "analysis.cost_breakdown",
+      "clarification": null,
+      "dynamic_sql_used": true,
+      "dynamic_sql_agents": [
+        "finance",
+        "ops"
+      ],
+      "answer": "Voyage 2205 on the Stena Imperator appears to be the most commercially inefficient due to its significant loss of $1,733,432.31 and zero revenue, indicating a complete lack of revenue conversion into profit.\n\n### Summary\n- **Voyage Number**: 2205\n- **Vessel**: Stena Imperator\n- **PnL**: -$1,733,432.31\n- **Revenue**: $0\n- **Total Expense**: $642,098.98\n- **Margin**: Not available\n- **Cost Ratio**: Not available\n\n### Results\n| Voyage # | Vessel Name | PnL | Revenue | Total Expense | Margin | Cost Ratio |\n| --- | --- | --- | --- | --- | --- | --- |\n| 2205 | Stena Imperator | -$1,733,432.31 | $0 | $642,098.98 | — | — |\n| 2204 | Green Sea | -$1,414,908.76 | $2,951,856.73 | $2,603,077.99 | -0.4793 | 0.8818 |\n| 2301 | Crude Zephyrus | -$1,226,438.19 | $4,656 | $1,231,094.19 | -263.4103 | 264.4103 |\n| 2007 | Green Sky | -$1,166,341.4 | $1,127,988.89 | $1,217,292.79 | -1.034 | 1.0792 |\n| 2301 | Nord Himalaya | -$1,092,295.96 | $2,274,053.89 | $1,195,912.35 | -0.4803 | 0.5259 |\n\nThe voyages listed are characterized by significant losses and inefficient revenue conversion, with voyage 2205 being the most extreme example due to its complete lack of revenue. The business impact of such inefficiencies is substantial, as they directly affect the profitability and sustainability of the operations. The data caveats include the lack of margin and cost ratio information for voyage 2205, which limits the depth of analysis for that specific voyage. However, the available data for other voyages highlights the need for improved cost discipline and revenue conversion efficiency to enhance commercial quality.",
+      "answer_length": 1611,
+      "answer_preview": "Voyage 2205 on the Stena Imperator appears to be the most commercially inefficient due to its significant loss of $1,733,432.31 and zero revenue, indicating a complete lack of revenue conversion into profit.\n\n### Summary\n- **Voyage Number**: 2205\n- **Vessel**: Stena Imperator\n- **PnL**: -$1,733,432.",
+      "must_contain": [
+        "revenue",
+        "PnL",
+        "margin"
+      ],
+      "missing_must_contain": [],
+      "bad_phrase_hits": [
+        "not available"
+      ],
+      "has_error": false,
+      "error": null,
+      "trace_summary": {
+        "trace_steps_count": 11,
+        "phases": [
+          "intent_extraction",
+          "planning",
+          "composite_step_start",
+          "composite_step_result",
+          "composite_step_inputs_resolved",
+          "token_usage"
+        ],
+        "agents_used": [
+          "finance",
+          "ops",
+          "llm"
+        ],
+        "likely_paths": [
+          "composite"
+        ],
+        "row_counts": {},
+        "sql_generated": true,
+        "mongo_collections": []
+      },
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "analysis.cost_breakdown",
+          "slots": {},
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "composite",
+          "intent_key": "analysis.cost_breakdown",
+          "steps": [
+            {
+              "agent": "finance",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "question": "Which voyages look commercially inefficient and why? Focus on revenue conversion, margin, cost ratio, and any operational caveats.",
+                "limit": 10,
+                "intent_key": "analysis.cost_breakdown"
+              }
+            },
+            {
+              "agent": "ops",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "llm",
+              "operation": "merge",
+              "inputs": {}
+            }
+          ]
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 3,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "question": "Which voyages look commercially inefficient and why? Focus on revenue conversion, margin, cost ratio, and any operational caveats.",
+            "limit": 10,
+            "intent_key": "analysis.cost_breakdown"
+          },
+          "goal": "Run a finance analysis query in Postgres (dynamic SQL) and return voyage_ids for downstream steps (limit=10)."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 10,
+          "voyage_ids": 10,
+          "extracted_voyage_ids": [
+            "2DA0080E56ACACE75ECEB989D76DB933",
+            "A39C9634A18E888B924AB9D5931933D8",
+            "8125EAB23DAB3193AE1A0DBF607F16D8",
+            "AAE74337629029006D5B6B988FC1AB65",
+            "90F7F7E18A5967D3D89EC9C511D5ECD5",
+            "1F3253E262D4FEE3C081E4080A4F41EC",
+            "A466EE22E39E05AF61BF6FDF94952639",
+            "BD4051B3CAD54517CA656BCCCC27E65F",
+            "787F2CA660F1C3FCC2ED5B73B8FFFA13",
+            "E47C210959F9252CA402E96D690A8692"
+          ],
+          "sql_present": true,
+          "sql": "SELECT \n  f.voyage_id,\n  f.voyage_number,\n  f.revenue,\n  f.total_expense,\n  f.pnl,\n  f.bunker_cost,\n  f.port_cost,\n  f.total_commission,\n  f.tce,\n  f.voyage_days,\n  o.delay_reason,\n  o.is_delayed,\n  o.offhire_days,\n  o.remarks_json\nFROM \n  finance_voyage_kpi f\n  LEFT JOIN ops_voyage_summary o ON f.voyage_id = o.voyage_id\nWHERE \n  f.scenario = COALESCE(%(scenario)s,'ACTUAL')\nORDER BY \n  f.pnl NULLS LAST\nLIMIT \n  %(limit)s",
+          "summary": "Finance: fetched 10 rows and extracted 10 voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 3,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch ops summaries (ports/grades/remarks/delay/offhire) for selected voyage_ids from Postgres when available; skip if finance aggregate result is self-contained."
+        },
+        {
+          "phase": "composite_step_inputs_resolved",
+          "step_index": 2,
+          "agent": "ops",
+          "resolved_voyage_ids_count": 10,
+          "resolved_cargo_grades_count": 0,
+          "intent_key_ops": "analysis.cost_breakdown"
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 10,
+          "voyage_ids": 10,
+          "extracted_voyage_ids": [
+            "2DA0080E56ACACE75ECEB989D76DB933",
+            "A39C9634A18E888B924AB9D5931933D8",
+            "8125EAB23DAB3193AE1A0DBF607F16D8",
+            "AAE74337629029006D5B6B988FC1AB65",
+            "90F7F7E18A5967D3D89EC9C511D5ECD5",
+            "1F3253E262D4FEE3C081E4080A4F41EC",
+            "A466EE22E39E05AF61BF6FDF94952639",
+            "BD4051B3CAD54517CA656BCCCC27E65F",
+            "787F2CA660F1C3FCC2ED5B73B8FFFA13",
+            "E47C210959F9252CA402E96D690A8692"
+          ],
+          "sql_present": true,
+          "sql": "SELECT voyage_id,\n       voyage_number,\n       vessel_imo,\n       vessel_name,\n       module_type,\n       fixture_count,\n       offhire_days,\n       is_delayed,\n       delay_reason,\n       ports_json,\n       grades_json,\n       remarks_json,\n       voyage_start_date,\n       voyage_end_date\nFROM ops_voyage_summary\nWHERE voyage_id = ANY(%(voyage_ids)s)\nLIMIT %(limit)s",
+          "summary": "Ops: fetched 10 ops rows for voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 3,
+          "step_count": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "inputs": {},
+          "goal": "Deterministically merge finance + ops + mongo context into a single joined dataset for summarization."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "ok": true,
+          "merged_rows": 10,
+          "summary": "Merge: joined finance + ops + mongo context into 10 merged rows."
+        },
+        {
+          "phase": "token_usage",
+          "stage": "pre_sanitize",
+          "total_tokens_est": 5956,
+          "mongo_tokens_est": 11,
+          "finance_tokens_est": 569,
+          "ops_tokens_est": 8,
+          "artifacts_tokens_est": 5337
+        },
+        {
+          "phase": "token_usage",
+          "stage": "post_sanitize",
+          "total_tokens_est": 6002,
+          "saved_tokens_est": -46,
+          "saved_pct_est": -0.7723304231027536
+        }
+      ]
+    },
+    {
+      "id": "BIZ_002",
+      "category": "business_decision",
+      "turn_index": 1,
+      "query": "Which vessels are profitable but operationally risky? Explain the financial upside and the delay or offhire risk.",
+      "session_id": "customer:golden:biz_002:business-decision-upgrade-pass",
+      "status_code": 200,
+      "elapsed_sec": 12.59,
+      "intent_key": "ranking.vessels",
+      "clarification": null,
+      "dynamic_sql_used": true,
+      "dynamic_sql_agents": [
+        "finance"
+      ],
+      "answer": "The Sonangol Maiombe is the most profitable vessel, with an average PnL of $4,359,664.53, but it also has a notable operational risk due to its average offhire days and delayed voyage count.\n\n### Summary\n- The top 5 vessels by average PnL are Sonangol Maiombe, Stena Superior, Sonangol Rangel, Stena Suede, and Sonangol Kalandula.\n- These vessels have an average PnL ranging from $1,725,629.45 to $4,359,664.53.\n- The vessels with the highest delayed voyage count are Stena Superior and Sonangol Maiombe, with 4 and 3 delayed voyages, respectively.\n\n### Results\n| Vessel Name | Vessel IMO | Average PnL | Delayed Voyage Count | Voyage Count |\n| --- | --- | --- | --- | --- |\n| Sonangol Maiombe | 9766322 | 4359664.53 | 3 | 16 |\n| Stena Superior | 9579030 | 3538080.61 | 4 | 17 |\n| Sonangol Rangel | 9575541 | 1628917.10 | 0 | 33 |\n| Stena Suede | 9579042 | 1855105.66 | 2 | 28 |\n| Sonangol Kalandula | 9575553 | 1816513.78 | 1 | 27 |\n\nThe financial upside of these vessels is significant, with the top 5 vessels having an average PnL of over $1.7 million. However, the operational risk associated with these vessels, particularly the delayed voyage count, must be carefully managed to minimize potential losses.\n\nData caveats: Some identity fields are only present in one source, so cross-source confidence is limited.",
+      "answer_length": 1318,
+      "answer_preview": "The Sonangol Maiombe is the most profitable vessel, with an average PnL of $4,359,664.53, but it also has a notable operational risk due to its average offhire days and delayed voyage count.\n\n### Summary\n- The top 5 vessels by average PnL are Sonangol Maiombe, Stena Superior, Sonangol Rangel, Stena ",
+      "must_contain": [
+        "vessel",
+        "PnL",
+        "risk"
+      ],
+      "missing_must_contain": [],
+      "bad_phrase_hits": [],
+      "has_error": false,
+      "error": null,
+      "trace_summary": {
+        "trace_steps_count": 10,
+        "phases": [
+          "intent_extraction",
+          "planning",
+          "composite_step_start",
+          "composite_step_result",
+          "token_usage"
+        ],
+        "agents_used": [
+          "finance",
+          "ops",
+          "llm"
+        ],
+        "likely_paths": [
+          "composite"
+        ],
+        "row_counts": {},
+        "sql_generated": true,
+        "mongo_collections": []
+      },
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "ranking.vessels",
+          "slots": {},
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "composite",
+          "intent_key": "ranking.vessels",
+          "steps": [
+            {
+              "agent": "finance",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "question": "Which vessels are profitable but operationally risky? Explain the financial upside and the delay or offhire risk.",
+                "limit": 10,
+                "intent_key": "ranking.vessels"
+              }
+            },
+            {
+              "agent": "ops",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "llm",
+              "operation": "merge",
+              "inputs": {}
+            }
+          ]
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 3,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "question": "Which vessels are profitable but operationally risky? Explain the financial upside and the delay or offhire risk.",
+            "limit": 10,
+            "intent_key": "ranking.vessels"
+          },
+          "goal": "Fetch top 10 voyages for the ranking intent (Postgres finance KPIs), returning voyage_ids for downstream steps."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 10,
+          "voyage_ids": 0,
+          "sql_present": true,
+          "sql": "SELECT \n  REPLACE(f.vessel_imo::TEXT, '.0', '') AS vessel_imo,\n  MAX(o.vessel_name)                   AS vessel_name,\n  COUNT(DISTINCT f.voyage_id)          AS voyage_count,\n  SUM(f.pnl)                           AS total_pnl,\n  AVG(f.pnl)                           AS avg_pnl,\n  AVG(o.offhire_days)                 AS avg_offhire_days,\n  SUM(CASE WHEN o.is_delayed THEN 1 ELSE 0 END) AS delayed_voyage_count\nFROM finance_voyage_kpi f\nJOIN ops_voyage_summary o\n  ON f.voyage_id = o.voyage_id\nWHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')\n  AND f.pnl > 0\nGROUP BY REPLACE(f.vessel_imo::TEXT, '.0', '')\nORDER BY total_pnl DESC NULLS LAST, delayed_voyage_count DESC\nLIMIT %(limit)s",
+          "summary": "Finance: fetched 10 rows (Postgres). No voyage_ids extracted."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 3,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch ops summaries (ports/grades/remarks/delay/offhire) for selected voyage_ids from Postgres when available; skip if finance aggregate result is self-contained."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "skipped": true,
+          "rows": 10,
+          "reason": "Finance returned aggregate rows (GROUP BY query). No voyage_ids to pass — ops step not needed, finance result is self-contained.",
+          "summary": "Ops step skipped — finance aggregate query is self-contained."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 3,
+          "step_count": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "inputs": {},
+          "goal": "Deterministically merge finance + ops + mongo context into a single joined dataset for summarization."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "ok": true,
+          "merged_rows": 10,
+          "summary": "Merge: joined 10 vessel-level rows for ranking.vessels."
+        },
+        {
+          "phase": "token_usage",
+          "stage": "pre_sanitize",
+          "total_tokens_est": 3178,
+          "mongo_tokens_est": 11,
+          "finance_tokens_est": 304,
+          "ops_tokens_est": 7,
+          "artifacts_tokens_est": 2827
+        },
+        {
+          "phase": "token_usage",
+          "stage": "post_sanitize",
+          "total_tokens_est": 3236,
+          "saved_tokens_est": -58,
+          "saved_pct_est": -1.8250471994965387
+        }
+      ]
+    },
+    {
+      "id": "BIZ_003",
+      "category": "business_decision",
+      "turn_index": 1,
+      "query": "Which cargo grades are attractive from a margin perspective, and what business caveats should we consider?",
+      "session_id": "customer:golden:biz_003:business-decision-upgrade-pass",
+      "status_code": 200,
+      "elapsed_sec": 16.93,
+      "intent_key": "analysis.cargo_profitability",
+      "clarification": null,
+      "dynamic_sql_used": true,
+      "dynamic_sql_agents": [
+        "finance"
+      ],
+      "answer": "### Summary\n- Most profitable cargo grades ranked by average PnL (top 10 shown).\n- Included common ports and recurring congestion/delay remarks where available.\n\n### Results\n| Cargo grade | Avg PnL | Avg Revenue | Voyage count | Congestion/Delay remarks |\n| --- | --- | --- | --- | --- |\n| no heat crude | $2,459,908.01 | $3,834,854.70 | 3 | No recurring congestion/delay remarks |\n| pome | $1,997,610.89 | $4,967,190.87 | 3 | No recurring congestion/delay remarks |\n| pmf | $1,748,944.82 | $4,374,927.59 | 3 | No recurring congestion/delay remarks |\n| fo | $1,593,935.81 | $3,044,500.46 | 65 | No recurring congestion/delay remarks |\n| nhc | $1,578,057.61 | $2,728,430.12 | 374 | No recurring congestion/delay remarks |\n| fame | $1,442,644.48 | $4,397,409.62 | 8 | No recurring congestion/delay remarks |\n| crd | $1,362,255.59 | $2,431,403.83 | 13 | No recurring congestion/delay remarks |\n| uco | $1,081,317.04 | $3,990,790.39 | 24 | No recurring congestion/delay remarks |\n| tame | $1,062,178.50 | $1,792,098.47 | 1 | No recurring congestion/delay remarks |\n| mixed xylene | $1,033,927.49 | $4,736,885.27 | 2 | No recurring congestion/delay remarks |",
+      "answer_length": 1153,
+      "answer_preview": "### Summary\n- Most profitable cargo grades ranked by average PnL (top 10 shown).\n- Included common ports and recurring congestion/delay remarks where available.\n\n### Results\n| Cargo grade | Avg PnL | Avg Revenue | Voyage count | Congestion/Delay remarks |\n| --- | --- | --- | --- | --- |\n| no heat cr",
+      "must_contain": [
+        "cargo",
+        "PnL",
+        "revenue"
+      ],
+      "missing_must_contain": [],
+      "bad_phrase_hits": [],
+      "has_error": false,
+      "error": null,
+      "trace_summary": {
+        "trace_steps_count": 10,
+        "phases": [
+          "intent_extraction",
+          "planning",
+          "composite_step_start",
+          "composite_step_result",
+          "token_usage"
+        ],
+        "agents_used": [
+          "finance",
+          "ops",
+          "llm"
+        ],
+        "likely_paths": [
+          "composite"
+        ],
+        "row_counts": {},
+        "sql_generated": true,
+        "mongo_collections": []
+      },
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "analysis.cargo_profitability",
+          "slots": {
+            "cargo_grade": "none"
+          },
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "composite",
+          "intent_key": "analysis.cargo_profitability",
+          "steps": [
+            {
+              "agent": "finance",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "question": "Which cargo grades are attractive from a margin perspective, and what business caveats should we consider?",
+                "limit": 10,
+                "intent_key": "analysis.cargo_profitability"
+              }
+            },
+            {
+              "agent": "ops",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "llm",
+              "operation": "merge",
+              "inputs": {}
+            }
+          ]
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 3,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "question": "Which cargo grades are attractive from a margin perspective, and what business caveats should we consider?",
+            "limit": 10,
+            "intent_key": "analysis.cargo_profitability"
+          },
+          "goal": "Run a finance analysis query in Postgres (dynamic SQL) and return voyage_ids for downstream steps (limit=10)."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 10,
+          "voyage_ids": 0,
+          "sql_present": true,
+          "sql": "SELECT \n  lower(trim(elem->>'grade_name')) AS cargo_grade, \n  AVG(f.pnl) AS avg_pnl, \n  AVG(f.revenue) AS avg_revenue, \n  COUNT(DISTINCT f.voyage_id) AS voyage_count,\n  AVG(f.pnl) / NULLIF(AVG(f.revenue), 0) AS margin\nFROM \n  finance_voyage_kpi f\n  JOIN ops_voyage_summary o ON f.voyage_id = o.voyage_id\n  LEFT JOIN LATERAL jsonb_array_elements(o.grades_json) AS elem ON TRUE\nWHERE \n  f.scenario = COALESCE(%(scenario)s,'ACTUAL')\n  AND jsonb_typeof(o.grades_json) = 'array'\n  AND jsonb_typeof(elem) = 'object'\n  AND elem->>'grade_name' IS NOT NULL\n  AND trim(elem->>'grade_name') != ''\nGROUP BY \n  lower(trim(elem->>'grade_name'))\nORDER BY \n  avg_pnl DESC NULLS LAST\nLIMIT \n  %(limit)s",
+          "summary": "Finance: fetched 10 rows (Postgres). No voyage_ids extracted."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 3,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch ops summaries (ports/grades/remarks/delay/offhire) for selected voyage_ids from Postgres when available; skip if finance aggregate result is self-contained."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "skipped": true,
+          "rows": 10,
+          "reason": "Finance returned aggregate rows (GROUP BY query). No voyage_ids to pass — ops step not needed, finance result is self-contained.",
+          "summary": "Ops step skipped — finance aggregate query is self-contained."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 3,
+          "step_count": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "inputs": {},
+          "goal": "Deterministically merge finance + ops + mongo context into a single joined dataset for summarization."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "ok": true,
+          "merged_rows": 10,
+          "summary": "Merge: joined finance + ops + mongo context into 10 merged rows."
+        },
+        {
+          "phase": "token_usage",
+          "stage": "pre_sanitize",
+          "total_tokens_est": 4029,
+          "mongo_tokens_est": 11,
+          "finance_tokens_est": 246,
+          "ops_tokens_est": 7,
+          "artifacts_tokens_est": 3736
+        },
+        {
+          "phase": "token_usage",
+          "stage": "post_sanitize",
+          "total_tokens_est": 4075,
+          "saved_tokens_est": -46,
+          "saved_pct_est": -1.141722511789526
+        }
+      ]
+    },
+    {
+      "id": "BIZ_004",
+      "category": "business_decision",
+      "turn_index": 1,
+      "query": "Which voyages have high revenue but weak business quality? Explain why high revenue alone is not enough.",
+      "session_id": "customer:golden:biz_004:business-decision-upgrade-pass",
+      "status_code": 200,
+      "elapsed_sec": 17.8,
+      "intent_key": "analysis.revenue_vs_pnl",
+      "clarification": null,
+      "dynamic_sql_used": true,
+      "dynamic_sql_agents": [
+        "finance",
+        "ops"
+      ],
+      "answer": "No voyages have both high revenue and weak business quality recorded in the dataset, as revenue and PnL values are not available for any voyage. High revenue alone is not enough to determine business quality without considering expenses and profitability. The dataset lacks key financial metrics such as revenue, total expense, and PnL for all voyages, making it impossible to assess business quality. Delays were reported for some voyages, which could impact business quality, but without financial data, the exact impact is unknown. Data caveats include the lack of financial data and the presence of delay exposures for some voyages, which could affect operational and financial performance.",
+      "answer_length": 694,
+      "answer_preview": "No voyages have both high revenue and weak business quality recorded in the dataset, as revenue and PnL values are not available for any voyage. High revenue alone is not enough to determine business quality without considering expenses and profitability. The dataset lacks key financial metrics such",
+      "must_contain": [
+        "revenue",
+        "PnL",
+        "business"
+      ],
+      "missing_must_contain": [],
+      "bad_phrase_hits": [
+        "not available"
+      ],
+      "has_error": false,
+      "error": null,
+      "trace_summary": {
+        "trace_steps_count": 13,
+        "phases": [
+          "intent_extraction",
+          "planning",
+          "composite_step_start",
+          "composite_step_result",
+          "composite_step_inputs_resolved",
+          "token_usage"
+        ],
+        "agents_used": [
+          "finance",
+          "ops",
+          "mongo",
+          "llm"
+        ],
+        "likely_paths": [
+          "composite"
+        ],
+        "row_counts": {},
+        "sql_generated": true,
+        "mongo_collections": []
+      },
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "analysis.revenue_vs_pnl",
+          "slots": {},
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "composite",
+          "intent_key": "analysis.revenue_vs_pnl",
+          "steps": [
+            {
+              "agent": "finance",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "question": "Which voyages have high revenue but weak business quality? Explain why high revenue alone is not enough.",
+                "limit": 10,
+                "intent_key": "analysis.revenue_vs_pnl"
+              }
+            },
+            {
+              "agent": "ops",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "mongo",
+              "operation": "fetchRemarks",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "llm",
+              "operation": "merge",
+              "inputs": {}
+            }
+          ]
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 4,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "question": "Which voyages have high revenue but weak business quality? Explain why high revenue alone is not enough.",
+            "limit": 10,
+            "intent_key": "analysis.revenue_vs_pnl"
+          },
+          "goal": "Run a finance analysis query in Postgres (dynamic SQL) and return voyage_ids for downstream steps (limit=10)."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 10,
+          "voyage_ids": 10,
+          "extracted_voyage_ids": [
+            "205904980E138687D16B5464AD662A10",
+            "6C5ACCAC38078103AC442ABC8F953F4C",
+            "7BBE26386FC504E510BF45167662B6AB",
+            "2D3729F01688442B63D91B819D47904B",
+            "56F951129BA83C40D3E9C3C7837D6063",
+            "85BE36902F793700251791820A4FDC88",
+            "9A0646A2549193FCD7C9AECF6A5E38A7",
+            "0DC4988880A3A2DF75C6E441DAD5B20C",
+            "45CFAE9BA3898833EA01C18E11D16EAE",
+            "63EDDD459C2B17D96FA7EB70CA718051"
+          ],
+          "sql_present": true,
+          "sql": "SELECT f.voyage_id, f.voyage_number, f.revenue, f.total_expense, f.pnl, f.tce \nFROM finance_voyage_kpi f \nWHERE f.scenario = COALESCE(%(scenario)s,'ACTUAL') \nORDER BY f.revenue DESC \nLIMIT %(limit)s",
+          "summary": "Finance: fetched 10 rows and extracted 10 voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 4,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch ops summaries (ports/grades/remarks/delay/offhire) for selected voyage_ids from Postgres when available; skip if finance aggregate result is self-contained."
+        },
+        {
+          "phase": "composite_step_inputs_resolved",
+          "step_index": 2,
+          "agent": "ops",
+          "resolved_voyage_ids_count": 10,
+          "resolved_cargo_grades_count": 0,
+          "intent_key_ops": "analysis.revenue_vs_pnl"
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 10,
+          "voyage_ids": 10,
+          "extracted_voyage_ids": [
+            "205904980E138687D16B5464AD662A10",
+            "6C5ACCAC38078103AC442ABC8F953F4C",
+            "7BBE26386FC504E510BF45167662B6AB",
+            "2D3729F01688442B63D91B819D47904B",
+            "56F951129BA83C40D3E9C3C7837D6063",
+            "85BE36902F793700251791820A4FDC88",
+            "9A0646A2549193FCD7C9AECF6A5E38A7",
+            "0DC4988880A3A2DF75C6E441DAD5B20C",
+            "45CFAE9BA3898833EA01C18E11D16EAE",
+            "63EDDD459C2B17D96FA7EB70CA718051"
+          ],
+          "sql_present": true,
+          "sql": "SELECT voyage_id,\n       voyage_number,\n       vessel_imo,\n       vessel_name,\n       module_type,\n       fixture_count,\n       offhire_days,\n       is_delayed,\n       delay_reason,\n       ports_json,\n       grades_json,\n       remarks_json,\n       voyage_start_date,\n       voyage_end_date\nFROM ops_voyage_summary\nWHERE voyage_id = ANY(%(voyage_ids)s)\nLIMIT %(limit)s",
+          "summary": "Ops: fetched 10 ops rows for voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 3,
+          "step_count": 4,
+          "agent": "mongo",
+          "operation": "fetch_remarks",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch voyage remarks + minimal fixture context (ports/grades/commissions) for the selected voyage_ids from MongoDB."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 3,
+          "agent": "mongo",
+          "operation": "fetch_remarks",
+          "ok": true,
+          "mode": "mongo_llm",
+          "mongo_ok": true,
+          "mongo_query": {
+            "collection": "voyages",
+            "filter": {
+              "voyageId": {
+                "$in": [
+                  "205904980E138687D16B5464AD662A10",
+                  "6C5ACCAC38078103AC442ABC8F953F4C",
+                  "7BBE26386FC504E510BF45167662B6AB",
+                  "2D3729F01688442B63D91B819D47904B",
+                  "56F951129BA83C40D3E9C3C7837D6063",
+                  "85BE36902F793700251791820A4FDC88",
+                  "9A0646A2549193FCD7C9AECF6A5E38A7",
+                  "0DC4988880A3A2DF75C6E441DAD5B20C",
+                  "45CFAE9BA3898833EA01C18E11D16EAE",
+                  "63EDDD459C2B17D96FA7EB70CA718051"
+                ]
+              }
+            },
+            "projection": {
+              "_id": 0,
+              "voyageId": 1,
+              "voyageNumber": 1,
+              "remarks": 1,
+              "fixtures.grades": 1,
+              "fixtures.fixtureGrades.gradeName": 1,
+              "fixtures.fixturePorts.portName": 1,
+              "fixtures.fixturePorts.activityType": 1
+            },
+            "sort": null,
+            "limit": 50,
+            "pipeline": null
+          },
+          "rows": 10,
+          "voyage_ids": 10,
+          "extracted_voyage_ids": [
+            "205904980E138687D16B5464AD662A10",
+            "6C5ACCAC38078103AC442ABC8F953F4C",
+            "7BBE26386FC504E510BF45167662B6AB",
+            "2D3729F01688442B63D91B819D47904B",
+            "56F951129BA83C40D3E9C3C7837D6063",
+            "85BE36902F793700251791820A4FDC88",
+            "9A0646A2549193FCD7C9AECF6A5E38A7",
+            "0DC4988880A3A2DF75C6E441DAD5B20C",
+            "45CFAE9BA3898833EA01C18E11D16EAE",
+            "63EDDD459C2B17D96FA7EB70CA718051"
+          ],
+          "remarks_by_voyage_id": 10,
+          "summary": "Mongo: fetched remarks + minimal context for 10 voyages (MongoDB)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 4,
+          "step_count": 4,
+          "agent": "llm",
+          "operation": "merge",
+          "inputs": {},
+          "goal": "Deterministically merge finance + ops + mongo context into a single joined dataset for summarization."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 4,
+          "agent": "llm",
+          "operation": "merge",
+          "ok": true,
+          "merged_rows": 10,
+          "summary": "Merge: joined finance + ops + mongo context into 10 merged rows."
+        },
+        {
+          "phase": "token_usage",
+          "stage": "pre_sanitize",
+          "total_tokens_est": 4256,
+          "mongo_tokens_est": 14,
+          "finance_tokens_est": 183,
+          "ops_tokens_est": 8,
+          "artifacts_tokens_est": 4021
+        },
+        {
+          "phase": "token_usage",
+          "stage": "post_sanitize",
+          "total_tokens_est": 4202,
+          "saved_tokens_est": 54,
+          "saved_pct_est": 1.268796992481203
+        }
+      ]
+    },
+    {
+      "id": "BIZ_005",
+      "category": "business_decision",
+      "turn_index": 1,
+      "query": "Which customer or charterer relationships look repeatable, if the data supports it? Include evidence and caveats.",
+      "session_id": "customer:golden:biz_005:business-decision-upgrade-pass",
+      "status_code": 200,
+      "elapsed_sec": 43.71,
+      "intent_key": "analysis.segment_performance",
+      "clarification": null,
+      "dynamic_sql_used": true,
+      "dynamic_sql_agents": [
+        "finance",
+        "ops"
+      ],
+      "answer": "The customer or charterer relationships that look repeatable are primarily those involving cargo grades such as PALM OIL, NHC, CPP, VEGOIL, and Gasoil, given the variety of voyages and vessels involved in transporting these cargo types. \n- The voyages for these cargo grades have been operated by different vessels, including Stena Imperator, Green Sea, Crude Zephyrus, Green Sky, Nord Himalaya, Dee 4 Nerium, Stena Penguin, Nikos M, and Stena Impression, indicating a diverse set of charterer relationships.\n- The financial performance of these voyages has been mixed, with some voyages generating significant revenue but also incurring high costs, leading to loss-making results.\n- The business reasoning signals from these voyages highlight concerns over inefficient revenue conversion, loss-making results, and weak business quality, suggesting that while there is revenue activity, the profit conversion and cost discipline are weak.\n\n### Summary\n- **Customer/Charterer Relationships**: Diverse, involving various cargo grades and vessels.\n- **Financial Performance**: Mixed, with significant revenue but high costs leading to losses in some cases.\n- **Business Quality**: Generally weak due to inefficient revenue conversion and high costs.\n\n### Results\n| Vessel Name | Voyage Number | Cargo Grade | Revenue | PnL | Margin |\n| --- | --- | --- | --- | --- | --- |\n| Green Sea | 2204 | PALM OIL | $2,951,857 | -$1,414,909 | -0.4793 |\n| Crude Zephyrus | 2301 | NHC | $4,656 | -$1,226,438 | -263.41 |\n| Green Sky | 2007 | CPP | $1,127,989 | -$1,166,341 | -1.034 |\n| Nord Himalaya | 2301 | VEGOIL | $2,274,054 | -$1,092,296 | -0.4803 |\n| Dee4 Nerium | 2402 | Gasoil | $1,028,972 | -$1,043,188 | -1.0138 |\n\nThe data suggests that while there are repeatable customer or charterer relationships, particularly in the transportation of specific cargo grades, the financial performance of these relationships is often loss-making due to high costs and inefficient revenue conversion. This indicates a need for closer examination of cost structures and commercial strategies to improve profitability.\n\nData caveats include the reliance on aligned sources for identity fields and the absence of detailed remarks or delay reasons for the voyages, which could provide additional insights into operational challenges and areas for improvement.",
+      "answer_length": 2333,
+      "answer_preview": "The customer or charterer relationships that look repeatable are primarily those involving cargo grades such as PALM OIL, NHC, CPP, VEGOIL, and Gasoil, given the variety of voyages and vessels involved in transporting these cargo types. \n- The voyages for these cargo grades have been operated by dif",
+      "must_contain": [
+        "customer",
+        "charterer",
+        "caveat"
+      ],
+      "missing_must_contain": [],
+      "bad_phrase_hits": [],
+      "has_error": false,
+      "error": null,
+      "trace_summary": {
+        "trace_steps_count": 11,
+        "phases": [
+          "intent_extraction",
+          "planning",
+          "composite_step_start",
+          "composite_step_result",
+          "composite_step_inputs_resolved",
+          "token_usage"
+        ],
+        "agents_used": [
+          "finance",
+          "ops",
+          "llm"
+        ],
+        "likely_paths": [
+          "composite"
+        ],
+        "row_counts": {},
+        "sql_generated": true,
+        "mongo_collections": []
+      },
+      "trace": [
+        {
+          "phase": "intent_extraction",
+          "intent_key": "analysis.segment_performance",
+          "slots": {},
+          "likely_path": "composite",
+          "source": "llm_extract_intent_slots"
+        },
+        {
+          "phase": "planning",
+          "plan_type": "composite",
+          "intent_key": "analysis.segment_performance",
+          "steps": [
+            {
+              "agent": "finance",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "question": "Which customer or charterer relationships look repeatable, if the data supports it? Include evidence and caveats.",
+                "limit": 10,
+                "intent_key": "analysis.segment_performance"
+              }
+            },
+            {
+              "agent": "ops",
+              "operation": "dynamicSQL",
+              "inputs": {
+                "voyage_ids": "$finance.voyage_ids"
+              }
+            },
+            {
+              "agent": "llm",
+              "operation": "merge",
+              "inputs": {}
+            }
+          ]
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 1,
+          "step_count": 3,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "question": "Which customer or charterer relationships look repeatable, if the data supports it? Include evidence and caveats.",
+            "limit": 10,
+            "intent_key": "analysis.segment_performance"
+          },
+          "goal": "Run a finance analysis query in Postgres (dynamic SQL) and return voyage_ids for downstream steps (limit=10)."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 1,
+          "agent": "finance",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 10,
+          "voyage_ids": 10,
+          "extracted_voyage_ids": [
+            "2DA0080E56ACACE75ECEB989D76DB933",
+            "A39C9634A18E888B924AB9D5931933D8",
+            "8125EAB23DAB3193AE1A0DBF607F16D8",
+            "AAE74337629029006D5B6B988FC1AB65",
+            "90F7F7E18A5967D3D89EC9C511D5ECD5",
+            "1F3253E262D4FEE3C081E4080A4F41EC",
+            "A466EE22E39E05AF61BF6FDF94952639",
+            "BD4051B3CAD54517CA656BCCCC27E65F",
+            "787F2CA660F1C3FCC2ED5B73B8FFFA13",
+            "E47C210959F9252CA402E96D690A8692"
+          ],
+          "sql_present": true,
+          "sql": "SELECT\n  f.voyage_id,\n  f.voyage_number,\n  f.vessel_imo,\n  f.revenue,\n  f.total_expense,\n  f.pnl,\n  f.tce,\n  f.total_commission,\n  f.voyage_start_date,\n  f.voyage_end_date,\n  o.vessel_name,\n  o.module_type,\n  o.ports_json,\n  o.grades_json,\n  o.activities_json,\n  o.remarks_json\nFROM finance_voyage_kpi f\nLEFT JOIN ops_voyage_summary o\n  ON f.voyage_id = o.voyage_id\nWHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')\n  AND f.pnl < 0\nORDER BY f.pnl ASC\nLIMIT %(limit)s",
+          "summary": "Finance: fetched 10 rows and extracted 10 voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 2,
+          "step_count": 3,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "inputs": {
+            "voyage_ids": "$finance.voyage_ids"
+          },
+          "goal": "Fetch ops summaries (ports/grades/remarks/delay/offhire) for selected voyage_ids from Postgres when available; skip if finance aggregate result is self-contained."
+        },
+        {
+          "phase": "composite_step_inputs_resolved",
+          "step_index": 2,
+          "agent": "ops",
+          "resolved_voyage_ids_count": 10,
+          "resolved_cargo_grades_count": 0,
+          "intent_key_ops": "analysis.segment_performance"
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 2,
+          "agent": "ops",
+          "operation": "dynamic_sql",
+          "ok": true,
+          "mode": "dynamic_sql",
+          "rows": 10,
+          "voyage_ids": 10,
+          "extracted_voyage_ids": [
+            "2DA0080E56ACACE75ECEB989D76DB933",
+            "A39C9634A18E888B924AB9D5931933D8",
+            "8125EAB23DAB3193AE1A0DBF607F16D8",
+            "AAE74337629029006D5B6B988FC1AB65",
+            "90F7F7E18A5967D3D89EC9C511D5ECD5",
+            "1F3253E262D4FEE3C081E4080A4F41EC",
+            "A466EE22E39E05AF61BF6FDF94952639",
+            "BD4051B3CAD54517CA656BCCCC27E65F",
+            "787F2CA660F1C3FCC2ED5B73B8FFFA13",
+            "E47C210959F9252CA402E96D690A8692"
+          ],
+          "sql_present": true,
+          "sql": "SELECT voyage_id,\n       voyage_number,\n       vessel_imo,\n       vessel_name,\n       module_type,\n       fixture_count,\n       offhire_days,\n       is_delayed,\n       delay_reason,\n       ports_json,\n       grades_json,\n       remarks_json,\n       voyage_start_date,\n       voyage_end_date\nFROM ops_voyage_summary\nWHERE voyage_id = ANY(%(voyage_ids)s)\nLIMIT %(limit)s",
+          "summary": "Ops: fetched 10 ops rows for voyage_ids (Postgres)."
+        },
+        {
+          "phase": "composite_step_start",
+          "step_index": 3,
+          "step_count": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "inputs": {},
+          "goal": "Deterministically merge finance + ops + mongo context into a single joined dataset for summarization."
+        },
+        {
+          "phase": "composite_step_result",
+          "step_index": 3,
+          "agent": "llm",
+          "operation": "merge",
+          "ok": true,
+          "merged_rows": 10,
+          "summary": "Merge: joined finance + ops + mongo context into 10 merged rows."
+        },
+        {
+          "phase": "token_usage",
+          "stage": "pre_sanitize",
+          "total_tokens_est": 6361,
+          "mongo_tokens_est": 11,
+          "finance_tokens_est": 973,
+          "ops_tokens_est": 8,
+          "artifacts_tokens_est": 5338
+        },
+        {
+          "phase": "token_usage",
+          "stage": "post_sanitize",
+          "total_tokens_est": 6406,
+          "saved_tokens_est": -45,
+          "saved_pct_est": -0.7074359377456375
+        }
+      ]
+    }
+  ]
+}

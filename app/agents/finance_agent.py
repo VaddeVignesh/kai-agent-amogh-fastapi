@@ -23,8 +23,11 @@ from app.config.agent_rules_loader import (
 )
 from app.config.domain_loader import get_default_limit, get_default_scenario, get_min_voyage_count_fallback
 from app.core.logger import get_logger
+from app.config.response_rules_loader import get_finance_kpi_scope_restricted_user_message
+from app.auth import session_may_access_finance_kpi
 from app.registries.intent_loader import get_yaml_registry_facade
-from app.sql.sql_allowlist import DEFAULT_ALLOWLIST
+from app.sql.registry_role_access import is_registry_query_allowed_for_session
+from app.sql.sql_allowlist import DEFAULT_ALLOWLIST, build_allowlist_for_session
 from app.sql.sql_guard import validate_and_prepare_sql
 from app.sql.sql_generator import SQLGenerator
 
@@ -40,9 +43,10 @@ class FinanceAgentResult:
     rows: List[Dict[str, Any]]
     mode: str = "registry_sql"
     sql: Optional[str] = None
+    fallback_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out = {
             "intent_key": self.intent_key,
             "query_key": self.query_key,
             "params": self.params,
@@ -50,6 +54,9 @@ class FinanceAgentResult:
             "mode": self.mode,
             "sql": self.sql,
         }
+        if self.fallback_reason:
+            out["fallback_reason"] = self.fallback_reason
+        return out
 
 
 class FinanceAgent:
@@ -92,7 +99,27 @@ class FinanceAgent:
         )
 
         try:
+            if not session_may_access_finance_kpi(session_context):
+                return {
+                    "mode": "registry_sql",
+                    "intent_key": intent_key,
+                    "query_key": "access_denied",
+                    "params": {},
+                    "rows": [],
+                    "fallback_reason": get_finance_kpi_scope_restricted_user_message(),
+                }
             query_key, params = self._map_intent(intent_key, slots)
+            if not is_registry_query_allowed_for_session(query_key, session_context):
+                return {
+                    "mode": "registry_sql",
+                    "intent_key": intent_key,
+                    "query_key": query_key,
+                    "params": params,
+                    "rows": [],
+                    "fallback_reason": (
+                        "This query requires database tables that are not enabled for your account role."
+                    ),
+                }
             rows = self.pg.fetch_all(query_key, params)
             elapsed = round(time.time() - start, 3)
             logger.info(
@@ -128,7 +155,7 @@ class FinanceAgent:
     # DYNAMIC SQL
     # =========================================================
 
-    def run_dynamic(self, *, question, intent_key, slots, enforce_limit=200):
+    def run_dynamic(self, *, question, intent_key, slots, enforce_limit=200, session_context=None):
         start = time.time()
         logger.info(
             "AGENT_START | agent=finance | mode=dynamic_sql | intent=%s | query_chars=%s",
@@ -138,6 +165,25 @@ class FinanceAgent:
 
         if not self.sql_generator:
             raise RuntimeError("FinanceAgent.run_dynamic requires sql_generator")
+
+        session_context = session_context or {}
+        allowlist = build_allowlist_for_session(session_context, self.allowlist)
+        if not session_may_access_finance_kpi(session_context):
+            elapsed = round(time.time() - start, 3)
+            logger.info(
+                "AGENT_END | agent=finance | mode=dynamic_sql | intent=%s | rows=0 | latency=%ss | note=access_denied",
+                intent_key,
+                elapsed,
+            )
+            return FinanceAgentResult(
+                intent_key=intent_key,
+                query_key="access_denied",
+                params={},
+                rows=[],
+                mode="dynamic_sql",
+                sql=None,
+                fallback_reason=get_finance_kpi_scope_restricted_user_message(),
+            )
 
         slots = self._normalize_slots(slots)
         # Composite intent hygiene: keep only registry-declared slots plus
@@ -206,7 +252,7 @@ class FinanceAgent:
         max_attempts = MAX_SQL_RETRIES + 1
         last_err = ""
         for attempt in range(max_attempts):
-            guard = validate_and_prepare_sql(sql=sql, params=params, allowlist=self.allowlist, enforce_limit=True)
+            guard = validate_and_prepare_sql(sql=sql, params=params, allowlist=allowlist, enforce_limit=True)
             if not guard.ok:
                 if (guard.reason or "").lower().find("forbidden sql pattern") >= 0:
                     repair_q = get_finance_repair_prompt("forbidden_sql_pattern").format(question=question)
@@ -238,7 +284,7 @@ class FinanceAgent:
             if not required_cols.issubset(set(first.keys())):
                 repair_q = get_finance_repair_prompt("require_kpi_columns").format(question=question)
                 sql2, params2 = _generate_once(repair_q)
-                guard2 = validate_and_prepare_sql(sql=sql2, params=params2, allowlist=self.allowlist, enforce_limit=True)
+                guard2 = validate_and_prepare_sql(sql=sql2, params=params2, allowlist=allowlist, enforce_limit=True)
                 if guard2.ok:
                     rows = self.pg.execute_dynamic_select(guard2.sql, guard2.params)
                     guard = guard2
@@ -285,7 +331,7 @@ class FinanceAgent:
                             params2["voyage_numbers"] = [int(v) for v in (slots.get("voyage_numbers") or [])]
                         except Exception:
                             pass
-                guard2 = validate_and_prepare_sql(sql=sql2, params=params2, allowlist=self.allowlist, enforce_limit=True)
+                guard2 = validate_and_prepare_sql(sql=sql2, params=params2, allowlist=allowlist, enforce_limit=True)
                 if guard2.ok:
                     rows2 = self.pg.execute_dynamic_select(guard2.sql, guard2.params)
                     if rows2 and not _needs_repair(rows2):
@@ -316,7 +362,7 @@ class FinanceAgent:
                 fallback_guard = validate_and_prepare_sql(
                     sql=fallback_sql,
                     params=fallback_params,
-                    allowlist=self.allowlist,
+                    allowlist=allowlist,
                     enforce_limit=True,
                 )
                 if fallback_guard.ok:

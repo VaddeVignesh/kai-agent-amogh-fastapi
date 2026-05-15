@@ -13,6 +13,8 @@ def test_role_access_config_matches_expected_admin_and_customer_scope() -> None:
     assert "admin_users" in ROLE_ACCESS["admin"]["redis"]
     assert "finance_voyage_kpi" in ROLE_ACCESS["admin"]["postgres_tables"]
     assert "voyages" in ROLE_ACCESS["customer"]["mongo_collections"]
+    assert ROLE_ACCESS["customer_ops_only"]["postgres_tables"] == ["ops_voyage_summary"]
+    assert "finance_voyage_kpi" not in ROLE_ACCESS["customer_ops_only"]["postgres_tables"]
 
 
 def test_admin_metrics_requires_admin_session(monkeypatch) -> None:

@@ -88,6 +88,27 @@ def get_null_equivalent_grade_values() -> set[str]:
     return normalized or {"none", "null", "n/a", "na"}
 
 
+def _user_access_messages() -> dict[str, Any]:
+    rules = load_response_rules().get("user_access_messages", {})
+    return rules if isinstance(rules, dict) else {}
+
+
+def get_finance_kpi_scope_restricted_user_message() -> str:
+    """
+    User-facing copy when finance KPI queries are blocked by RBAC (e.g. customer_ops_only).
+    Single source of truth in config/response_rules.yaml.
+    """
+    value = _user_access_messages().get("finance_kpi_scope_restricted", "")
+    text = str(value or "").strip()
+    if text:
+        return text
+    return (
+        "Commercial financial KPIs (revenue, PnL, TCE, scenario comparisons) are not available "
+        "for this workspace. Operational voyage data may still be available — ask about ports, "
+        "delays, grades, or remarks."
+    )
+
+
 def get_router_fallback_template(name: str) -> str:
     value = _router_fallback_templates().get(name, "")
     return str(value or "")

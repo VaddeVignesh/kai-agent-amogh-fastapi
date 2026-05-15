@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import logging
 import os
@@ -20,11 +21,17 @@ from app.config.prompt_rules_loader import (
     get_graph_router_multi_voyage_answer_system_prompt,
     get_graph_router_voyage_metadata_answer_system_prompt,
 )
-from app.config.response_rules_loader import get_result_set_response_template, get_router_fallback_template
+from app.config.response_rules_loader import (
+    get_finance_kpi_scope_restricted_user_message,
+    get_result_set_response_template,
+    get_router_fallback_template,
+)
 from app.registries.intent_loader import get_yaml_registry_facade
 from app.registries.sql_registry import SQL_REGISTRY
 from app.services.response_merger import compact_payload
+from app.utils.ops_llm_shrink import shrink_ops_row_json_fields
 from app.adapters.mongo_adapter import narrow_voyage_rows_by_entity_slots
+from app.auth import session_may_access_finance_kpi
 from app.config.routing_rules_loader import (
     get_cargo_grade_terms,
     get_cargo_grade_voyage_terms,
@@ -1382,15 +1389,9 @@ class GraphRouter:
             for p in get_explicit_result_set_reference_phrases()
         )
         starts_like_new_request = ul.startswith(get_new_request_prefixes())
+        _phase4a_fresh_ranking_utterance, _corpus_fresh_guard = GraphRouter._corpus_fresh_guard_flags(ul)
 
         # Use structured follow-up scope only when the operation/action is concrete.
-        _phase4a_fresh_ranking_utterance = starts_like_new_request and (
-            any(phrase in ul for phrase in get_fresh_ranking_phrases())
-            or (
-                any(word in ul for word in get_fresh_ranking_trend_words())
-                and any(word in ul for word in get_fresh_ranking_trend_context_words())
-            )
-        )
         _si_scope = session_ctx.get("_structured_intent") if isinstance(session_ctx, dict) else None
         _structured_scope_ok = isinstance(_si_scope, dict) and _si_scope.get("confidence") in ("high", "medium")
         if _structured_scope_ok:
@@ -1406,7 +1407,7 @@ class GraphRouter:
                 and _si_op in get_structured_followup_operations()
                 and (_si_fu_act is not None and str(_si_fu_act).strip() != "")
             )
-            if _genuine_followup and not _phase4a_fresh_ranking_utterance:
+            if _genuine_followup and not _corpus_fresh_guard:
                 turn_type = "followup"
                 fresh_fleet_turn = False
                 starts_like_new_request = False
@@ -1523,7 +1524,7 @@ class GraphRouter:
             # Do not let stale result-set memory hijack fresh ranking or trend asks.
             metric_followup_override = (
                 (not fresh_fleet_turn)
-                and (not _phase4a_fresh_ranking_utterance)
+                and (not _corpus_fresh_guard)
                 and isinstance(op_slots, dict)
                 and op_slots.get("action") in get_metric_followup_override_actions()
                 and len(words) <= 12
@@ -1557,7 +1558,7 @@ class GraphRouter:
                         )
                         return state
             if (
-                (not _phase4a_fresh_ranking_utterance)
+                (not _corpus_fresh_guard)
                 and isinstance(op_slots, dict)
                 and op_slots.get("action")
                 and ((not explicit_fresh_entity) or result_set_refinement)
@@ -1950,7 +1951,19 @@ class GraphRouter:
         # Final guard before persisting intent: avoids stale-session
         # followup.result_set on fresh fleet ranking / trend asks regardless of upstream overrides.
         _ul_fin = (user_input or "").strip().lower()
-        if intent_key == "followup.result_set" and _ul_fin.startswith(
+        _, _cf_fin = GraphRouter._corpus_fresh_guard_flags(_ul_fin)
+        if intent_key == "followup.result_set" and _cf_fin:
+            if any(term in _ul_fin for term in get_fresh_ranking_pnl_terms()):
+                intent_key = "ranking.voyages_by_pnl"
+            elif any(term in _ul_fin for term in get_fresh_ranking_segment_terms()):
+                intent_key = "analysis.segment_performance"
+            elif "trend" in _ul_fin and ("month" in _ul_fin or "average" in _ul_fin):
+                intent_key = "aggregation.trends"
+            elif len(_ul_fin.split()) > 12:
+                intent_key = "composite.query"
+            elif re.search(r"\b(top|bottom)\s+\d{1,2}\b", _ul_fin):
+                intent_key = "composite.query"
+        elif intent_key == "followup.result_set" and _ul_fin.startswith(
             ("show ", "show me", "list ", "rank ", "find ", "tell ", "what ", "which ")
         ):
             if "most profitable" in _ul_fin:
@@ -2404,6 +2417,96 @@ class GraphRouter:
         return _num(row.get(metric))
 
     @staticmethod
+    def _corpus_fresh_guard_flags(ul: str) -> tuple[bool, bool]:
+        """
+        Returns (phase4a_ranking_or_topn, corpus_broad_guard).
+
+        ``corpus_broad_guard`` is True for fresh-looking fleet/corpus asks (new-request
+        prefix plus ranking phrase, top/bottom-N pattern, or a longer question). Used to
+        block stale ``last_result_set`` hijacks and spurious structured follow-up scope.
+
+        ``phase4a_ranking_or_topn`` is the narrower guard reused for LLM intent remaps.
+        """
+        ul = (ul or "").strip().lower()
+        words = [w for w in ul.split() if w]
+        starts = ul.startswith(get_new_request_prefixes())
+        phase4a = starts and (
+            any(phrase in ul for phrase in get_fresh_ranking_phrases())
+            or (
+                any(word in ul for word in get_fresh_ranking_trend_words())
+                and any(word in ul for word in get_fresh_ranking_trend_context_words())
+            )
+            or bool(re.search(r"\b(top|bottom)\s+\d{1,2}\b", ul))
+        )
+        corpus = phase4a or (starts and len(words) > 10)
+        return phase4a, corpus
+
+    @staticmethod
+    def _routing_yaml_token_hit(ul: str, term: str) -> bool:
+        """Match YAML routing tokens without substring traps (e.g. ``include`` vs ``including``)."""
+        t = (term or "").strip().lower()
+        if not t:
+            return False
+        if " " in t:
+            return t in ul
+        return re.search(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])", ul, flags=re.I) is not None
+
+    @staticmethod
+    def _yaml_term_list_hit(ul: str, terms) -> bool:
+        for raw in terms:
+            if GraphRouter._routing_yaml_token_hit(ul, str(raw)):
+                return True
+        return False
+
+    @staticmethod
+    def _generic_followup_markers_hit(ul: str) -> bool:
+        return GraphRouter._yaml_term_list_hit(ul, get_generic_followup_markers())
+
+    @staticmethod
+    def _ops_only_voyage_snapshot_markdown(ops_safe: dict) -> str:
+        """Deterministic ops-only lines for RBAC tenants without finance KPI (no LLM)."""
+
+        rows = ops_safe.get("rows") if isinstance(ops_safe, dict) else None
+        if not isinstance(rows, list) or not rows:
+            return ""
+        r0 = rows[0]
+        if not isinstance(r0, dict):
+            return ""
+        r = copy.deepcopy(r0)
+        shrink_ops_row_json_fields(r, voyage_summary=True)
+        lines: list[str] = ["### Operations snapshot (this voyage)"]
+        for label, key in (
+            ("Voyage", "voyage_number"),
+            ("Vessel", "vessel_name"),
+            ("Module type", "module_type"),
+            ("Offhire days", "offhire_days"),
+            ("Delayed", "is_delayed"),
+            ("Delay reason", "delay_reason"),
+        ):
+            val = r.get(key)
+            if val not in (None, "", [], {}):
+                lines.append(f"- **{label}:** {val}")
+        ports = r.get("ports")
+        if isinstance(ports, list) and ports:
+            preview = ", ".join(str(p) for p in ports[:15])
+            more = len(ports) - 15
+            suffix = f" (+{more} more)" if more > 0 else ""
+            lines.append(f"- **Key ports:** {preview}{suffix}")
+        grades = r.get("cargo_grade_names")
+        if isinstance(grades, list) and grades:
+            preview = ", ".join(str(g) for g in grades[:20])
+            more = len(grades) - 20
+            suffix = f" (+{more} more)" if more > 0 else ""
+            lines.append(f"- **Cargo grades:** {preview}{suffix}")
+        rem = r.get("remarks_preview")
+        if isinstance(rem, list) and rem:
+            lines.append("- **Remarks (excerpt):**")
+            for t in rem[:3]:
+                if str(t).strip():
+                    lines.append(f"  - {str(t).strip()[:500]}")
+        return "\n".join(lines) if len(lines) > 1 else ""
+
+    @staticmethod
     def _classify_turn_type(*, session_ctx: Dict[str, Any], user_input: str) -> str:
         """
         Classify the incoming message as:
@@ -2542,9 +2645,10 @@ class GraphRouter:
         if len(words) > 8 and ul.startswith(get_long_new_question_prefixes()):
             return "new_question"
 
-        followup_markers = get_generic_followup_markers()
+        _, _corpus_cls = GraphRouter._corpus_fresh_guard_flags(ul)
+
         has_coref = any(w in words for w in get_coreference_words())
-        if any(m in ul for m in followup_markers) or has_coref:
+        if GraphRouter._generic_followup_markers_hit(ul) or has_coref:
             return "followup"
 
         # If we already have a result set, allow concise refinement operations as follow-ups.
@@ -2555,9 +2659,10 @@ class GraphRouter:
         # even when phrased as longer natural sentences.
         if (
             has_result_set
-            and any(k in ul for k in get_result_set_operation_verbs())
-            and any(k in ul for k in get_result_set_operation_fields())
-            and len(words) <= 18
+            and GraphRouter._yaml_term_list_hit(ul, get_result_set_operation_verbs())
+            and GraphRouter._yaml_term_list_hit(ul, get_result_set_operation_fields())
+            and len(words) <= 14
+            and not _corpus_cls
         ):
             return "followup"
 
@@ -2571,12 +2676,7 @@ class GraphRouter:
             return "followup"
 
         # Fresh ask markers -> new question.
-        starts_like_new_request = ul.startswith(
-            (
-                "show ", "show me", "list ", "rank ", "find ", "give ", "tell ",
-                "summarize", "compare ", "for ", "which ", "what ",
-            )
-        )
+        starts_like_new_request = ul.startswith(get_new_request_prefixes())
         if starts_like_new_request or GraphRouter._looks_like_new_question(ui):
             return "new_question"
 
@@ -2681,6 +2781,12 @@ class GraphRouter:
         """
         ul = (user_input or "").strip().lower()
         if not ul:
+            return None
+
+        wc = len(ul.split())
+        if wc > 22:
+            return None
+        if wc > 12 and ul.startswith(get_new_request_prefixes()):
             return None
 
         _sctx_rs = session_ctx if isinstance(session_ctx, dict) else {}
@@ -4986,7 +5092,30 @@ class GraphRouter:
             )
             if not finance_ok and not ops_ok and not mongo_ok:
                 vn = voyage_number or slots.get("voyage_numbers") or voyage_id or "this voyage"
-                answer = _router_fallback("backend_unavailable_generic", voyage_ref=vn)
+                vn_disp = str(vn)
+                ops_fr = str((ops_safe or {}).get("fallback_reason") or "")
+                fin_fr = str((finance_safe or {}).get("fallback_reason") or "")
+                combined = f"{ops_fr} {fin_fr}".lower()
+                # Empty SQL/Mongo rows often mean wrong/incomplete voyage ref — do not blame infra unless transport errors show up.
+                transport_unavailable = postgres_down or any(
+                    needle in combined
+                    for needle in (
+                        "connection refused",
+                        "postgres is not available",
+                        "could not connect",
+                        "timed out",
+                        "timeout",
+                        "server selection timed out",
+                        "operationalerror",
+                        "lost connection",
+                        "network is unreachable",
+                        "name or service not known",
+                    )
+                )
+                if transport_unavailable:
+                    answer = _router_fallback("backend_unavailable_generic", voyage_ref=vn_disp)
+                else:
+                    answer = _router_fallback("voyage_reference_ambiguous_or_not_found", voyage_ref=vn_disp)
                 state["merged"] = {"finance": finance_safe, "ops": ops_safe, "mongo": {}, "artifacts": {"intent_key": intent_key, "slots": slots}}
                 state["answer"] = answer
                 state["slots"] = slots
@@ -5003,6 +5132,8 @@ class GraphRouter:
                 vnum = mongo_safe.get("voyage_number")
                 remarks = mongo_safe.get("remarks") or []
                 fixtures = mongo_safe.get("fixtures") or []
+                if not session_may_access_finance_kpi(session_context):
+                    fixtures = []
                 mongo_llm_like = {
                     "mode": "mongo_llm",
                     "ok": True,
@@ -5027,6 +5158,7 @@ class GraphRouter:
                 "artifacts": {
                     "intent_key": intent_key,
                     "slots": slots,
+                    "finance_kpi_unavailable": not session_may_access_finance_kpi(session_context),
                 },
                 "dynamic_sql_used": isinstance(finance_safe, dict) and finance_safe.get("mode") == "dynamic_sql",
                 "dynamic_sql_agents": ["finance", "ops"] if isinstance(finance_safe, dict) and finance_safe.get("mode") == "dynamic_sql" else [],
@@ -5055,7 +5187,23 @@ class GraphRouter:
                     "commission",
                 )
             )
-            if asked_financials and not finance_ok:
+            # Ops-only / finance-KPI-disabled tenants: never run the LLM for explicit financial asks
+            # when finance rows are empty — ops/mongo payloads can still contain hire/fixture text
+            # that models misread as revenue/PnL.
+            if asked_financials and not finance_ok and not session_may_access_finance_kpi(session_context):
+                answer = get_finance_kpi_scope_restricted_user_message().strip()
+                snap = GraphRouter._ops_only_voyage_snapshot_markdown(ops_safe if isinstance(ops_safe, dict) else {})
+                if snap:
+                    answer = f"{answer}\n\n{snap}"
+                state["merged"] = merged
+                state["answer"] = answer
+                state["slots"] = slots
+                state["finance"] = finance_safe
+                state["ops"] = ops_safe
+                state["mongo"] = mongo_llm_like
+                return state
+
+            if asked_financials and not finance_ok and session_may_access_finance_kpi(session_context):
                 vn = voyage_number or slots.get("voyage_numbers") or voyage_id or "this voyage"
                 # Helpful diagnostics: finance had rows for this voyage number, but none
                 # matched Mongo's canonical vessel after strict reconciliation.
@@ -5102,17 +5250,18 @@ class GraphRouter:
                 return state
 
             try:
+                merged_llm = GraphRouter._sanitize_for_llm(compact_payload(merged))
                 if hasattr(self.llm, "generate_final_answer"):
                     answer = self.llm.generate_final_answer(
                         question=user_input,
-                        merged_data=merged,
+                        merged_data=merged_llm,
                         session_context=session_context,
                     )
                 else:
                     answer = self.llm.summarize_answer(
                         question=user_input,
                         plan=state.get("plan") or {"plan_type": "single", "intent_key": intent_key},
-                        merged=merged,
+                        merged=merged_llm,
                         session_context=session_context,
                     )
             except Exception as e:
@@ -6879,6 +7028,7 @@ Question: {user_input}"""
                     result = self.finance_agent.run(
                         intent_key=intent_key,
                         slots=slots,
+                        session_context=sess,
                     )
                 else:
                     finance_question = state["user_input"]
@@ -6910,7 +7060,8 @@ Question: {user_input}"""
                     result = self.finance_agent.run_dynamic(
                         question=finance_question,
                         intent_key=intent_key,
-                        slots=slots
+                        slots=slots,
+                        session_context=sess,
                     )
 
                 safe = _json_safe(result)
@@ -7046,7 +7197,11 @@ Question: {user_input}"""
                 # Retry with registry when dynamic SQL fails due to missing column (e.g. bunker_cost)
                 if "bunker_cost" in err_str and (intent_key == "analysis.high_revenue_low_pnl" or (state.get("plan") or {}).get("intent_key") == "analysis.high_revenue_low_pnl"):
                     try:
-                        result = self.finance_agent.run(intent_key=intent_key, slots=slots)
+                        result = self.finance_agent.run(
+                            intent_key=intent_key,
+                            slots=slots,
+                            session_context=sess,
+                        )
                         safe = _json_safe(result)
                         rows = safe.get("rows", []) or []
                         rows = rows[:20]
@@ -7113,6 +7268,7 @@ Question: {user_input}"""
                         or "composite.query"
                     ),
                     slots=enriched_slots,
+                    session_context=sess,
                 )
                 safe = _json_safe(result)
                 rows = (safe.get("rows") or [])[:25]
@@ -7243,7 +7399,8 @@ Question: {user_input}"""
                 result = self.ops_agent.run_dynamic(
                     question=state["user_input"],
                     intent_key=intent_key_ops,
-                    slots=slots
+                    slots=slots,
+                    session_context=sess,
                 )
 
                 safe = _json_safe(result)
@@ -9166,8 +9323,12 @@ Question: {user_input}"""
             Sanitized merged data with reduced size
         """
         import copy
-        
+
         sanitized = copy.deepcopy(merged)
+
+        intent_raw = sanitized.get("artifacts") if isinstance(sanitized.get("artifacts"), dict) else {}
+        intent_k = str((intent_raw or {}).get("intent_key") or "").strip()
+        voyage_summary_intent = intent_k == "voyage.summary"
 
         def _cap_list(v: Any, n: int) -> Any:
             return v[:n] if isinstance(v, list) else v
@@ -9305,12 +9466,7 @@ Question: {user_input}"""
                 for r in rows2:
                     if not isinstance(r, dict):
                         continue
-                    # These JSON arrays are the biggest token drivers in ops.
-                    r["ports_json"] = _cap_list(r.get("ports_json"), 12)
-                    r["grades_json"] = _cap_list(r.get("grades_json"), 12)
-                    r["remarks_json"] = _cap_list(r.get("remarks_json"), 5)
-                    if isinstance(r.get("remarks_json"), list):
-                        r["remarks_json"] = [_cap_str(str(x), 200) for x in (r.get("remarks_json") or [])[:5]]
+                    shrink_ops_row_json_fields(r, voyage_summary=voyage_summary_intent)
         
         # === Sanitize Artifacts ===
         if isinstance(sanitized.get("artifacts"), dict):

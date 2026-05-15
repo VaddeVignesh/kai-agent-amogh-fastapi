@@ -1,0 +1,173 @@
+derived_metrics:
+  margin:
+    label: Profit margin
+    numerator: pnl
+    denominator: revenue
+    output_key: margin
+    precision: 4
+  cost_ratio:
+    label: Cost ratio
+    numerator: total_expense
+    denominator: revenue
+    output_key: cost_ratio
+    precision: 4
+  commission_ratio:
+    label: Commission ratio
+    numerator: total_commission
+    denominator: revenue
+    output_key: commission_ratio
+    precision: 4
+
+reasoning_signals:
+  inefficient_revenue:
+    label: Inefficient revenue
+    conditions:
+      all:
+        - field: revenue
+          op: gt
+          value: 0
+        - field: margin
+          op: lt
+          value: 0.1
+        - field: cost_ratio
+          op: gt
+          value: 0.8
+    interpretation: Revenue is not converting efficiently into profit because cost is consuming most of the earning base.
+    impact: Treat this as a cost-efficiency concern, not a strong commercial result.
+  strong_margin:
+    label: Strong margin
+    conditions:
+      all:
+        - field: margin
+          op: gte
+          value: 0.2
+        - field: revenue
+          op: gt
+          value: 0
+    interpretation: Profit conversion is strong relative to revenue.
+    impact: This indicates efficient commercial performance when the underlying revenue base is meaningful.
+  loss_making:
+    label: Loss-making result
+    conditions:
+      all:
+        - field: pnl
+          op: lt
+          value: 0
+    interpretation: The voyage or group lost money on the available financial measure.
+    impact: This should be reviewed for cost, delay, cargo, or commercial exposure before being treated as operationally acceptable.
+  delay_exposure:
+    label: Delay exposure
+    conditions:
+      any:
+        - field: offhire_days
+          op: gt
+          value: 0
+        - field: is_delayed
+          op: is_true
+    interpretation: Operational delay/offhire is present in the row.
+    impact: Consider delay as an operational risk factor alongside financial KPIs.
+  profitable_but_operationally_risky:
+    label: Profitable but operationally risky
+    conditions:
+      all:
+        - field: pnl
+          op: gt
+          value: 0
+        - any:
+            - field: offhire_days
+              op: gt
+              value: 0
+            - field: is_delayed
+              op: is_true
+            - field: delay_reason
+              op: exists
+    interpretation: Commercial result is positive, but operational friction is visible in delay or offhire signals.
+    impact: Treat this as good revenue quality only if the operational issue is explainable or non-repeatable.
+  weak_business_quality:
+    label: Weak business quality
+    conditions:
+      all:
+        - field: revenue
+          op: gt
+          value: 0
+        - any:
+            - field: pnl
+              op: lte
+              value: 0
+            - field: margin
+              op: lt
+              value: 0.05
+            - field: total_expense
+              op: gte_field
+              other_field: revenue
+    interpretation: The row has revenue activity, but profit conversion or cost discipline is weak.
+    impact: Do not treat high revenue alone as a high-quality commercial result.
+  attractive_cargo_margin:
+    label: Attractive cargo margin
+    conditions:
+      all:
+        - field: cargo_grades
+          op: exists
+        - field: margin
+          op: gte
+          value: 0.15
+    interpretation: Cargo context is available and the associated margin is strong.
+    impact: This cargo pattern may be commercially attractive if sample size and reconciliation caveats are acceptable.
+
+answer_contract:
+  sections:
+    - What happened
+    - Why it matters
+    - Business impact
+    - Data caveats
+
+reconciliation:
+  primary_identity_fields:
+    - voyage_id
+  fallback_identity_fields:
+    - vessel_imo
+    - imo
+    - vessel_name
+    - voyage_number
+  canonical_field_sources:
+    voyage_id:
+      - finance
+      - ops
+      - mongo
+      - merged
+    voyage_number:
+      - finance
+      - ops
+      - mongo
+      - merged
+    vessel_imo:
+      - finance
+      - ops
+      - mongo
+      - merged
+    imo:
+      - mongo
+      - ops
+      - finance
+      - merged
+    vessel_name:
+      - ops
+      - mongo
+      - finance
+      - merged
+  source_sections:
+    - finance
+    - ops
+    - mongo
+  status_labels:
+    aligned: aligned
+    partial: partial
+    mismatch: mismatch
+  severity:
+    aligned: info
+    partial: warning
+    mismatch: blocking
+  caveats:
+    aligned: Sources agree on available identity fields.
+    partial: Some identity fields are only present in one source, so cross-source confidence is limited.
+    mismatch: Source identity fields disagree; treat row-level business conclusions as unreliable until reviewed.

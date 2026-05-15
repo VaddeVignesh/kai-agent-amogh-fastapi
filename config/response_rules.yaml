@@ -20,6 +20,24 @@ compact_payload:
     - n/a
     - na
 
+# Shown when the user's role cannot read finance_voyage_kpi (e.g. ops-only / chartering ops workspace).
+user_access_messages:
+  finance_kpi_scope_restricted: |
+    ### Data scope
+
+    Your workspace is provisioned for **operational voyage intelligence** (e.g. ports, delays, offhire, cargo grades, execution remarks) from approved operational stores. **Commercial financial KPIs** — revenue, expenses, PnL, TCE, scenario comparisons (ACTUAL vs WHEN_FIXED), and profitability or commission-led rankings — are **not exposed** under this access profile, in line with common **read-only ops / post-fixture** views in chartering and operations.
+
+    This is an **intentional data-access boundary** for this account — not a system outage, database failure, or model error.
+
+    ### What you can do here
+
+    - Ask for **route, delays, grades, and remarks** for a named voyage or vessel.
+    - Use **operational** fleet questions that do not require profitability tables.
+
+    ### If you need financials
+
+    Use a **full commercial** workspace or ask your **tenant administrator** to extend data scope. Figures are **not inferred** from operational fields alone.
+
 router_fallback_templates:
   no_data_available: Not available in dataset.
   backend_unavailable_with_list: |
@@ -42,6 +60,16 @@ router_fallback_templates:
 
     ### Next step
     - Start the databases (or update `POSTGRES_DSN` / `MONGO_URI`), then ask again.
+  voyage_reference_ambiguous_or_not_found: |
+    ### Summary
+    - I could not find any voyage, ops, or voyage-document data for **{voyage_ref}** after searching with the reference you gave.
+
+    ### What this usually means
+    - The **voyage number or ID** might be **only part of the full identifier**, **mistyped**, or **not present** in this environment’s datasets.
+    - That usually means the reference **did not match any row**—not necessarily that the databases are unavailable.
+
+    ### Next step
+    - Confirm the full **voyage number** or **voyage_id**, or add **vessel name / IMO** to narrow the match. If the reference is correct, verify Postgres and Mongo are loaded for that voyage.
   multi_voyage_formatting_failed: |
     ### Summary
     - I found the voyage financial and operational details, but could not format the final response right now.

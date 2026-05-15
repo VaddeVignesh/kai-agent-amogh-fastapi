@@ -15,13 +15,19 @@ from app.config.agent_rules_loader import (
     get_ops_simple_intent_mappings,
     get_ops_validation_message,
 )
+from app.auth import session_may_access_ops_summary, session_may_access_finance_kpi
 from app.config.domain_loader import get_default_limit, get_default_scenario, is_null_equivalent
 from app.core.logger import get_logger
-from app.sql.sql_allowlist import DEFAULT_ALLOWLIST
+from app.sql.registry_role_access import is_registry_query_allowed_for_session
+from app.sql.sql_allowlist import DEFAULT_ALLOWLIST, build_allowlist_for_session
 from app.sql.sql_guard import validate_and_prepare_sql
 from app.sql.sql_generator import SQLGenerator
 
 logger = get_logger("ops_agent")
+
+_OPS_ACCESS_DENIED = (
+    "Operational voyage data is not available for your account role."
+)
 
 
 @dataclass(frozen=True)
@@ -68,7 +74,27 @@ class OpsAgent:
         )
 
         try:
-            query_key, params = self.map_intent(intent_key, slots)
+            if not session_may_access_ops_summary(session_context):
+                return {
+                    "mode": "registry_sql",
+                    "intent_key": intent_key,
+                    "query_key": "access_denied",
+                    "params": {},
+                    "rows": [],
+                    "fallback_reason": _OPS_ACCESS_DENIED,
+                }
+            query_key, params = self.map_intent(intent_key, slots, session_context)
+            if not is_registry_query_allowed_for_session(query_key, session_context):
+                return {
+                    "mode": "registry_sql",
+                    "intent_key": intent_key,
+                    "query_key": query_key,
+                    "params": params,
+                    "rows": [],
+                    "fallback_reason": (
+                        "This query requires database tables that are not enabled for your account role."
+                    ),
+                }
             rows = self.pg.fetch_all(query_key, params)
             elapsed = round(time.time() - start, 3)
             logger.info(
@@ -100,9 +126,14 @@ class OpsAgent:
                 "fallback_reason": str(e),
             }
 
-    def try_dynamic(self, *, question, intent_key, slots):
+    def try_dynamic(self, *, question, intent_key, slots, session_context=None):
         try:
-            return self.run_dynamic(question=question, intent_key=intent_key, slots=slots)
+            return self.run_dynamic(
+                question=question,
+                intent_key=intent_key,
+                slots=slots,
+                session_context=session_context,
+            )
         except Exception as exc:
             logger.error(
                 "AGENT_ERROR | agent=ops | mode=dynamic_sql | intent=%s | error=%s",
@@ -115,13 +146,32 @@ class OpsAgent:
     # DYNAMIC EXECUTION (STRICT OPS-ONLY)
     # =========================================================
 
-    def run_dynamic(self, *, question, intent_key, slots, enforce_limit=200):
+    def run_dynamic(self, *, question, intent_key, slots, enforce_limit=200, session_context=None):
         start = time.time()
         logger.info(
             "AGENT_START | agent=ops | mode=dynamic_sql | intent=%s | query_chars=%s",
             intent_key,
             len(question or ""),
         )
+
+        session_context = session_context or {}
+        allowlist = build_allowlist_for_session(session_context, self.allowlist)
+
+        if not session_may_access_ops_summary(session_context):
+            elapsed = round(time.time() - start, 3)
+            logger.info(
+                "AGENT_END | agent=ops | mode=dynamic_sql | intent=%s | rows=0 | latency=%ss | note=access_denied",
+                intent_key,
+                elapsed,
+            )
+            return OpsAgentResult(
+                intent_key=intent_key,
+                query_key="access_denied",
+                params={},
+                rows=[],
+                mode="dynamic_sql",
+                sql=None,
+            )
 
         if not self.sql_generator:
             raise RuntimeError("OpsAgent.run_dynamic requires sql_generator")
@@ -166,6 +216,15 @@ class OpsAgent:
             and vessel_imos
             and not (isinstance(voyage_ids, list) and voyage_ids)
         ):
+            if not is_registry_query_allowed_for_session("kpi.vessel_most_common_grades", session_context):
+                return OpsAgentResult(
+                    intent_key=intent_key,
+                    query_key="access_denied",
+                    params={},
+                    rows=[],
+                    mode="dynamic_sql",
+                    sql=None,
+                )
             try:
                 vimos = [v for v in vessel_imos if v is not None]
                 if vimos:
@@ -204,7 +263,7 @@ class OpsAgent:
             guard = validate_and_prepare_sql(
                 sql=canonical_sql,
                 params=params,
-                allowlist=self.allowlist,
+                allowlist=allowlist,
                 enforce_limit=True,
             )
 
@@ -249,7 +308,7 @@ class OpsAgent:
             guard = validate_and_prepare_sql(
                 sql=canonical_sql,
                 params=params,
-                allowlist=self.allowlist,
+                allowlist=allowlist,
                 enforce_limit=True,
             )
             if guard.ok:
@@ -321,7 +380,7 @@ class OpsAgent:
                 guard = validate_and_prepare_sql(
                     sql=vessel_sql,
                     params=params,
-                    allowlist=self.allowlist,
+                    allowlist=allowlist,
                     enforce_limit=True,
                 )
 
@@ -353,7 +412,7 @@ class OpsAgent:
         guard = validate_and_prepare_sql(
             sql=sql,
             params=params,
-            allowlist=self.allowlist,
+            allowlist=allowlist,
             enforce_limit=True,
         )
 
@@ -389,8 +448,9 @@ class OpsAgent:
     # REGISTRY FALLBACK
     # =========================================================
 
-    def map_intent(self, intent_key, slots):
+    def map_intent(self, intent_key, slots, session_context=None):
         s = dict(slots or {})
+        session_context = session_context or {}
         limit = min(int(s.get("limit") or self.DEFAULT_LIMIT), self.MAX_LIMIT)
 
         if intent_key == "voyage.summary":
@@ -399,17 +459,23 @@ class OpsAgent:
             vessel_imo = s.get("imo") or s.get("vessel_imo")
             if not voyage_number and not voyage_id:
                 raise ValueError(get_ops_validation_message("voyage_summary_requires_reference"))
-            return "kpi.voyage_by_reference", {
+            params = {
                 "voyage_number": str(int(voyage_number)) if voyage_number is not None else None,
                 "voyage_id": str(voyage_id) if voyage_id is not None else None,
                 "vessel_imo": str(vessel_imo) if vessel_imo is not None else None,
-                "scenario": s.get("scenario") or get_default_scenario(),
             }
+            # Tenants without finance KPI still need ops voyage rows; kpi.* SQL joins finance_voyage_kpi.
+            if not session_may_access_finance_kpi(session_context):
+                return "ops.voyage_by_reference", params
+            params["scenario"] = s.get("scenario") or get_default_scenario()
+            return "kpi.voyage_by_reference", params
 
         if intent_key == "vessel.summary":
             vessel_ref = s.get("vessel_name") or s.get("imo")
             if not vessel_ref:
                 raise ValueError(get_ops_validation_message("vessel_summary_requires_reference"))
+            if not session_may_access_finance_kpi(session_context):
+                return "ops.vessel_voyages_by_reference", {"vessel_ref": str(vessel_ref), "limit": limit}
             return "kpi.vessel_voyages_by_reference", {"vessel_ref": str(vessel_ref), "limit": limit}
 
         simple_mappings = get_ops_simple_intent_mappings()

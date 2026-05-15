@@ -381,12 +381,12 @@ export default function AdminPage() {
           </div>
           <div>
             <h2 className="text-sm font-semibold text-foreground">Analytics Assistant</h2>
-            <p className="text-xs text-muted-foreground">Ask the AI for org-wide ecommerce insights</p>
+            <p className="text-xs text-muted-foreground">Ask the AI for voyage, vessel, port, and fleet insights</p>
           </div>
         </div>
         <AnalyticsChat
           title="Admin Analytics Copilot"
-          welcome="Admin view enabled. Ask anything about orders, revenue, customers, products, inventory, or platform performance — I have access to all tenants."
+          welcome="Admin view enabled. Ask about voyages, vessels, ports, cargo, financial KPIs, or platform health — full tenant and admin scope."
           height="640px"
           showExecutionTrace
         />

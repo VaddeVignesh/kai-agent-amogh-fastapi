@@ -160,7 +160,7 @@ generator:
     - left: finance_voyage_kpi
       right: ops_voyage_summary
       keys:
-        - voyage_number + vessel_imo (string-normalized with REPLACE(.0,''))
+        - voyage_id
   param_conventions:
     named_params: Use %(param)s placeholders. Never hardcode values.
     list_params: f.voyage_id = ANY(%(voyage_ids)s::TEXT[])

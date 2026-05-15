@@ -31,6 +31,8 @@ def test_mongo_guard_rules_load_from_yaml() -> None:
 def test_mongo_projection_and_limits_load_from_yaml() -> None:
     full_context = get_mongo_projection("full_voyage_context")
     assert full_context["voyageId"] == 1
+    assert full_context["vesselImo"] == 1
+    assert full_context["imo"] == 1
     assert full_context["remarkList"] == 1
     assert get_mongo_projection("minimal_document")["_id"] == 0
     assert get_mongo_projection("voyage_metadata_context")["projected_results"] == 1
@@ -50,6 +52,7 @@ def test_mongo_agent_policy_loads_from_yaml() -> None:
     scoring = get_mongo_agent_scoring("full_voyage_context_scoring")
 
     assert output_fields["voyage_id"] == "voyageId"
+    assert output_fields["vessel_imo"]["first_of"] == ["vesselImo", "vessel_imo", "imo"]
     assert output_fields["remarks"]["first_of"] == ["remarks", "remarkList"]
     assert scoring["recency_fields"] == ["startDateUtc", "extracted_at"]
     assert scoring["id_field"] == "voyageId"

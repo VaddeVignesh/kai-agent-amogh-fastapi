@@ -1,328 +1,537 @@
-# kai-agent – Reference Architecture (Implemented)
+# KAI Agent Reference Architecture
 
-This document describes the **implemented** architecture of `kai-agent` as it exists in this repository.
-It covers how the system routes natural-language questions, safely queries Postgres/Mongo, merges results, and generates narrative answers.
-
----
-
-## 1) System overview
-
-`kai-agent` is a **schema-guarded, multi-agent maritime analytics assistant**.
-
-It answers questions using:
-- **PostgreSQL** for analytics KPIs (finance + ops)
-- **MongoDB** for rich voyage/vessel context (remarks, fixtures, ports, grades, legs, etc.)
-- **Redis** for session memory (slots + last intent + turn counter)
-- **LLMs** for:
-  - intent + slot extraction (with deterministic overrides)
-  - dynamic query generation (guarded SQL and guarded Mongo find specs)
-  - narrative response generation (draft + “polish/editor” rewrite)
-
-**Hard constraint**: LLMs do not connect to databases directly. All database access is performed by adapters/agents.
+This document describes the current implemented architecture of `kai-agent-amogh-fastapi`.
+It supersedes older Streamlit-first and pre-business-reasoning architecture notes.
 
 ---
 
-## 2) High-level request flow
+## 1. System Purpose
 
+KAI Agent is a config-driven, multi-agent maritime analytics assistant. It answers natural-language questions about voyages, vessels, ports, cargo grades, financial KPIs, delays, offhire, scenario comparison, metadata, and business decision quality.
+
+The current system is designed as a governed decision-support platform, not a free-form chatbot:
+
+- Users ask questions in a React/Vite frontend or optional Streamlit UI.
+- FastAPI exposes the main `/query` API plus auth/admin endpoints.
+- `GraphRouter` orchestrates intent extraction, slot validation, planning, agent execution, merge, enrichment, and summarization.
+- Agents retrieve data from PostgreSQL and MongoDB through safe adapters.
+- Redis stores session memory, clarification state, metrics, audit, execution history, and idempotency data.
+- YAML configuration owns most domain policy: routing, prompts, SQL rules, registry SQL, response compaction, and business reasoning.
+- The LLM helps with intent extraction, dynamic SQL/spec generation, and answer wording, but it never directly accesses databases.
+
+---
+
+## 2. Current Runtime Stack
+
+| Layer | Current implementation |
+| --- | --- |
+| Frontend | `frontend/digital-sales-agent-main` React/Vite app with chat, login, admin, diagnostics, markdown tables, and trace display |
+| Optional UI | `app/UI/UX/streamlit_app.py` for local/debug chat |
+| API | `app/main.py` FastAPI app |
+| Orchestration | `app/orchestration/graph_router.py` and `planner.py` |
+| Agents | `FinanceAgent`, `OpsAgent`, `MongoAgent` |
+| Data | PostgreSQL, MongoDB, Redis |
+| LLM | Groq-backed `LLMClient` |
+| Guardrails | SQL allowlist/guard, Mongo guard, config loaders |
+| Reasoning | source reconciliation, derived metrics, reasoning signals, answer contract |
+| Validation | pytest and `scripts/run_golden_config_suite.py` |
+
+---
+
+## 3. High-Level Component View
+
+```mermaid
+flowchart TD
+    U[User] --> FE[React Frontend]
+    U --> ST[Optional Streamlit UI]
+    FE --> API[FastAPI API]
+    ST --> API
+
+    API --> RBAC[Auth / RBAC / Admin APIs]
+    API --> GR[GraphRouter]
+
+    GR --> RS[RedisStore]
+    GR --> LLM[LLMClient]
+    GR --> PL[Planner]
+    GR --> FA[FinanceAgent]
+    GR --> OA[OpsAgent]
+    GR --> MA[MongoAgent]
+
+    FA --> PG[(PostgreSQL)]
+    OA --> PG
+    MA --> MG[(MongoDB)]
+    RS --> RD[(Redis)]
+
+    GR --> MERGE[Deterministic Merge]
+    MERGE --> RECON[Source Reconciliation]
+    RECON --> REASON[Business Reasoning]
+    REASON --> COMPACT[Compact Payload]
+    COMPACT --> LLM
+    LLM --> API
+    API --> FE
 ```
-User input
-  ↓
-GraphRouter.handle(session_id, user_input)
-  ↓
-Load session (Redis)
-  ↓
-Intent + slot extraction (LLMClient.extract_intent_slots + deterministic rules + regex)
-  ↓
-Planning (Planner.build_plan → single vs composite)
-  ↓
-Execution (agents: finance / ops / mongo)
-  ↓
-Merge results (artifacts.merged_rows)
-  ↓
-Compaction + sanitization (response_merger.compact_payload + GraphRouter._sanitize_for_llm)
-  ↓
-Narrative answer generation (LLMClient.summarize_answer + polish pass)
-  ↓
-Return { intent_key, slots, answer, data, plan, dynamic_sql_used, dynamic_sql_agents }
+
+---
+
+## 4. End-To-End Request Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant FE as React/Streamlit UI
+    participant API as FastAPI /query
+    participant Router as GraphRouter
+    participant Redis as RedisStore
+    participant Planner
+    participant Finance as FinanceAgent
+    participant Ops as OpsAgent
+    participant Mongo as MongoAgent
+    participant LLM as LLMClient
+
+    User->>FE: Ask a business/analytics question
+    FE->>API: POST /query with query, session_id, request_id
+    API->>Redis: Check idempotency and load memory
+    API->>Router: handle(session_id, query)
+    Router->>Redis: load_session()
+    Router->>Router: deterministic routing, slot cleanup, fast paths
+    Router->>LLM: intent/slot extraction when needed
+    Router->>Router: validate required slots
+    alt Missing slot
+        Router->>Redis: persist pending clarification
+        Router-->>API: clarification response
+        API-->>FE: clarification and suggestions
+    else Executable query
+        Router->>Planner: build_plan(intent, slots)
+        alt single plan
+            Router->>Finance: registry/direct query when needed
+            Router->>Ops: registry/direct query when needed
+            Router->>Mongo: metadata/context when needed
+        else composite plan
+            Router->>Finance: registry or guarded dynamic SQL
+            Router->>Ops: canonical ops enrichment by voyage_id
+            Router->>Mongo: optional metadata/remarks/context
+        end
+        Router->>Router: merge finance + ops + mongo
+        Router->>Router: reconcile sources and evaluate business reasoning
+        Router->>Router: compact payload
+        Router->>LLM: summarize with answer contract
+        Router->>Redis: save session, metrics, result-set memory
+        Router-->>API: answer + trace + metadata
+        API-->>FE: final response
+    end
 ```
 
 ---
 
-## 3) Core orchestration
+## 5. API Layer
 
-### 3.1 `GraphRouter` (LangGraph-style orchestration)
-**File**: `app/orchestration/graph_router.py`
+`app/main.py` initializes the runtime and exposes the application API.
 
-Responsibilities:
-- maintains GraphState: `intent_key`, `slots`, `plan`, `step_index`, `artifacts`, `finance`, `ops`, `mongo`, `merged`, `answer`
-- executes:
-  - **single** path (entity-style questions)
-  - **composite** path (multi-step analysis/ranking)
-- performs deterministic merge into `artifacts.merged_rows`
-- compacts/sanitizes payload before LLM summarization
-- persists session state back to Redis
+Important responsibilities:
 
-Public API:
-- `handle(session_id, user_input)` → returns the final response object
+- Load environment variables.
+- Build `LLMClient`.
+- Build `MongoAdapter`, `PostgresAdapter`, `RedisStore`.
+- Build `MongoAgent`, `FinanceAgent`, `OpsAgent`.
+- Build `GraphRouter`.
+- Expose query, session, login, admin metrics, audit, users, and health endpoints.
+- Use FastAPI background tasks for non-critical query side effects such as metrics/audit/execution-history recording.
 
-### 3.2 `Planner` (single vs composite planning)
-**File**: `app/orchestration/planner.py`
+Main request model:
 
-Planner is deterministic and uses:
-- extracted intent_key
-- extracted slots
-- phrase heuristics (ranking/trend/offhire/compare)
+```json
+{
+  "query": "Which voyages have high revenue but weak business quality?",
+  "session_id": "customer-session-id",
+  "request_id": "optional-idempotency-id",
+  "chat_history": []
+}
+```
 
-Outputs:
-- `ExecutionPlan(plan_type="single")` with no steps, OR
-- `ExecutionPlan(plan_type="composite")` with steps like:
+Main response fields:
 
-Composite pattern:
-1. (optional) `mongo.resolve_anchor`
-2. `finance.dynamic_sql`
-3. `ops.dynamic_sql` (skipped for scenario comparison)
-4. (optional) `mongo.fetch_remarks`
-5. `llm.merge`
-
----
-
-## 4) Intent model and configuration
-
-**File**: `app/registries/intent_registry.py`
-
-- `SUPPORTED_INTENTS`: full list of supported intents
-- `INTENT_REGISTRY`: per-intent needs + slot requirements
-
-Each intent config declares:
-- `required_slots`, `optional_slots`
-- `needs: { mongo, finance, ops }`
-- mongo anchor intent + default projection, when applicable
+- `session_id`
+- `answer`
+- `clarification`
+- `trace`
+- `intent_key`
+- `slots`
+- `dynamic_sql_used`
+- `dynamic_sql_agents`
 
 ---
 
-## 5) Agents
+## 6. Frontend And RBAC
 
-### 5.1 FinanceAgent (Postgres)
-**File**: `app/agents/finance_agent.py`
+The current primary frontend is the React/Vite application under `frontend/digital-sales-agent-main`.
 
-Role:
-- produces finance KPI rows from Postgres (`finance_voyage_kpi`)
+Important frontend responsibilities:
 
-Modes:
-- `registry_sql`: runs a known SQL registry query
-- `dynamic_sql`: generates SQL via `SQLGenerator`, validates via `sql_guard`, executes via `PostgresAdapter.execute_dynamic_select`
+- Login page and role-aware access.
+- Assistant chat page.
+- Admin page for metrics, users, audit logs, and system health.
+- Markdown answer rendering.
+- Table rendering.
+- Clarification display.
+- Execution trace and diagnostics display.
+- Stable session/request ids for continuity and idempotency.
 
-**Dynamic SQL enablement / initialization**
-- Dynamic SQL is invoked **only in composite plans** (multi-step analysis/ranking).
-- In composite execution, the router calls `FinanceAgent.run_dynamic(...)` directly:
-  - `SQLGenerator.generate(question, intent_key, slots, agent="finance")`
-  - `sql_guard.validate_and_prepare_sql(sql, params, allowlist, enforce_limit=True)`
-  - `PostgresAdapter.execute_dynamic_select(guard.sql, guard.params)`
-- Output contract:
-  - `mode: "dynamic_sql"`
-  - `sql`: the final guarded SQL string (for debugging)
-  - `rows`: query results (capped upstream in orchestration)
+FastAPI provides login/admin endpoints backed by `app/auth.py` and Redis/admin data helpers. Roles control which admin resources are available.
 
-### 5.2 OpsAgent (Postgres)
-**File**: `app/agents/ops_agent.py`
-
-Role:
-- produces operational rows from Postgres (`ops_voyage_summary`) including JSON aggregates:
-  - `ports_json`, `grades_json`, `remarks_json`
-
-Modes:
-- `registry_sql`
-- `dynamic_sql` with strict guardrails:
-  - canonical query paths when `voyage_ids` or `voyage_number` exist
-  - deterministic `vessel.summary` query path (ensures ports/grades/remarks coverage)
-  - blocks finance columns from leaking into ops queries
-
-**Dynamic SQL behavior (ops)**
-- Dynamic SQL is invoked **only in composite plans** (multi-step analysis/ranking).
-- In composite execution, the router calls `OpsAgent.run_dynamic(...)` directly.
-- For data completeness, `OpsAgent.run_dynamic()` prefers deterministic “canonical” SQL paths when possible:
-  - If `slots.voyage_ids` exists → fetch from `ops_voyage_summary` including `ports_json`, `grades_json`, `remarks_json`.
-  - If `slots.voyage_number` exists → resolve `voyage_id` then re-run with `voyage_ids`.
-  - If `intent_key == "vessel.summary"` → deterministic query by IMO and/or vessel name (ensures ports/grades/remarks are available for narrative vessel summaries).
-
-### 5.3 MongoAgent (MongoDB)
-**File**: `app/agents/mongo_agent.py`
-
-Role:
-- resolves vessel/voyage anchors and fetches documents with minimal projection
-- supports **Dynamic NoSQL**:
-  - `run_llm_find(question, slots)` → LLM generates a safe `find()` spec using `mongo_schema_hint()`
-  - spec is validated via `mongo_guard.validate_mongo_spec`
-  - query is executed via `MongoAdapter.find_many`
-
-Notes:
-- Mongo stores `voyageNumber` as **string**, so slots are normalized to string for Mongo find specs.
-
-**Dynamic NoSQL enablement / initialization**
-- Dynamic NoSQL is available when `MongoAgent` is constructed with an `LLMClient` (so it can create a `MongoQueryBuilder`).
-- Execution path:
-  - `mongo_schema_hint()` provides a stable list of collections/fields + allowed operators.
-  - `MongoQueryBuilder.build(...)` prompts the LLM to output a strict JSON `MongoQuerySpec`.
-  - `mongo_guard.validate_mongo_spec(...)` enforces allowed collections/operators, projection constraints, and `limit <= 50`.
-  - `MongoAdapter.find_many(...)` executes the safe Mongo query.
-- Output contract:
-  - `mode: "mongo_llm"`
-  - `ok: true|false`, with `reason` when false
-  - `collection`, `filter`, `projection`, `limit`
-  - `rows`: projected documents (capped upstream in orchestration)
+The Streamlit UI remains available as a developer/debug client, but the browser UI is now the richer product-facing interface.
 
 ---
 
-## 6) Adapters (infrastructure boundary)
+## 7. Orchestration Layer
 
-### 6.1 PostgresAdapter
-**File**: `app/adapters/postgres_adapter.py`
+`GraphRouter` is the central orchestration engine.
 
-- pooled connections (psycopg2)
-- supports:
-  - registry queries (`fetch_all`)
-  - dynamic select (`execute_dynamic_select`)
+It manages:
 
-Dynamic safety:
-- only allows `SELECT` or `WITH ... SELECT`
-- blocks DML keywords
-- normalizes `:param` → `%(param)s`
-- enforces `LIMIT` if missing
-- filters parameters to those used in SQL
+- session load
+- intent and slot extraction
+- slot validation
+- clarification generation
+- planning
+- single execution
+- composite execution
+- result merge
+- payload compaction
+- business enrichment
+- final summarization
+- Redis persistence
+- trace emission
 
-### 6.2 MongoAdapter
-**File**: `app/adapters/mongo_adapter.py`
+The router is stateful per request through `GraphState`, not through global mutable query state.
 
-Read-only access to:
-- `vessels`
-- `voyages`
+Important `GraphState` fields:
 
-Provides:
-- anchor helpers (vessel name → IMO, voyage number → voyageId)
-- document fetch with projections and remark slicing
-- `find_many()` for dynamic NoSQL execution
+- `session_id`
+- `user_input`
+- `raw_user_input`
+- `session_ctx`
+- `intent_key`
+- `slots`
+- `missing_keys`
+- `clarification`
+- `plan_type`
+- `plan`
+- `step_index`
+- `mongo`
+- `finance`
+- `ops`
+- `data`
+- `merged`
+- `answer`
+- `artifacts`
 
-### 6.3 RedisStore
-**File**: `app/adapters/redis_store.py`
-
-Provides:
-- `load_session()`, `save_session()` (router-facing session memory)
-- optional idempotency + distributed lock utilities
-
----
-
-## 7) Query generation and guards
-
-### 7.1 SQL generation
-**File**: `app/sql/sql_generator.py`
-
-Generates SQL for known intents and patterns.
-Uses safe metric mapping and deterministic templates for key intents.
-
-### 7.2 SQL guard (validation)
-**Files**:
-- `app/sql/sql_guard.py`
-- `app/sql/sql_allowlist.py`
-
-Validates:
-- allowed tables only (`finance_voyage_kpi`, `ops_voyage_summary`)
-- blocks forbidden patterns
-- validates select list for invalid columns
-- handles CTE names, ignores `LATERAL`, enforces LIMIT
-- sanitizes parameters (lists for `ANY(...)`, preserves normal strings)
-
-### 7.3 Mongo schema hint + guard (Dynamic NoSQL)
-**Files**:
-- `app/orchestration/mongo_schema.py` (schema hint, audited field names, allowed operators)
-- `app/llm/mongo_query_builder.py` (LLM JSON spec builder)
-- `app/mongo/mongo_guard.py` (operator/projection/limit validation)
-
-### 7.4 How orchestration uses Dynamic SQL / Dynamic NoSQL
-
-Dynamic SQL / NoSQL are invoked by the orchestrator depending on plan type:
-
-- **Single**:
-  - `FinanceAgent.run()` and `OpsAgent.run()` use **registry SQL** (safe, deterministic query mapping) for entity summaries.
-  - `voyage.summary` single path also fetches Mongo context; the router normalizes the mongo payload into a `mode: mongo_llm`-like shape for a consistent summarizer/validator contract.
-
-- **Composite**:
-  - Finance step uses `FinanceAgent.run_dynamic(...)` (forced in composite execution).
-  - Ops step uses `OpsAgent.run_dynamic(...)` (forced in composite execution, typically with `voyage_ids` from finance).
-  - Mongo enrichment step uses `MongoAgent.run_llm_find(...)` to fetch remarks/ports/grades/commissions for the composite set of voyage IDs.
-  - Merge step creates `artifacts.merged_rows` as the primary joined dataset for the summarizer.
+`artifacts` carries transient execution details such as trace, merged rows, voyage ids, coverage, result-set memory, and dynamic SQL metadata.
 
 ---
 
-## 8) Merging, compaction, and summarization
+## 8. Intent, Slots, And Clarification
 
-### 8.1 Deterministic merge
-**File**: `app/orchestration/graph_router.py`
+The system maps user text to:
 
-Composite merges by `voyage_id` into:
-- `artifacts.merged_rows`: one item per voyage containing:
-  - finance row
-  - ops row(s)
-  - remarks / ports / grades derived from Mongo
+- `intent_key`: what the user wants.
+- `slots`: parameters needed for execution.
 
-### 8.2 Compaction
-**File**: `app/services/response_merger.py`
+The router uses:
 
-`compact_payload()` caps:
-- finance rows
-- ops rows
-- mongo rows
-- artifacts.merged_rows
+- deterministic fast paths
+- config-driven routing terms
+- regex extraction
+- LLM extraction when needed
+- placeholder cleanup
+- session-aware follow-up handling
 
-This prevents token blowups.
+Clarification is used when required information is missing. Examples:
 
-### 8.3 Narrative answer generation (draft + polish)
-**File**: `app/llm/llm_client.py`
+- `tell me about vessel` asks for vessel name or IMO.
+- `tell me about voyage` asks for voyage number.
+- `tell me about port` asks for port name.
+- Common typo/plural variants such as `tell me about vesssl`, `tell me about vessels`, `tell me about voyages`, and `tell me about voyge` also clarify.
 
-Pipeline:
-1. Draft answer from compact JSON, guided by intent templates and style flags.
-2. “Polish pass”: send {query + JSON + draft} to an editor prompt to rewrite into a question-driven narrative without inventing facts.
-3. Postprocess: normalize bullets, remove repeated headings/duplicate lines.
+Clarification context is saved in Redis so a short follow-up such as `2301` or `3` can resolve the pending slot and continue the original query.
 
 ---
 
-## 9) Data sources and mapping rules
+## 9. Planner And Execution Modes
 
-### 9.1 MongoDB key fields
-- `voyages.voyageId` (string UUID)
-- `voyages.voyageNumber` (string)
-- `voyages.vesselName`
-- `voyages.remarks[]`, `voyages.fixtures[]`, `voyages.legs[]`, etc.
+`Planner.build_plan()` is deterministic.
 
-### 9.2 Postgres key fields
-- `finance_voyage_kpi.voyage_id` (string UUID)
-- `finance_voyage_kpi.voyage_number` (int)
-- `ops_voyage_summary.voyage_id` (string UUID)
-- `ops_voyage_summary.voyage_number` (int)
-- `ops_voyage_summary.ports_json`, `grades_json`, `remarks_json` (JSONB arrays)
+It chooses:
 
-### 9.3 Join rules
-- Preferred join: `Mongo.voyageId` ↔ `Postgres.voyage_id`
-- Voyage number conversion:
-  - Mongo expects `"1901"` (string)
-  - Postgres expects `1901` (int)
+- `single` for direct entity or metadata queries.
+- `composite` for fleet-wide rankings, aggregations, trends, comparisons, and business analytics.
+
+Single examples:
+
+- `voyage.summary`
+- `vessel.summary`
+- `voyage.metadata`
+- `vessel.metadata`
+- `port.details`
+
+Composite examples:
+
+- `ranking.*`
+- `analysis.*`
+- `aggregation.*`
+- `ops.offhire_ranking`
+- business decision queries
+
+Composite execution usually follows:
+
+1. Optional Mongo anchor resolution.
+2. Finance query.
+3. Ops enrichment by `voyage_id`.
+4. Optional Mongo enrichment.
+5. Deterministic merge.
+6. LLM summarization.
 
 ---
 
-## 10) Operational constraints and guardrails
-- Read-only DB access (SELECT/find only)
-- SQL allowlist + forbidden pattern checks
-- Mongo operator allowlist
-- LIMIT enforcement + row caps
-- token compaction before summarization
-- Redis session TTL
+## 10. Agents
+
+### FinanceAgent
+
+Uses PostgreSQL finance data, mainly `finance_voyage_kpi`.
+
+Handles:
+
+- PnL
+- revenue
+- total expense
+- TCE
+- commission
+- voyage/vessel financial rankings
+- scenario comparison
+- high revenue with weak PnL
+- business quality analytics
+
+Execution modes:
+
+- registry SQL from `config/sql_registry.yaml`
+- guarded dynamic SQL through `SQLGenerator` and `sql_guard`
+
+### OpsAgent
+
+Uses PostgreSQL operational data, mainly `ops_voyage_summary`.
+
+Handles:
+
+- ports
+- cargo grades
+- offhire days
+- delay status
+- delay reason
+- operational remarks
+- vessel/voyage ops snapshots
+
+In composite flows, it usually receives `voyage_ids` from finance and fetches matching operational context by `voyage_id`.
+
+### MongoAgent
+
+Uses MongoDB rich documents.
+
+Handles:
+
+- vessel metadata
+- voyage metadata
+- vessel and voyage anchor resolution
+- remarks and fixture/context documents
+- safe LLM-generated Mongo find specs
 
 ---
 
-## 11) Testing
-**File**: `scripts/C.py`
+## 11. Data Identity Strategy
 
-Interactive test harness that:
-- runs `GraphRouter.handle()`
-- prints intent/plan/agent execution
-- validates dynamic SQL usage and dynamic NoSQL usage
-- logs results to `test_validation_log.json`
+The current finance/ops identity strategy is:
+
+> Prefer `voyage_id` for finance/ops joins. Keep `voyage_number` as display/user-facing context.
+
+This avoids incorrectly merging rows when the same voyage number can appear across different vessels or sources.
+
+`source_reconciliation.py` adds another safety layer by comparing identity fields across source sections and producing:
+
+- `status`: aligned, partial, mismatch
+- `severity`: info, warning, blocking
+- `canonical_fields`
+- `caveats`
+- `mismatches`
+
+---
+
+## 12. Guardrails
+
+Dynamic SQL and Mongo querying are allowed, but guarded.
+
+SQL guardrails:
+
+- only SELECT/WITH
+- allowed tables and columns only
+- forbidden DML/destructive patterns blocked
+- LIMIT required
+- bare hardcoded LIMIT blocked
+- dynamic values use placeholders
+- params filtered to SQL usage
+- generated SQL repaired only through safe generic transforms
+
+Mongo guardrails:
+
+- allowed collections only
+- allowed operators only
+- projection required and bounded
+- limit capped
+- read-only find specs
+
+The LLM proposes; guards and adapters execute.
+
+---
+
+## 13. Configuration-Driven Design
+
+The current system is heavily config-driven.
+
+| Config | Drives |
+| --- | --- |
+| `intent_registry.yaml` | intents, needs, slots, SQL hints |
+| `sql_registry.yaml` | named SQL templates |
+| `sql_rules.yaml` | SQL generation and guard policy |
+| `routing_rules.yaml` | routing terms, follow-ups, clarification rules |
+| `prompt_rules.yaml` | answer, polish, SQL, and out-of-scope prompts |
+| `agent_rules.yaml` | agent caps, metrics, fallback SQL |
+| `response_rules.yaml` | compaction limits and labels |
+| `mongo_rules.yaml` | Mongo query behavior |
+| `business_rules.yaml` | derived metrics, reasoning signals, reconciliation, answer contract |
+| `schema.yaml` / `source_map.yaml` | field/source metadata |
+
+Python acts as the generic execution engine. Domain/business policy lives in versioned YAML.
+
+---
+
+## 14. Business Decision Intelligence
+
+The current system includes a business reasoning layer.
+
+`business_rules.yaml` defines:
+
+- derived metrics
+- reasoning signals
+- reconciliation policy
+- answer contract
+
+Derived metrics include:
+
+- `margin = pnl / revenue`
+- `cost_ratio = total_expense / revenue`
+- `commission_ratio = total_commission / revenue`
+
+Reasoning signals include:
+
+- inefficient revenue
+- strong margin
+- loss-making result
+- delay exposure
+- profitable but operationally risky
+- weak business quality
+- attractive cargo margin
+
+`business_reasoning.py` evaluates these rules generically. It supports:
+
+- `all`
+- `any`
+- numeric comparisons
+- boolean checks
+- existence checks
+- field-to-field comparisons
+
+`prompt_rules.yaml` instructs analytical answers to cover:
+
+- what happened
+- why it matters
+- business impact
+- data caveats
+
+---
+
+## 15. Merge, Compaction, And Summarization
+
+`response_merger.compact_payload()` keeps the summarization payload small while preserving decision-critical fields.
+
+Preserved fields include:
+
+- voyage identity
+- vessel identity
+- revenue
+- total expense
+- PnL
+- TCE
+- commission
+- margin
+- cost ratio
+- commission ratio
+- offhire days
+- delay reason
+- key ports
+- cargo grades
+- remarks
+- source reconciliation
+- business reasoning
+
+The LLM receives compact, decision-ready evidence instead of raw database dumps.
+
+---
+
+## 16. Testing And Validation
+
+Validation layers:
+
+- unit tests for loaders, guards, routing, clarification, reasoning, reconciliation, merger
+- full pytest backend suite
+- frontend Vitest suite
+- golden capture/compare suite
+
+Golden suite:
+
+- `scripts/golden_config_suite.json`
+- `scripts/run_golden_config_suite.py`
+
+Important categories:
+
+- `core`
+- `sql_aggregation`
+- `voyage_metadata`
+- `vessel_metadata`
+- `vessel_ranking`
+- `followup`
+- `business_decision`
+
+The `business_decision` category validates the new reasoning-oriented queries.
+
+---
+
+## 17. Deployment
+
+Podman application containerization is documented in `docs/PODMAN_APP_CONTAINERIZATION.md`.
+
+The app layer includes:
+
+- `docker/Containerfile.api`
+- `docker/Containerfile.ui`
+- `docker/podman-compose.app.yaml`
+- `docker/app.podman.env.example`
+
+It connects to existing containers:
+
+- `postgresdb`
+- `mongodb`
+- `redisdb`
+- network `kai-agent_kai-net`
+
+---
+
+## 18. Current Architecture Summary
+
+KAI Agent is now a config-driven, multi-agent, decision-grade maritime analytics system. The frontend sends a natural-language query to FastAPI. `GraphRouter` loads session context, extracts intent/slots, clarifies missing entities, builds a single or composite plan, executes finance/ops/mongo agents through guarded adapters, merges rows by safe identity, enriches with reconciliation and business reasoning, compacts the evidence, and asks the LLM to generate a decision-grade answer with impact and caveats.

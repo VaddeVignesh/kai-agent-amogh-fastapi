@@ -69,7 +69,8 @@ intents:
     sql_hints:
       finance: "\nINTENT-SPECIFIC RULES (finance voyage.summary):\n- Query `finance_voyage_kpi`. Join `ops_voyage_summary`\
         \ only if needed to resolve vessel name.\n- MUST filter scenario: `scenario = COALESCE(%(scenario)s, 'ACTUAL')`.\n\
-        - Filter by voyage_number = %(voyage_number)s.\n- Return voyage-level rows with exact aliases:\n  voyage_id, voyage_number,\
+        - If Mongo has resolved a `voyage_id`, filter by `voyage_id` only. Do not also broaden the query by voyage_number.\n\
+        - Use voyage_number only as fallback when `voyage_id` is not available.\n- Return voyage-level rows with exact aliases:\n  voyage_id, voyage_number,\
         \ revenue, total_expense, pnl, tce, total_commission,\n  voyage_start_date, voyage_end_date.\n- Keep LIMIT %(limit)s.\n"
       ops: ''
   voyage.entity:
@@ -218,7 +219,9 @@ intents:
   ranking.vessel_metadata:
     description: Fleet-wide vessel metadata listing/ranking from MongoDB `vessels` only. Use when the user asks about metadata-style
       vessel attributes across the fleet such as operating status, scrubber, hire rate, pool tags, market type, default ballast/laden
-      speed, or current contract duration. Do NOT answer these using finance aggregates as a proxy.
+      speed, or current contract duration. Do NOT answer these using finance aggregates as a proxy. Do NOT use this intent when
+      the user also asks about profitability, PnL, revenue, offhire, delay risk, operational risk, commercial quality, or business
+      quality; use finance + ops vessel ranking/analysis for those questions.
     route: single
     required_slots: []
     optional_slots:
@@ -379,7 +382,8 @@ intents:
       finance: "\nINTENT-SPECIFIC RULES (finance analysis.cargo_profitability):\n- Join `finance_voyage_kpi` with `ops_voyage_summary`\
         \ and unnest grades_json.\n- MUST filter scenario: `f.scenario = COALESCE(%(scenario)s, 'ACTUAL')`.\n- GROUP BY cargo\
         \ grade with AVG(pnl), AVG(revenue), COUNT(*) as voyage_count.\n- Return exact aliases: cargo_grade, avg_pnl, avg_revenue,\
-        \ voyage_count.\n- ORDER BY avg_pnl DESC NULLS LAST.\n- Keep LIMIT %(limit)s.\n- If the question also asks for common\
+        \ voyage_count.\n- If the question asks for margin or attractiveness, also return `AVG(f.pnl) / NULLIF(AVG(f.revenue),\
+        \ 0) AS margin` and explain caveats from sample size / missing operational detail.\n- ORDER BY avg_pnl DESC NULLS LAST.\n- Keep LIMIT %(limit)s.\n- If the question also asks for common\
         \ ports or congestion/delay remarks for profitable cargo grades:\n  - still GROUP ONLY BY normalized cargo grade,\n\
         \  - add `string_agg(DISTINCT lower(trim(p->>'port_name')), ', ') AS most_common_ports`,\n  - aggregate only congestion/delay-like\
         \ remarks instead of grouping by raw remarks_json,\n  - return one row per cargo grade, never one row per remark payload.\n\
@@ -408,7 +412,7 @@ intents:
 
         INTENT-SPECIFIC RULES (finance analysis.by_module_type):
 
-        - Join `finance_voyage_kpi` f with `ops_voyage_summary` o on voyage_number and normalized vessel_imo.
+        - Join `finance_voyage_kpi` f with `ops_voyage_summary` o on `f.voyage_id = o.voyage_id`.
 
         - MUST filter scenario: `f.scenario = COALESCE(%(scenario)s, ''ACTUAL'')`.
 
@@ -449,7 +453,7 @@ intents:
 
         INTENT-SPECIFIC RULES (finance analysis.segment_performance):
 
-        - Join `finance_voyage_kpi` f with `ops_voyage_summary` o on voyage_number and normalized vessel_imo.
+        - Join `finance_voyage_kpi` f with `ops_voyage_summary` o on `f.voyage_id = o.voyage_id`.
 
         - MUST filter scenario: `f.scenario = COALESCE(%(scenario)s, ''ACTUAL'')`.
 
@@ -485,12 +489,12 @@ intents:
       verify_scenario_variance_columns: true
     sql_hints:
       finance: "\nINTENT-SPECIFIC RULES (analysis.scenario_comparison):\n- Query `finance_voyage_kpi` comparing scenario='ACTUAL'\
-        \ vs scenario='WHEN_FIXED'.\n- MUST filter: `voyage_number = ANY(%(voyage_numbers)s)`.\n- Pre-aggregate each scenario\
-        \ to one row per (voyage_number, vessel_imo_key), then join,\n  then aggregate to FINAL one row per voyage_number.\n\
-        - Avoid many-to-many joins:\n  1) CTE actual: one row per (voyage_number, vessel_imo_key) for ACTUAL\n  2) CTE when_fixed:\
-        \ one row per (voyage_number, vessel_imo_key) for WHEN_FIXED\n  3) JOIN on both keys, then GROUP BY voyage_number\n\
-        - Return exact aliases:\n  voyage_number, pnl_actual, pnl_when_fixed, pnl_variance,\n  tce_actual, tce_when_fixed,\
-        \ tce_variance.\n- ORDER BY voyage_number.\n- Keep LIMIT %(limit)s.\n"
+        \ vs scenario='WHEN_FIXED'.\n- MUST filter: `voyage_number = ANY(%(voyage_numbers)s)`.\n- Return **one row per requested voyage_number**:\
+        \ multiple finance rows (different voyage_id / vessel_imo) for the same voyage_number must be rolled up — SUM pnl/revenue\
+        \ (actual and when-fixed), AVG tce (actual and when-fixed), variance from those rolled totals; `vessel_imo` may list\
+        \ distinct IMOs comma-separated; pick a representative `voyage_id` (e.g. MAX).\n\
+        - Return exact aliases:\n  voyage_id, voyage_number, vessel_imo, pnl_actual, pnl_when_fixed, pnl_variance,\n  tce_actual,\
+        \ tce_when_fixed, tce_variance.\n- ORDER BY voyage_number.\n- Keep LIMIT %(limit)s.\n"
       ops: ''
   analysis.cost_breakdown:
     description: Detailed cost structure and expense breakdown analysis. Can be for a specific voyage/vessel or fleet-wide.
@@ -825,10 +829,12 @@ intents:
         '
       ops: ''
   ranking.vessels:
-    description: "Fleet-wide aggregate ranking of ALL vessels by any metric \u2014 voyage count, total PnL, average TCE, total\
-      \ revenue, most offhire days. No specific vessel name or IMO is known or needed. Use when user asks 'which vessel has\
-      \ the most voyages', 'which vessel earned the highest PnL', 'rank vessels by performance'. Needs GROUP BY vessel + aggregate\
-      \ dynamic SQL. Do NOT use when user names a specific vessel \u2014 use vessel.summary for that."
+    description: "Fleet-wide aggregate ranking of ALL vessels by any finance or operations metric \u2014 voyage count, total\
+      \ PnL, average TCE, total revenue, most offhire days, delay risk, operational risk, profitable-but-risky screening,\
+      \ or business quality. No specific vessel name or IMO is known or needed. Use when user asks 'which vessel has the most\
+      \ voyages', 'which vessel earned the highest PnL', 'which vessels are profitable but operationally risky', 'rank vessels\
+      \ by performance'. Needs GROUP BY vessel + aggregate dynamic SQL. Do NOT use when user names a specific vessel \u2014\
+      \ use vessel.summary for that."
     route: composite
     required_slots: []
     optional_slots:
@@ -846,16 +852,18 @@ intents:
       finance: "\nINTENT-SPECIFIC RULES (finance ranking.vessels):\n- MANDATORY: Keep this vessel-level GROUP BY structure\
         \ and do NOT use a CTE that omits the ops join:\n  SELECT\n    REPLACE(f.vessel_imo::TEXT, '.0', '') AS vessel_imo,\n\
         \    MAX(o.vessel_name)                   AS vessel_name,\n    COUNT(DISTINCT f.voyage_id)          AS voyage_count,\n\
-        \    AVG(f.pnl)                           AS avg_pnl,\n    SUM(f.pnl)                           AS total_pnl\n  FROM\
-        \ finance_voyage_kpi f\n  JOIN ops_voyage_summary o\n    ON REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT,\
-        \ '.0', '')\n  WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')\n  GROUP BY REPLACE(f.vessel_imo::TEXT, '.0', '')\n\
+        \    AVG(f.pnl)                           AS avg_pnl,\n    SUM(f.pnl)                           AS total_pnl,\n    AVG(o.offhire_days)\
+        \                 AS avg_offhire_days,\n    SUM(CASE WHEN o.is_delayed THEN 1 ELSE 0 END) AS delayed_voyage_count\n  FROM\
+        \ finance_voyage_kpi f\n  JOIN ops_voyage_summary o\n    ON f.voyage_id = o.voyage_id\n  WHERE f.scenario = COALESCE(%(scenario)s,\
+        \ 'ACTUAL')\n  GROUP BY REPLACE(f.vessel_imo::TEXT, '.0', '')\n\
         \  ORDER BY <chosen_metric> DESC NULLS LAST, voyage_count DESC\n  LIMIT %(limit)s\n- CRITICAL: vessel_name MUST come\
         \ from MAX(o.vessel_name) \u2014 it does NOT exist in finance_voyage_kpi.\n- NEVER use a CTE that queries finance_voyage_kpi\
         \ alone without joining ops_voyage_summary.\n- Pick aggregates and aliases based on the question:\n  - total profit\
         \ / total pnl / earned most -> SUM(f.pnl) AS total_pnl\n  - average pnl / profitability -> AVG(f.pnl) AS avg_pnl\n\
         \  - total revenue / earnings -> SUM(f.revenue) AS total_revenue\n  - average revenue -> AVG(f.revenue) AS avg_revenue\n\
         \  - total expense / most expensive -> SUM(f.total_expense) AS total_expense\n  - average expense / cost -> AVG(f.total_expense)\
-        \ AS avg_total_expense\n  - TCE -> AVG(f.tce) AS avg_tce\n- Always include voyage_count. Order by the metric implied\
+        \ AS avg_total_expense\n  - TCE -> AVG(f.tce) AS avg_tce\n  - offhire / delay / operational risk -> AVG(o.offhire_days)\
+        \ AS avg_offhire_days and SUM(CASE WHEN o.is_delayed THEN 1 ELSE 0 END) AS delayed_voyage_count\n- Always include voyage_count. Order by the metric implied\
         \ by the question, not always by voyage_count.\n- When ordering by avg/total KPI columns, add `NULLS LAST`.\n"
       ops: "\nINTENT-SPECIFIC RULES (ops ranking.vessels):\n- Query ONLY `ops_voyage_summary`.\n- CRITICAL: Use vessel_imo\
         \ NOT vessel_id. The column vessel_id does NOT exist.\n- Available columns include: voyage_id, voyage_number, vessel_imo,\
@@ -1005,7 +1013,7 @@ intents:
 
         INTENT-SPECIFIC RULES (finance finance.loss_due_to_delay):
 
-        - Join `finance_voyage_kpi` f with `ops_voyage_summary` o on voyage_number and normalized vessel_imo.
+        - Join `finance_voyage_kpi` f with `ops_voyage_summary` o on `f.voyage_id = o.voyage_id`.
 
         - MUST filter scenario: `f.scenario = COALESCE(%(scenario)s, ''ACTUAL'')`.
 
@@ -1076,7 +1084,7 @@ intents:
 
         INTENT-SPECIFIC RULES (finance ops.port_query):
 
-        - Join `ops_voyage_summary` o with `finance_voyage_kpi` f on voyage_number and normalized vessel_imo.
+        - Join `ops_voyage_summary` o with `finance_voyage_kpi` f on `f.voyage_id = o.voyage_id`.
 
         - Filter by port: o.ports_json @> to_jsonb(%(port_name)s::text).
 

@@ -32,13 +32,21 @@ const RequireAuth = ({ role, children }: { role?: "user" | "admin" | "customer";
   if (!auth) return <Navigate to="/login" replace />;
   if (role) {
     const allowedRoles: Record<string, string[]> = {
-      user: ["user", "customer"],
-      customer: ["user", "customer"],
+      // Backend may return customer_ops_only (e.g. customer5) — same UI as customer, narrower data access server-side.
+      user: ["user", "customer", "customer_ops_only"],
+      customer: ["user", "customer", "customer_ops_only"],
       admin: ["admin"],
     };
     const allowed = allowedRoles[role] ?? [role];
     if (!allowed.includes(auth.role)) {
-      return <Navigate to={auth.role === "admin" ? "/admin" : "/assistant"} replace />;
+      // Avoid redirect loops: /assistant rejects role X but fallback was /assistant when role !== admin.
+      if (auth.role === "admin") {
+        return <Navigate to="/admin" replace />;
+      }
+      if (role === "admin") {
+        return <Navigate to="/assistant" replace />;
+      }
+      return <Navigate to="/login" replace />;
     }
   }
   return <>{children}</>;

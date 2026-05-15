@@ -40,6 +40,10 @@ def test_router_fallback_templates_load_from_yaml() -> None:
     assert "{candidate_preview}" in mismatch_template
     assert "different vessel identities" in mismatch_template
 
+    not_found = get_router_fallback_template("voyage_reference_ambiguous_or_not_found")
+    assert "{voyage_ref}" in not_found
+    assert "full identifier" in not_found.lower()
+
     assert "Voyage metadata is available" in get_router_fallback_template("voyage_metadata_formatting_failed")
 
 

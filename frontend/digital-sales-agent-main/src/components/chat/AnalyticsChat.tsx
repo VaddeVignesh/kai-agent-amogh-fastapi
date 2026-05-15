@@ -1,12 +1,12 @@
-import { useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  Send, Bot, User, Copy, ThumbsUp, ThumbsDown, RefreshCw,
+  Send, Bot, User,
   Sparkles, ChevronDown, ChevronRight,
-  TrendingUp, ShoppingCart, Users, Package, Clock, BarChart3,
+  BarChart3, Anchor, Ship, MapPin,
   DollarSign, Activity, Database, Workflow,
-  CheckCircle2, Brain, Route,
+  CheckCircle2, Brain, Route, Maximize2, Minimize2,
 } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 
@@ -53,19 +53,18 @@ export interface Message {
 
 const processingSteps = [
   "Understanding your query…",
-  "Detecting intent & filters…",
-  "Querying orders_db & product_catalog…",
+  "Detecting intent & voyage context…",
+  "Querying voyage & ops data…",
   "Aggregating results…",
   "Generating insights…",
 ];
 
+/** Short one-tap prompts — concrete voyage / vessel / port examples (avoid vague “about ports” asks). */
 const suggestedPrompts = [
-  { icon: TrendingUp, label: "Show top selling products" },
-  { icon: BarChart3, label: "Revenue trend this month" },
-  { icon: Users, label: "Customer purchase behavior" },
-  { icon: Clock, label: "Orders with delays" },
-  { icon: Package, label: "Low stock items" },
-  { icon: ShoppingCart, label: "Compare product performance" },
+  { icon: Route, label: "Voyage 2302 — delays & ports" },
+  { icon: Anchor, label: "Stena Conquest — recent voyages" },
+  { icon: MapPin, label: "Singapore — voyages calling this port" },
+  { icon: Ship, label: "Top 5 voyages by PnL" },
 ];
 
 const newWelcome = (text: string): Message => ({
@@ -225,7 +224,7 @@ interface AnalyticsChatProps {
 
 export default function AnalyticsChat({
   title = "AI Sales Copilot",
-  welcome = "Welcome to the AI Sales Copilot. Ask about orders, revenue, customers, products, or performance — I'll route the question to the right data agent.",
+  welcome = "Welcome to the AI Sales Copilot. Ask about voyages, vessels, ports, delays, cargo, or financial KPIs — I'll route your question to the right data agent.",
   seed,
   showInsightPanel = true,
   showExecutionTrace = false,
@@ -236,6 +235,22 @@ export default function AnalyticsChat({
   const [openTraces, setOpenTraces] = useState<Record<number, boolean>>({});
   const [isProcessing, setIsProcessing] = useState(false);
   const [processingStep, setProcessingStep] = useState(0);
+  /** In-tab fullscreen overlay (entire viewport); Esc exits. Not Element.requestFullscreen. */
+  const [chatMaximized, setChatMaximized] = useState(false);
+
+  useEffect(() => {
+    if (!chatMaximized) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setChatMaximized(false);
+    };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [chatMaximized]);
 
   const getSession = () => {
     if (window.__dsa_session?.session_id) return window.__dsa_session.session_id;
@@ -321,20 +336,40 @@ export default function AnalyticsChat({
 
   const toggleTrace = (id: number) => setOpenTraces((p) => ({ ...p, [id]: !p[id] }));
 
+  /** Full viewport within the browser tab (fixed inset-0); Esc exits. Not OS / requestFullscreen. */
+  const maximizedShell = (node: ReactNode) =>
+    chatMaximized ? (
+      <div className="fixed inset-0 z-[100] flex flex-col bg-background">
+        <div className="flex flex-col flex-1 min-h-0 w-full h-full overflow-hidden">{node}</div>
+      </div>
+    ) : (
+      <div className="w-full">{node}</div>
+    );
+
   const chatPanel = (
     <div
-      className="flex flex-col rounded-xl border border-border bg-gradient-to-b from-card to-card/50 backdrop-blur-md overflow-hidden"
-      style={{ height }}
+      className={`flex flex-col border border-border bg-gradient-to-b from-card to-card/50 backdrop-blur-md overflow-hidden ${chatMaximized ? "flex-1 min-h-0 h-full rounded-none border-0 shadow-none" : "rounded-xl shadow-sm"}`}
+      style={{ height: chatMaximized ? "100%" : height }}
     >
-      <div className="flex items-center gap-2 px-5 py-3 border-b border-border">
-        <Sparkles className="w-4 h-4 text-primary" />
-        <h3 className="text-sm font-semibold text-foreground">{title}</h3>
-        <span className="ml-auto text-xs text-muted-foreground flex items-center gap-1.5">
+      <div className="flex items-center gap-2 px-5 py-3 border-b border-border shrink-0">
+        <Sparkles className="w-4 h-4 text-primary shrink-0" />
+        <h3 className="text-sm font-semibold text-foreground truncate min-w-0 flex-1">{title}</h3>
+        <span className="text-xs text-muted-foreground hidden sm:flex items-center gap-1.5 shrink-0">
           <span className="w-1.5 h-1.5 rounded-full bg-[hsl(var(--success))]" /> 3 agents online
         </span>
+        <button
+          type="button"
+          onClick={() => setChatMaximized((v) => !v)}
+          className="shrink-0 p-1.5 rounded-md border border-border/80 bg-background/60 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+          aria-expanded={chatMaximized}
+          aria-label={chatMaximized ? "Exit fullscreen" : "Fullscreen chat"}
+          title={chatMaximized ? "Exit fullscreen (Esc)" : "Fullscreen chat (this tab)"}
+        >
+          {chatMaximized ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+        </button>
       </div>
 
-      <div className="flex-1 overflow-auto p-6 space-y-6">
+      <div className="flex-1 min-h-0 overflow-auto p-6 space-y-6">
         {messages.map((msg) => (
           <div key={msg.id} className={`flex gap-3 ${msg.role === "user" ? "justify-end" : ""}`}>
             {msg.role === "assistant" && (
@@ -457,14 +492,6 @@ export default function AnalyticsChat({
                 </div>
               )}
 
-              {msg.role === "assistant" && (
-                <div className="flex gap-2 mt-3 pt-3 border-t border-border/50">
-                  <button className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"><Copy className="w-3.5 h-3.5" /></button>
-                  <button className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"><ThumbsUp className="w-3.5 h-3.5" /></button>
-                  <button className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"><ThumbsDown className="w-3.5 h-3.5" /></button>
-                  <button className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"><RefreshCw className="w-3.5 h-3.5" /></button>
-                </div>
-              )}
               <p className="text-xs text-muted-foreground mt-2">{msg.timestamp}</p>
             </div>
             {msg.role === "user" && (
@@ -494,7 +521,7 @@ export default function AnalyticsChat({
         )}
       </div>
 
-      <div className="px-4 pt-3 border-t border-border">
+      <div className="px-4 pt-3 border-t border-border shrink-0">
         <div className="flex flex-wrap gap-2">
           {suggestedPrompts.map((p) => (
             <button
@@ -509,13 +536,13 @@ export default function AnalyticsChat({
         </div>
       </div>
 
-      <div className="p-4">
+      <div className="p-4 shrink-0">
         <div className="relative">
           <textarea
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
-            placeholder="Ask about orders, revenue, customers, products, or performance…"
+            placeholder="Ask about voyages, vessels, ports, delays, cargo, or PnL…"
             className="w-full h-20 bg-background/50 border border-border rounded-lg px-4 py-3 pr-14 text-sm text-foreground placeholder:text-muted-foreground resize-none focus:outline-none focus:ring-2 focus:ring-primary/50 transition-all"
           />
           <button
@@ -582,21 +609,30 @@ export default function AnalyticsChat({
   );
 
   if (!showInsightPanel) {
-    return chatPanel;
+    return maximizedShell(chatPanel);
   }
 
-  return (
-    <Tabs defaultValue="chat" className="w-full">
-      <TabsList>
+  return maximizedShell(
+    <Tabs
+      defaultValue="chat"
+      className={`w-full ${chatMaximized ? "flex flex-col flex-1 min-h-0 h-full" : ""}`}
+    >
+      <TabsList className={chatMaximized ? "shrink-0" : ""}>
         <TabsTrigger value="chat">Chat</TabsTrigger>
         <TabsTrigger value="metrics">Metrics</TabsTrigger>
       </TabsList>
-      <TabsContent value="chat" className="mt-4">
+      <TabsContent
+        value="chat"
+        className={`mt-4 ${chatMaximized ? "flex-1 min-h-0 flex flex-col" : ""}`}
+      >
         {chatPanel}
       </TabsContent>
-      <TabsContent value="metrics" className="mt-4">
+      <TabsContent
+        value="metrics"
+        className={`mt-4 ${chatMaximized ? "flex-1 min-h-0 overflow-auto" : ""}`}
+      >
         {metricsPanel}
       </TabsContent>
-    </Tabs>
+    </Tabs>,
   );
 }

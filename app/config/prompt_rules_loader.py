@@ -45,6 +45,10 @@ def get_llm_ranking_answer_hint() -> str:
     return _get_string("llm_client", "ranking_answer_hint", "")
 
 
+def get_llm_ops_only_voyage_answer_instruction() -> str:
+    return _get_string("llm_client", "ops_only_voyage_answer_instruction", "")
+
+
 def get_out_of_scope_response_template(name: str) -> str:
     return _get_nested_string("llm_client", "out_of_scope_responses", name, "")
 

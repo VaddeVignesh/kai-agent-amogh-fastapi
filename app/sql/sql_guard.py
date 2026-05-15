@@ -152,6 +152,29 @@ def _clean_order_by(sql: str, tables: set) -> str:
     )
 
 
+def extract_referenced_sql_tables(sql: str) -> set[str]:
+    """
+    Best-effort extraction of physical table names from FROM / JOIN (matches validate_and_prepare_sql).
+    Ignores CTE names and jsonb helper pseudo-tables.
+    """
+    fixed = _apply_simple_fixes(sql)
+    lowered = fixed.lower()
+    cte_names = set(re.findall(r"\bwith\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+as\s*\(", lowered))
+    cte_names.update(re.findall(r",\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+as\s*\(", lowered))
+    tables: set[str] = set()
+    for m in re.finditer(r"\bfrom\s+([a-zA-Z0-9_.]+)", lowered):
+        tname = m.group(1)
+        if tname not in cte_names:
+            tables.add(tname)
+    for m in re.finditer(r"\bjoin\s+([a-zA-Z0-9_.]+)", lowered):
+        tname = m.group(1)
+        if tname == "lateral":
+            continue
+        if tname not in cte_names:
+            tables.add(tname)
+    return {t for t in tables if t not in _JSONB_FUNCTIONS}
+
+
 # =========================================================
 # MAIN VALIDATOR
 # =========================================================
@@ -177,26 +200,7 @@ def validate_and_prepare_sql(
         # ---------------------------------------------
         # Extract tables
         # ---------------------------------------------
-
-        # Collect CTE names so we don't treat them as real tables.
-        # This keeps allowlist enforcement on underlying tables while permitting safe WITH queries.
-        cte_names = set(re.findall(r"\bwith\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+as\s*\(", lowered))
-        cte_names.update(re.findall(r",\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+as\s*\(", lowered))
-
-        tables = set()
-
-        for m in re.finditer(r"\bfrom\s+([a-zA-Z0-9_.]+)", lowered):
-            tname = m.group(1)
-            if tname not in cte_names:
-                tables.add(tname)
-
-        for m in re.finditer(r"\bjoin\s+([a-zA-Z0-9_.]+)", lowered):
-            tname = m.group(1)
-            # Ignore join keywords like "lateral" (e.g., CROSS JOIN LATERAL ...)
-            if tname == "lateral":
-                continue
-            if tname not in cte_names:
-                tables.add(tname)
+        tables = extract_referenced_sql_tables(sql)
 
         for t in tables:
             if t in _JSONB_FUNCTIONS:

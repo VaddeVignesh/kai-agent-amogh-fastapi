@@ -106,12 +106,11 @@ finance:
         {question}
 
         IMPORTANT FIX (scenario comparison):
-        Use TWO CTEs aggregated to one row per (voyage_number, normalized vessel_imo)
-        for ACTUAL and WHEN_FIXED, then join on BOTH and aggregate to one row per voyage_number.
+        Use one row per voyage_number: SUM pnl (and revenue) across rows sharing that voyage_number, AVG tce,
+        vessel_imo as distinct IMOs joined; representative voyage_id (e.g. MAX).
         Filter voyage_number = ANY(%(voyage_numbers)s).
-        Return exactly: voyage_number, pnl_actual, pnl_when_fixed, pnl_variance,
+        Return exactly: voyage_id, voyage_number, vessel_imo, pnl_actual, pnl_when_fixed, pnl_variance,
         tce_actual, tce_when_fixed, tce_variance.
-        Use SUM for pnl fields and AVG for tce fields.
     segment_performance_fallback_sql:
       with_voyage_numbers: |
         SELECT
@@ -133,8 +132,7 @@ finance:
           o.remarks_json
         FROM finance_voyage_kpi f
         LEFT JOIN ops_voyage_summary o
-          ON f.voyage_number = o.voyage_number
-          AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+          ON f.voyage_id = o.voyage_id
         WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
           AND f.voyage_number = ANY(%(voyage_numbers)s)
         ORDER BY f.voyage_end_date DESC
@@ -159,8 +157,7 @@ finance:
           o.remarks_json
         FROM finance_voyage_kpi f
         LEFT JOIN ops_voyage_summary o
-          ON f.voyage_number = o.voyage_number
-          AND REPLACE(f.vessel_imo::TEXT, '.0', '') = REPLACE(o.vessel_imo::TEXT, '.0', '')
+          ON f.voyage_id = o.voyage_id
         WHERE f.scenario = COALESCE(%(scenario)s, 'ACTUAL')
           AND f.pnl < 0
         ORDER BY f.pnl ASC

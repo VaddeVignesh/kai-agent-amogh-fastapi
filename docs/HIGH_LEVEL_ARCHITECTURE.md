@@ -1,361 +1,399 @@
 # KAI Agent High-Level Architecture
 
-## Purpose
-`kai-agent-amogh-fastapi` is a maritime analytics assistant that answers natural-language questions about:
-- voyages
-- vessels
-- ports
-- cargo grades
-- PnL, revenue, expense, and TCE
-- delays, offhire, and scenario comparisons
-- voyage and vessel metadata
+This HLD describes the current production-oriented architecture after the frontend, RBAC/admin, config-driven refactor, source reconciliation, business reasoning, and golden validation upgrades.
 
-The runtime stack combines:
-- `PostgreSQL` for structured finance and ops analytics
-- `MongoDB` for rich voyage and vessel documents
-- `Redis` for session memory and follow-up continuity
-- `LLM + deterministic orchestration` for intent extraction, guarded dynamic SQL generation, and final answer drafting
+### Functional overview (for decks)
 
-The current system is intentionally hybrid:
-- deterministic routing and validation where correctness matters
-- registry-driven planning and SQL behavior
-- guarded dynamic SQL for fleet-wide analytical questions
-- deterministic merge before final narration
-- explicit session/result-set persistence for follow-ups
+Non-technical system map aligned with this document (people → experience → secure entry → orchestration → planning → evidence → merge → answer, plus guardrails): [`demo-assets/hld-system-map-functional.png`](./demo-assets/hld-system-map-functional.png).
 
-## What Changed In The Updated Architecture
-Compared with the earlier version, the implemented flow now explicitly includes:
-- turn classification before planning
-- clarification follow-up handling through Redis state
-- result-set follow-up fast paths such as top/bottom/filter/project actions
-- registry-driven `single` vs `composite` planning
-- zero-row escalation from misclassified `single` queries into `composite`
-- dedicated metadata paths for:
-  - `vessel.metadata`
-  - `voyage.metadata`
-  - `ranking.vessel_metadata`
-- deterministic post-answer guards for ranking and cargo-profitability outputs
+---
 
-## Runtime Layers
-The runtime is best viewed as five layers:
+## 1. Purpose
 
-1. `Presentation layer`
-   Streamlit captures user input and renders answers, trace, and SQL.
+KAI Agent is a maritime decision-support assistant. It converts natural-language questions into governed analytics over finance, operations, and document data.
 
-2. `API layer`
-   FastAPI exposes `/query` and `/session/clear`.
+It supports:
 
-3. `Orchestration layer`
-   `GraphRouter` manages session loading, turn classification, intent extraction, validation, clarification, planning, execution, merge, summarization, and persistence.
+- voyage and vessel summaries
+- port and cargo analysis
+- PnL, revenue, expense, TCE, commission analysis
+- delays and offhire analysis
+- scenario comparison
+- metadata lookups
+- business decision questions such as weak revenue conversion, operational risk, and cargo attractiveness
 
-4. `Agent + data access layer`
-   `FinanceAgent`, `OpsAgent`, and `MongoAgent` query Postgres and Mongo through adapters.
+---
 
-5. `Storage + memory layer`
-   Postgres, MongoDB, and Redis store analytics data, rich documents, and session memory.
+## 2. High-Level Goals
 
-## High-Level Component View
+The system is designed to:
+
+- answer questions using real data from Postgres and MongoDB
+- preserve follow-up context through Redis
+- avoid unsafe LLM database access
+- support flexible analytics through guarded dynamic SQL/Mongo specs
+- keep business/domain logic config-driven
+- produce decision-grade responses with reasoning, business impact, and caveats
+- expose traceability for demo, debugging, and audit
+
+---
+
+## 3. System Context
+
+```mermaid
+flowchart LR
+    User[Business User / Admin] --> Browser[React Browser UI]
+    User --> Streamlit[Optional Streamlit Debug UI]
+
+    Browser --> API[FastAPI Backend]
+    Streamlit --> API
+
+    API --> Auth[Auth + RBAC]
+    API --> Router[GraphRouter]
+    API --> Admin[Admin Metrics / Audit / Health]
+
+    Router --> Postgres[(PostgreSQL)]
+    Router --> Mongo[(MongoDB)]
+    Router --> Redis[(Redis)]
+    Router --> Groq[Groq LLM API]
+```
+
+---
+
+## 4. Runtime Layers
+
+| Layer | Responsibility | Main files |
+| --- | --- | --- |
+| Presentation | Chat UI, login, admin dashboard, trace rendering | `frontend/digital-sales-agent-main`, `app/UI/UX/streamlit_app.py` |
+| API | Request models, CORS, auth, admin, query endpoint, background side effects | `app/main.py`, `app/auth.py` |
+| Orchestration | Session-aware state machine, intent, slots, validation, plan, execution, merge, summarize | `app/orchestration/graph_router.py`, `planner.py` |
+| Agents | Domain-specific data retrieval | `finance_agent.py`, `ops_agent.py`, `mongo_agent.py` |
+| Data access | Safe database boundaries | `postgres_adapter.py`, `mongo_adapter.py`, `redis_store.py` |
+| Guardrails | SQL/Mongo validation and allowlists | `sql_guard.py`, `sql_allowlist.py`, `mongo_guard.py` |
+| Configuration | Domain/routing/prompt/business policy | `config/*.yaml`, `app/config/*_loader.py` |
+| Intelligence | Reconciliation, derived metrics, reasoning signals, answer contract | `source_reconciliation.py`, `business_reasoning.py`, `response_merger.py` |
+| Validation | Unit/regression/golden tests | `tests/`, `scripts/run_golden_config_suite.py` |
+
+---
+
+## 5. Main Component Diagram
+
 ```mermaid
 flowchart TD
-    U[User] --> UI[Streamlit UI]
-    UI --> API[FastAPI /query]
+    UI[React Chat + Admin UI] --> API[FastAPI]
+    API --> QR[/POST /query/]
+    API --> Login[/Login + RBAC/]
+    API --> Admin[/Admin APIs/]
 
-    API --> GR[GraphRouter]
+    QR --> GR[GraphRouter]
+    GR --> Session[Redis Session Context]
+    GR --> Intent[Intent + Slot Extraction]
+    GR --> Validate[Slot Validation / Clarification]
+    GR --> Plan[Planner]
 
-    GR --> RS[RedisStore]
-    GR --> PL[Planner]
-    GR --> LLM[LLMClient]
-    GR --> FA[FinanceAgent]
-    GR --> OA[OpsAgent]
-    GR --> MA[MongoAgent]
+    Plan --> Single[Single Plan]
+    Plan --> Composite[Composite Plan]
 
-    FA --> PG[(PostgreSQL)]
-    OA --> PG
-    MA --> MG[(MongoDB)]
-    RS --> RD[(Redis)]
+    Single --> Finance[FinanceAgent]
+    Single --> Ops[OpsAgent]
+    Single --> Mongo[MongoAgent]
 
-    GR --> MERGE[Deterministic Merge + Payload Compaction]
-    MERGE --> LLM
-    LLM --> API
-    API --> UI
-    UI --> U
+    Composite --> Finance
+    Composite --> Ops
+    Composite --> Mongo
+
+    Finance --> PG[(Postgres Finance/Ops Tables)]
+    Ops --> PG
+    Mongo --> MG[(Mongo Voyage/Vessel Docs)]
+    Session --> RD[(Redis)]
+
+    Finance --> Merge[Deterministic Merge]
+    Ops --> Merge
+    Mongo --> Merge
+
+    Merge --> Recon[Source Reconciliation]
+    Recon --> Reason[Business Reasoning]
+    Reason --> Compact[Payload Compaction]
+    Compact --> LLM[LLM Summarization]
+    LLM --> QR
 ```
 
-## Proper End-to-End Flow
-```mermaid
-sequenceDiagram
-    participant User
-    participant UI as Streamlit
-    participant API as FastAPI
-    participant Router as GraphRouter
-    participant Redis as RedisStore
-    participant Planner as Planner
-    participant LLM as LLMClient
-    participant Finance as FinanceAgent
-    participant Ops as OpsAgent
-    participant Mongo as MongoAgent
+---
 
-    User->>UI: Ask question
-    UI->>API: POST /query
-    API->>Router: handle(session_id, user_input)
+## 6. User-Facing Flows
 
-    Router->>Redis: load_session()
-    Router->>Router: classify turn type
-    Router->>LLM: extract intent + slots
-    Router->>Router: apply deterministic overrides and slot cleanup
-    Router->>Router: validate required slots
+### 6.1 Normal Analytical Query
 
-    alt clarification needed
-        Router->>Redis: save pending clarification context
-        Router-->>API: clarification
-        API-->>UI: clarification response
-    else execution continues
-        Router->>Planner: build_plan(intent, slots, session_ctx)
+1. User asks a question in React chat.
+2. Frontend posts to `POST /query`.
+3. FastAPI checks session/request information.
+4. `GraphRouter` loads Redis session.
+5. Router extracts intent and slots.
+6. Router validates required slots.
+7. Planner chooses `single` or `composite`.
+8. Agents retrieve data.
+9. Router merges and enriches results.
+10. LLM generates final answer.
+11. Frontend renders answer and trace.
 
-        alt single plan
-            Router->>Finance: registry SQL or direct single-path finance
-            Router->>Ops: registry SQL or direct single-path ops
-            Router->>Mongo: direct metadata or context fetch if needed
-        else composite plan
-            Router->>Mongo: optional resolveAnchor
-            Router->>Finance: dynamic SQL
-            Router->>Ops: dynamic SQL or canonical ops fetch
-            Router->>Mongo: optional remarks/context enrichment
-        end
+### 6.2 Clarification Flow
 
-        Router->>Router: deterministic merge of finance + ops + mongo
-        Router->>Router: compact + sanitize payload
-        Router->>LLM: summarize_answer()
-        Router->>Redis: save session and result-set memory
-        Router-->>API: answer + trace + intent + slots
-        API-->>UI: JSON response
-        UI-->>User: answer + execution trace
-    end
-```
+Example:
 
-## Request Modes
-### Single Mode
-Best for:
-- one voyage
-- one vessel
-- one named port
-- one metadata request
-- one clarification-resolved entity question
+`tell me about vesssl`
 
-Typical examples:
-- `voyage.summary`
-- `vessel.summary`
-- `voyage.metadata`
-- `vessel.metadata`
+Flow:
 
-Characteristics:
-- fewer steps
-- prefers registry SQL and direct Mongo fetches
-- lower latency
-- lower prompt complexity
+1. Router recognizes incomplete vessel request from config-driven variants.
+2. Required vessel identifier is missing.
+3. Router returns clarification and suggestions.
+4. Redis stores pending clarification context.
+5. User replies with a vessel name or number from suggestions.
+6. Router resumes the original query with the resolved slot.
 
-### Composite Mode
-Best for:
-- fleet-wide rankings
-- aggregate analytics
-- trends
-- scenario comparisons
-- delayed/offhire analysis
-- cross-source finance + ops synthesis
+### 6.3 Follow-Up Flow
 
-Typical examples:
-- `ranking.*`
-- `analysis.*`
-- `aggregation.*`
-- `ops.offhire_ranking`
+Example:
 
-Characteristics:
-- step-based execution plan
-- finance dynamic SQL first
-- ops enrichment second
-- optional Mongo enrichment
-- deterministic merge before final answer generation
+1. User: "Which voyages have high revenue but weak business quality?"
+2. Assistant returns a list.
+3. User: "Which one has highest cost ratio?"
 
-## Main Runtime Components
-### Streamlit UI
-Responsibilities:
-- keep a stable `session_id`
-- send user question to FastAPI
-- render answer, clarification, trace, and SQL
-- clear backend session state when required
+Redis stores previous result-set context so the router can interpret the follow-up against the previous answer instead of treating it as a brand-new fleet query.
 
-### FastAPI
-Responsibilities:
-- initialize dependencies
-- expose `POST /query`
-- expose `POST /session/clear`
-- translate request and response models
+---
 
-### GraphRouter
-Responsibilities:
-- load session context
-- classify clarification/follow-up/new-question turns
-- extract intent and slots
-- validate required slots
-- generate clarification messages
-- build execution plan
-- run `single` or `composite`
-- escalate zero-row `single` queries into `composite` when needed
-- deterministically merge results
-- compact payload for summarization
-- persist session and result-set memory
-- emit execution trace
+## 7. Data Architecture
 
-### Planner
-Responsibilities:
-- decide `single` vs `composite`
-- build ordered execution steps
-- keep entity-anchored questions on `single`
-- route registry-declared analytical intents to `composite`
-- support forced composite escalation after zero-row single failures
-
-### FinanceAgent
-Responsibilities:
-- execute finance registry SQL
-- generate, repair, and validate finance dynamic SQL
-- enforce finance-specific guardrails
-- extract voyage ids for downstream composite steps
-
-### OpsAgent
-Responsibilities:
-- execute ops registry SQL
-- fetch canonical ops summaries by voyage id
-- run guarded ops dynamic SQL
-- enrich rankings with ports, grades, offhire, delays, and remarks fields
-
-### MongoAgent
-Responsibilities:
-- resolve vessel and voyage anchors
-- fetch vessel metadata and voyage metadata
-- fetch rich nested voyage context
-- support safe dynamic Mongo find for allowed use cases
-
-## Data Stores And Their Roles
 ### PostgreSQL
-Primary structured analytical source.
+
+Primary structured analytics source.
 
 Key tables:
+
 - `finance_voyage_kpi`
 - `ops_voyage_summary`
 
 Used for:
-- PnL, revenue, total expense, TCE, commission
-- voyage counts, rankings, averages, trends
-- delays, offhire, ports, grades, and ops summaries
+
+- financial KPIs
+- voyage/vessel rankings
+- aggregate analytics
+- ops enrichment
+- delay/offhire context
+- cargo/port summaries
+
+Important identity rule:
+
+> Finance and ops joins should prefer `voyage_id`. `voyage_number` is kept for display and user reference.
 
 ### MongoDB
-Primary document and metadata source.
+
+Primary rich document and metadata source.
 
 Used for:
-- vessel metadata
+
 - voyage documents
-- fixture and leg details
-- route context
-- nested remarks and projected fields
+- vessel metadata
+- remarks
+- fixtures
+- route/leg details
+- vessel contract/consumption information
 
 ### Redis
-Primary short-term conversation memory.
+
+State and observability source.
 
 Used for:
+
+- session memory
+- pending clarification
+- result-set follow-up context
+- idempotency
+- locks
+- query metrics
+- audit log
+- execution history
+
+---
+
+## 8. Config-Driven Design
+
+The current architecture is intentionally config-driven.
+
+| Policy area | Config file |
+| --- | --- |
+| intents and slots | `intent_registry.yaml` |
+| named SQL | `sql_registry.yaml` |
+| SQL generation/guardrails | `sql_rules.yaml` |
+| routing and follow-ups | `routing_rules.yaml` |
+| prompts and answer contract | `prompt_rules.yaml` |
+| agent behavior | `agent_rules.yaml` |
+| response compaction | `response_rules.yaml` |
+| Mongo constraints | `mongo_rules.yaml` |
+| business metrics/reasoning/reconciliation | `business_rules.yaml` |
+
+Python code remains generic:
+
+- load config
+- execute rules
+- validate queries
+- run agents
+- merge data
+- enrich rows
+- summarize answers
+
+---
+
+## 9. Decision Intelligence
+
+The current system adds a reasoning layer between retrieval and final response.
+
+### Derived Metrics
+
+Examples:
+
+- `margin`
+- `cost_ratio`
+- `commission_ratio`
+
+### Business Signals
+
+Examples:
+
+- inefficient revenue
+- loss-making result
+- delay exposure
+- weak business quality
+- profitable but operationally risky
+- attractive cargo margin
+
+### Source Reconciliation
+
+The system compares identity fields across finance, ops, and Mongo.
+
+It emits:
+
+- alignment status
+- severity
+- canonical fields
+- caveats
+- mismatches
+
+### Answer Contract
+
+Analytical answers should explain:
+
+- what happened
+- why it matters
+- business impact
+- data caveats
+
+---
+
+## 10. Security And Safety Boundaries
+
+Important safety rules:
+
+- The LLM never directly queries databases.
+- SQL must pass `sql_guard`.
+- Mongo specs must pass `mongo_guard`.
+- Only read operations are allowed.
+- Query limits are enforced.
+- Dynamic values should use params, not hardcoded strings.
+- RBAC protects admin APIs.
+- Request/session ids support traceability and idempotency.
+
+---
+
+## 11. Observability
+
+Every query response can include trace data:
+
+- intent extraction source
+- intent key
 - slots
-- last intent
-- last user input
-- clarification state
-- result-set follow-up memory
-- selected-row context for follow-ups
+- plan type
+- agents used
+- SQL generated
+- row counts
+- phases
+- token usage estimates
+- merge summaries
+- dynamic SQL flags
 
-## Architecture Decisions
-### 1. Registry-first intent contract
-`INTENT_REGISTRY` is the semantic contract for supported behavior.
+The React UI renders this for admin diagnostics and demo transparency.
 
-It defines:
-- intent meaning
-- `single` or `composite`
-- required and optional slots
-- source dependencies
-- SQL hints and guardrails
+---
 
-### 2. Deterministic planning before execution
-Planning is not another free-form LLM step.
-The planner converts extracted intent and slots into:
-- `single`
-- `composite`
-- ordered execution steps
+## 12. Deployment View
 
-### 3. Guarded dynamic SQL, not unconstrained SQL generation
-Dynamic SQL is allowed only inside a guarded path:
-- schema-aware prompt generation
-- allowlist checks
-- SQL guard validation
-- agent-level repair loops and intent-specific safeguards
+Podman app-layer deployment:
 
-### 4. Deterministic merge before final narration
-The LLM does not invent joins across data sources.
-The router assembles normalized merged rows first, then the final answer explains those rows.
+```mermaid
+flowchart LR
+    Host[Host Machine] --> APIContainer[kai-agent-api]
+    Host --> UIContainer[kai-agent-ui]
 
-### 5. Session memory is explicit and selective
-Redis stores:
-- slot memory
-- result-set memory
-- clarification state
-- recent focus entity
+    APIContainer --> PG[postgresdb]
+    APIContainer --> MG[mongodb]
+    APIContainer --> RD[redisdb]
+    UIContainer --> APIContainer
 
-High-risk entity anchors are cleared when the turn family changes, reducing context bleed.
+    subgraph Network[kai-agent_kai-net]
+        APIContainer
+        UIContainer
+        PG
+        MG
+        RD
+    end
+```
 
-## Output Strategy
-Final answers are generated from a compact merged payload.
+Docs:
 
-The summarizer is guided by:
-- strict answer-structure rules
-- intent-specific answer archetypes
-- markdown/table hygiene rules
-- deterministic answer guards for known weak LLM patterns
+- `docs/PODMAN_APP_CONTAINERIZATION.md`
 
-Current deterministic answer guards include:
-- ranking voyage answer repair
-- ranking vessel answer repair
-- cargo profitability answer repair
+Container files:
 
-## Non-Functional Characteristics
-### Strengths
-- clear split between orchestration and data access
-- support for both entity questions and fleet analytics
-- auditable trace with SQL and step metadata
-- explicit clarification and follow-up handling
-- safer dynamic SQL through layered validation
+- `docker/Containerfile.api`
+- `docker/Containerfile.ui`
+- `docker/podman-compose.app.yaml`
+- `docker/app.podman.env.example`
 
-### Trade-offs
-- orchestration logic is concentrated in `GraphRouter`
-- dynamic SQL quality still depends on prompt quality plus guardrails
-- multiple safety layers increase maintenance cost
-- some behavior is intentionally heuristic for robustness
+---
 
-## Recommended Reading Order
-1. `app/main.py`
-2. `app/orchestration/graph_router.py`
-3. `app/orchestration/planner.py`
-4. `app/registries/intent_registry.py`
-5. `app/agents/finance_agent.py`
-6. `app/agents/ops_agent.py`
-7. `app/agents/mongo_agent.py`
-8. `app/sql/sql_generator.py`
-9. `app/sql/sql_guard.py`
-10. `app/services/response_merger.py`
-11. `app/llm/llm_client.py`
+## 13. Validation View
 
-## Summary
-The updated architecture is a staged analytics pipeline:
-- session-aware routing
-- intent and slot extraction
-- clarification handling
-- deterministic plan generation
-- guarded single/composite execution
-- deterministic merge
-- constrained final narration
+Validation layers:
 
-It is designed to answer both narrow entity questions and broad analytical prompts while remaining debuggable, traceable, and resilient under multi-turn usage.
+1. Unit tests for loaders, guards, routing, agents, reasoning, reconciliation, merger.
+2. Backend regression tests with pytest.
+3. Frontend tests with Vitest.
+4. Golden query capture/compare using `scripts/run_golden_config_suite.py`.
+5. Business decision golden category for reasoning-oriented answers.
+
+Recent backend validation after the business upgrade:
+
+```text
+106 passed, 1 warning
+```
+
+---
+
+## 14. High-Level Summary
+
+KAI Agent now has a layered architecture:
+
+- React UI for chat/admin/demo.
+- FastAPI API for query/auth/admin.
+- GraphRouter for orchestration.
+- Planner for single/composite execution.
+- Agents for finance, ops, and Mongo.
+- Guarded adapters for safe DB access.
+- YAML configuration for domain behavior.
+- Reconciliation and business reasoning for decision-grade answers.
+- Golden tests for regression and answer quality.
+
+In one sentence:
+
+> KAI Agent turns natural-language maritime business questions into safe multi-source analytics and produces explainable decision-grade answers with traceability.

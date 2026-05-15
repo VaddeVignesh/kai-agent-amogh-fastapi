@@ -617,6 +617,10 @@ def get_llm_metadata_fleet_wide_markers() -> list[str]:
     return _get_string_list("llm_metadata_fleet_wide_markers")
 
 
+def get_llm_metadata_override_blocking_metric_terms() -> list[str]:
+    return _get_string_list("llm_metadata_override_blocking_metric_terms")
+
+
 def get_llm_generic_agg_terms() -> list[str]:
     return _get_string_list("llm_generic_agg_terms")
 

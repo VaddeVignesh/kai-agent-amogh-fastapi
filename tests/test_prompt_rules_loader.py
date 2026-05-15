@@ -8,6 +8,7 @@ from app.config.prompt_rules_loader import (
     get_llm_answer_generation_system_prompt,
     get_llm_conversation_memory_label,
     get_llm_intent_classifier_system_prompt_template,
+    get_llm_ops_only_voyage_answer_instruction,
     get_llm_ranking_answer_hint,
     get_mongo_query_builder_system_prompt,
     get_out_of_scope_response_template,
@@ -48,6 +49,9 @@ def test_sql_generator_prompts_load_from_yaml() -> None:
 
 def test_llm_response_prompts_load_from_yaml() -> None:
     assert "merged_rows has numeric fields" in get_llm_ranking_answer_hint()
+    ops_only = get_llm_ops_only_voyage_answer_instruction()
+    assert "HARD CONSTRAINT" in ops_only
+    assert "fixtures" in ops_only.lower()
     assert "Digital Sales Agent" in get_out_of_scope_response_template("greeting")
     assert "About Digital Sales Agent" in get_out_of_scope_response_template("identity")
     assert "weather/forecast" in get_out_of_scope_response_template("weather")
@@ -56,6 +60,7 @@ def test_llm_response_prompts_load_from_yaml() -> None:
     polish_prompt = get_answer_polish_system_prompt()
     assert "senior maritime analyst" in polish_prompt
     assert "Use ONLY the provided JSON" in polish_prompt
+    assert "DECISION-GRADE RULE" in polish_prompt
 
     assert get_answer_generation_fallback("no_recent_context") == "No recent conversational context."
     assert get_answer_generation_fallback("empty_answer") == "Not available in dataset."
@@ -69,6 +74,13 @@ def test_llm_response_prompts_load_from_yaml() -> None:
     answer_prompt = get_llm_answer_generation_system_prompt()
     assert "flagship-quality maritime analytics assistant" in answer_prompt
     assert "VERDICT FIRST RULE" in answer_prompt
+    assert "DECISION-GRADE CONTRACT" in answer_prompt
+    assert "business_answer_contract" in answer_prompt
+    assert "include Margin" in answer_prompt
+    assert "include Cost ratio" in answer_prompt
+    assert "Margin column" in answer_prompt
+    assert "explicitly name PnL" in answer_prompt
+    assert "Data caveat" in answer_prompt
     assert get_llm_conversation_memory_label("hot_context_empty") == "HOT CONTEXT: none"
 
 

@@ -15,6 +15,8 @@ from app.config.response_rules_loader import (
     get_null_equivalent_grade_values,
     get_unknown_vessel_label,
 )
+from app.services.business_reasoning import enrich_row_with_business_reasoning
+from app.services.source_reconciliation import reconcile_merged_row
 
 
 def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
@@ -120,6 +122,8 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
         total_expense = _k("total_expense", "Total_expense", "total expense")
         tce = _k("tce", "TCE")
         total_commission = _k("total_commission", "Total_commission", "total commission")
+        offhire_days = _k("offhire_days")
+        delay_reason = r.get("delay_reason") or fin.get("delay_reason")
         total_pnl = _k("total_pnl")
         avg_tce = _k("avg_tce")
         avg_total_expense = _k("avg_total_expense")
@@ -141,6 +145,8 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
             "total_expense": total_expense,
             "tce": tce,
             "total_commission": total_commission,
+            "offhire_days": offhire_days,
+            "delay_reason": delay_reason,
             "total_pnl": total_pnl,
             "avg_tce": avg_tce,
             "avg_total_expense": avg_total_expense,
@@ -187,7 +193,10 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
                     else f"{imo_prefix}{_vimo}" if _vimo
                     else unknown_vessel_label
                 )
-        return out_row
+        reconciled_source_row = reconcile_merged_row(r)
+        if isinstance(reconciled_source_row.get("source_reconciliation"), dict):
+            out_row["source_reconciliation"] = reconciled_source_row.get("source_reconciliation")
+        return enrich_row_with_business_reasoning(out_row)
 
     fin = merged.get("finance")
     if isinstance(fin, dict):
@@ -223,6 +232,14 @@ def compact_payload(merged: Dict[str, Any]) -> Dict[str, Any]:
         # Optional: lightweight coverage hints help the summarizer avoid false "Not available" claims.
         if isinstance(artifacts.get("coverage"), dict):
             compact_artifacts["coverage"] = artifacts.get("coverage") or {}
+        if isinstance(artifacts.get("source_reconciliation"), dict):
+            compact_artifacts["source_reconciliation"] = artifacts.get("source_reconciliation") or {}
+        if artifacts.get("intent_key") is not None:
+            compact_artifacts["intent_key"] = artifacts.get("intent_key")
+        if isinstance(artifacts.get("slots"), dict):
+            compact_artifacts["slots"] = artifacts.get("slots")
+        if artifacts.get("finance_kpi_unavailable") is True:
+            compact_artifacts["finance_kpi_unavailable"] = True
         if compact_artifacts:
             out["artifacts"] = compact_artifacts
 

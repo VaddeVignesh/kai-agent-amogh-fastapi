@@ -19,6 +19,45 @@ class _MemRedis:
         self._store[session_id] = cur
 
 
+def _router_for_clarification_tests() -> GraphRouter:
+    llm = SimpleNamespace(
+        extract_intent_slots=lambda **kwargs: {"intent_key": "out_of_scope", "slots": {}},
+        summarize_answer=lambda **kwargs: "dummy",
+    )
+    dummy_agent = SimpleNamespace(
+        pg=None,
+        run=lambda **kwargs: {"mode": "error", "rows": []},
+        fetch_full_voyage_context=lambda **kwargs: {},
+        run_llm_find=lambda **kwargs: {"mode": "mongo_llm", "ok": False, "rows": []},
+    )
+    return GraphRouter(
+        llm=llm,
+        redis_store=_MemRedis(),
+        mongo_agent=dummy_agent,
+        finance_agent=dummy_agent,
+        ops_agent=dummy_agent,
+    )
+
+
+def test_incomplete_vessel_and_voyage_variants_trigger_clarification() -> None:
+    router = _router_for_clarification_tests()
+
+    cases = [
+        ("tell me about vessel", "vessel.summary", "vessel"),
+        ("tell me about vesssl", "vessel.summary", "vessel"),
+        ("tell me about vessels", "vessel.summary", "vessel"),
+        ("tell me about voyage", "voyage.summary", "voyage"),
+        ("tell me about voyages", "voyage.summary", "voyage"),
+        ("tell me about voyge", "voyage.summary", "voyage"),
+    ]
+
+    for query, expected_intent, expected_word in cases:
+        out = router.handle(session_id=f"s-{query.replace(' ', '-')}", user_input=query)
+        assert out.get("intent_key") == expected_intent
+        assert out.get("clarification"), f"Expected clarification for {query!r}"
+        assert expected_word in str(out.get("clarification")).lower()
+
+
 def test_clarification_numeric_choice_fills_port_name() -> None:
     """
     "what is port" should trigger a clarification and store suggestions.
