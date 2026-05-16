@@ -421,10 +421,11 @@ class FinanceAgent:
                 raise ValueError(get_finance_validation_message("voyage_summary_requires_reference"))
 
             return "kpi.voyage_by_reference", {
-                "voyage_number": str(int(voyage_number)) if voyage_number is not None else None,
+                "voyage_number": str(int(voyage_number)) if voyage_number is not None and not voyage_id else None,
                 "voyage_id": str(voyage_id) if voyage_id is not None else None,
                 "vessel_imo": str(vessel_imo) if vessel_imo is not None else None,
                 "scenario": scenario,
+                "limit": 1,
             }
 
         # ------------------------------------------------------

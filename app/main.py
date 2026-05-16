@@ -15,6 +15,7 @@ os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT", "kai-agent-poc"
 
 from app.auth import USERS, ROLE_ACCESS, get_role_access, login, generate_session_id
 from app.core.logger import get_logger
+from app.core.request_context import bind_request_session
 
 # =========================================================
 # IMPORTS
@@ -309,10 +310,11 @@ def query_agent(req: QueryRequest, background_tasks: BackgroundTasks = None):
             return QueryResponse(**cached)
 
     start_time = time.time()
-    result = router.handle(
-        session_id=session_id,
-        user_input=req.query
-    )
+    with bind_request_session(session_id):
+        result = router.handle(
+            session_id=session_id,
+            user_input=req.query,
+        )
     elapsed = time.time() - start_time
 
     response = QueryResponse(

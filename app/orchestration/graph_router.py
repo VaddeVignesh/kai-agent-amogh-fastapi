@@ -4909,15 +4909,25 @@ class GraphRouter:
                 canonical_vid = mongo_data.get("voyage_id")
                 canonical_imo = mongo_data.get("vessel_imo")
                 canonical_vname = mongo_data.get("vessel_name")
-                if canonical_vid and not slots.get("voyage_id"):
+                if canonical_vid:
                     slots["voyage_id"] = str(canonical_vid)
-                if canonical_imo and not slots.get("imo"):
+                if canonical_imo:
                     slots["imo"] = str(canonical_imo)
-                if canonical_vname and not slots.get("vessel_name"):
+                    slots["vessel_imo"] = str(canonical_imo)
+                if canonical_vname:
                     slots["vessel_name"] = str(canonical_vname)
                 voyage_id = slots.get("voyage_id")
 
-            # 2️⃣ Finance
+            # One voyage → one vessel (Mongo canonical). Do not query finance/ops without Mongo identity.
+            if voyage_number and not voyage_id and not (isinstance(mongo_data, dict) and mongo_data.get("voyage_id")):
+                vn_disp = str(voyage_number)
+                answer = _router_fallback("voyage_reference_ambiguous_or_not_found", voyage_ref=vn_disp)
+                state["merged"] = {"finance": {}, "ops": {}, "mongo": {}, "artifacts": {"intent_key": intent_key, "slots": slots}}
+                state["answer"] = answer
+                state["slots"] = slots
+                return state
+
+            # 2️⃣ Finance (scoped to Mongo voyage_id + vessel IMO only)
             self._trace(
                 state,
                 {
@@ -5059,30 +5069,38 @@ class GraphRouter:
                 mongo_imo = _norm_imo(mongo_safe.get("vessel_imo"))
                 mongo_vessel_name = str(mongo_safe.get("vessel_name") or "").strip().lower()
 
-            if voyage_number and (mongo_imo or mongo_vessel_name):
-                if isinstance(finance_safe, dict) and isinstance(finance_safe.get("rows"), list):
-                    fin_rows = finance_safe.get("rows") or []
-                    fin_filtered = []
-                    for r in fin_rows:
-                        if not isinstance(r, dict):
-                            continue
-                        row_imo = _norm_imo(r.get("vessel_imo"))
-                        row_vname = str(r.get("vessel_name") or "").strip().lower()
-                        if (mongo_imo and row_imo == mongo_imo) or (mongo_vessel_name and row_vname == mongo_vessel_name):
-                            fin_filtered.append(r)
-                    finance_safe = {**finance_safe, "rows": fin_filtered}
+            # Strict Mongo-led reconciliation: one voyage → one vessel; never surface multi-vessel finance rows.
+            if (mongo_imo or mongo_vessel_name or voyage_id) and isinstance(finance_safe, dict) and isinstance(finance_safe.get("rows"), list):
+                fin_rows = finance_safe.get("rows") or []
+                fin_filtered = []
+                for r in fin_rows:
+                    if not isinstance(r, dict):
+                        continue
+                    row_imo = _norm_imo(r.get("vessel_imo"))
+                    row_vname = str(r.get("vessel_name") or "").strip().lower()
+                    row_vid = str(r.get("voyage_id") or "").strip()
+                    if voyage_id and row_vid and row_vid == str(voyage_id).strip():
+                        fin_filtered.append(r)
+                    elif (mongo_imo and row_imo == mongo_imo) or (mongo_vessel_name and row_vname == mongo_vessel_name):
+                        fin_filtered.append(r)
+                if fin_filtered:
+                    finance_safe = {**finance_safe, "rows": fin_filtered[:1]}
 
-                if isinstance(ops_safe, dict) and isinstance(ops_safe.get("rows"), list):
-                    ops_rows = ops_safe.get("rows") or []
-                    ops_filtered = []
-                    for r in ops_rows:
-                        if not isinstance(r, dict):
-                            continue
-                        row_imo = _norm_imo(r.get("vessel_imo"))
-                        row_vname = str(r.get("vessel_name") or "").strip().lower()
-                        if (mongo_imo and row_imo == mongo_imo) or (mongo_vessel_name and row_vname == mongo_vessel_name):
-                            ops_filtered.append(r)
-                    ops_safe = {**ops_safe, "rows": ops_filtered}
+            if (mongo_imo or mongo_vessel_name or voyage_id) and isinstance(ops_safe, dict) and isinstance(ops_safe.get("rows"), list):
+                ops_rows = ops_safe.get("rows") or []
+                ops_filtered = []
+                for r in ops_rows:
+                    if not isinstance(r, dict):
+                        continue
+                    row_imo = _norm_imo(r.get("vessel_imo"))
+                    row_vname = str(r.get("vessel_name") or "").strip().lower()
+                    row_vid = str(r.get("voyage_id") or "").strip()
+                    if voyage_id and row_vid and row_vid == str(voyage_id).strip():
+                        ops_filtered.append(r)
+                    elif (mongo_imo and row_imo == mongo_imo) or (mongo_vessel_name and row_vname == mongo_vessel_name):
+                        ops_filtered.append(r)
+                if ops_filtered:
+                    ops_safe = {**ops_safe, "rows": ops_filtered[:1]}
 
             # If all backends are unavailable, avoid a slow/expensive LLM call and return a clear message.
             finance_ok = isinstance(finance_safe, dict) and finance_safe.get("rows")
@@ -9686,8 +9704,14 @@ Question: {user_input}"""
             len(user_input or ""),
         )
         try:
+            run_config = {
+                "configurable": {"thread_id": session_id},
+                "metadata": {"session_id": session_id},
+                "run_name": session_id,
+            }
             out: GraphState = self.graph.invoke(
-                {"session_id": session_id, "user_input": user_input, "raw_user_input": user_input}
+                {"session_id": session_id, "user_input": user_input, "raw_user_input": user_input},
+                config=run_config,
             )
         except Exception as exc:
             logger.error(

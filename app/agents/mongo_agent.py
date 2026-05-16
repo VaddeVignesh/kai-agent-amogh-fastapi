@@ -71,31 +71,33 @@ class MongoAgent:
 
         if vn_int is not None:
             proj = get_mongo_projection("full_voyage_context")
-            doc = self.adapter.get_voyage_by_number(vn_int, projection=proj)
-            if not doc:
-                batch = self.adapter.list_voyages_by_number(
-                    vn_int,
-                    projection=proj,
-                    limit=get_mongo_limit("full_voyage_context_batch", 40),
+            # Mongo is canonical: always resolve exactly one voyage document per voyage_number.
+            batch = self.adapter.list_voyages_by_number(
+                vn_int,
+                projection=proj,
+                limit=get_mongo_limit("full_voyage_context_batch", 40),
+            )
+            narrowed = narrow_voyage_rows_by_entity_slots(batch, entity_slots or {})
+            candidates = narrowed if narrowed else batch
+
+            def _score(d: Dict[str, Any]) -> tuple[str, int, int, str]:
+                if not isinstance(d, dict):
+                    return ("", -1, -1, "")
+                scoring = get_mongo_agent_scoring("full_voyage_context_scoring")
+                recency = next(
+                    (str(d.get(field) or "") for field in scoring.get("recency_fields", []) if d.get(field)),
+                    "",
                 )
-                narrowed = narrow_voyage_rows_by_entity_slots(batch, entity_slots or {})
-                if len(narrowed) == 1:
-                    doc = narrowed[0]
-                elif narrowed:
-                    # Ambiguous voyageNumber: pick a single coherent doc by anchor completeness.
-                    def _score(d: Dict[str, Any]) -> tuple[str, int, int, str]:
-                        if not isinstance(d, dict):
-                            return ("", -1, -1, "")
-                        scoring = get_mongo_agent_scoring("full_voyage_context_scoring")
-                        recency = next(
-                            (str(d.get(field) or "") for field in scoring.get("recency_fields", []) if d.get(field)),
-                            "",
-                        )
-                        anchor = sum(int(bool(str(d.get(field) or "").strip())) for field in scoring.get("anchor_fields", []))
-                        payload = sum(int(bool(d.get(field))) for field in scoring.get("payload_fields", []))
-                        vid = str(d.get(scoring.get("id_field", "")) or "")
-                        return (recency, anchor, payload, vid)
-                    doc = sorted(narrowed, key=_score, reverse=True)[0]
+                anchor = sum(int(bool(str(d.get(field) or "").strip())) for field in scoring.get("anchor_fields", []))
+                payload = sum(int(bool(d.get(field))) for field in scoring.get("payload_fields", []))
+                vid = str(d.get(scoring.get("id_field", "voyageId")) or "")
+                return (recency, anchor, payload, vid)
+
+            doc = None
+            if len(candidates) == 1:
+                doc = candidates[0]
+            elif candidates:
+                doc = sorted(candidates, key=_score, reverse=True)[0]
 
         elif voyage_id:
             doc = self.adapter.fetch_voyage(

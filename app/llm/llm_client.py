@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 
 from groq import Groq
 
+from app.core.request_context import get_request_session_id
 from app.utils.ops_llm_shrink import shrink_ops_row_json_fields
 from app.config.prompt_rules_loader import (
     get_answer_generation_fallback,
@@ -1098,8 +1099,26 @@ class LLMClient:
                     ops_only_hint = t
 
         style = self._derive_answer_style(question=question, intent_key=intent_key)
-        recent_context_turns = self._recent_turns_for_context(session_context, limit=2)
-        recent_context_text = self._recent_turns_prompt(session_context, limit=2)
+
+        if intent_key == "voyage.summary" and isinstance(merged_safe, dict) and not ops_only_hint:
+            deterministic = self._build_deterministic_voyage_summary(
+                question=question,
+                merged_safe=merged_safe,
+                style=style,
+            )
+            if deterministic:
+                return deterministic
+
+        recent_context_turns = (
+            []
+            if intent_key == "voyage.summary"
+            else self._recent_turns_for_context(session_context, limit=2)
+        )
+        recent_context_text = (
+            ""
+            if intent_key == "voyage.summary"
+            else self._recent_turns_prompt(session_context, limit=2)
+        )
 
         system = get_llm_answer_generation_system_prompt()
 
@@ -1180,8 +1199,8 @@ class LLMClient:
         if not text:
             return ""
 
-        # Always polish — every response must be question-driven, not template-driven
-        should_polish = True
+        if intent_key == "voyage.summary":
+            return text
 
         system = get_answer_polish_system_prompt()
 
@@ -1990,6 +2009,120 @@ class LLMClient:
             return f"- Overall, this voyage finished {direction} (PnL {pnl_s}) on revenue {rev_s} and total expense {exp_s}."
         return f"- Overall, this voyage finished with PnL {pnl_s} on revenue {rev_s} and total expense {exp_s}."
 
+    def _build_deterministic_voyage_summary(
+        self,
+        *,
+        question: str,
+        merged_safe: Dict[str, Any],
+        style: Dict[str, Any],
+    ) -> str:
+        """
+        Stable markdown for voyage.summary — same structure and wording every time
+        when finance/ops KPI rows are present (demo-safe; no LLM paraphrase).
+        """
+        art = merged_safe.get("artifacts") if isinstance(merged_safe.get("artifacts"), dict) else {}
+        if art.get("finance_kpi_unavailable") is True:
+            return ""
+
+        fin_rows = (merged_safe.get("finance") or {}).get("rows") if isinstance(merged_safe.get("finance"), dict) else []
+        ops_rows = (merged_safe.get("ops") or {}).get("rows") if isinstance(merged_safe.get("ops"), dict) else []
+        fin_row = fin_rows[0] if isinstance(fin_rows, list) and fin_rows and isinstance(fin_rows[0], dict) else {}
+        ops_row = ops_rows[0] if isinstance(ops_rows, list) and ops_rows and isinstance(ops_rows[0], dict) else {}
+
+        has_finance = any(
+            fin_row.get(k) not in (None, "")
+            for k in ("pnl", "revenue", "total_expense", "tce", "total_commission")
+        )
+        if not has_finance and not ops_row:
+            return ""
+
+        vn = fin_row.get("voyage_number") or ops_row.get("voyage_number") or ""
+        vname, imo = self._extract_voyage_identity(merged_safe)
+        lines: List[str] = ["### Summary"]
+        id_parts = []
+        if vn not in (None, ""):
+            id_parts.append(f"**{vn}**")
+        if vname:
+            id_parts.append(f"**{vname}**")
+        if imo:
+            id_parts.append(f"(IMO {imo})")
+        if id_parts:
+            lines.append(f"- Voyage {' — '.join(id_parts)}.")
+        else:
+            lines.append("- Voyage summary from available finance and operations data.")
+
+        if has_finance:
+            lines.extend(["", "### Financial summary", "| Metric | Value |", "| --- | --- |"])
+            for label, key in (
+                ("Revenue", "revenue"),
+                ("Total expense", "total_expense"),
+                ("PnL", "pnl"),
+                ("TCE", "tce"),
+                ("Total commission", "total_commission"),
+            ):
+                val = fin_row.get(key)
+                if val not in (None, ""):
+                    fmt = self._fmt_usd(val) if key != "tce" else self._fmt_usd(val)
+                    lines.append(f"| {label} | {fmt or val} |")
+
+        if style.get("ask_ports", True):
+            ports: List[str] = []
+            if isinstance(ops_row.get("ports"), list):
+                ports = [str(p).strip() for p in ops_row["ports"] if str(p).strip()]
+            elif isinstance(ops_row.get("key_ports"), list):
+                for p in ops_row["key_ports"]:
+                    if isinstance(p, dict):
+                        pn = str(p.get("portName") or p.get("port_name") or "").strip()
+                        if pn:
+                            ports.append(pn)
+                    elif str(p).strip():
+                        ports.append(str(p).strip())
+            elif isinstance(ops_row.get("ports_json"), list):
+                ports = [str(p).strip() for p in ops_row["ports_json"] if str(p).strip()]
+            lines.extend(["", "### Main ports involved"])
+            if ports:
+                for p in ports[:12]:
+                    lines.append(f"- {p}")
+                if len(ports) > 12:
+                    lines.append(f"- (+{len(ports) - 12} more)")
+            else:
+                lines.append("- Not available in dataset.")
+
+        if style.get("ask_remarks", True):
+            remarks_out: List[str] = []
+            mongo = merged_safe.get("mongo")
+            if isinstance(mongo, dict):
+                raw_remarks = mongo.get("remarks")
+                if isinstance(raw_remarks, list):
+                    for item in raw_remarks[:8]:
+                        if isinstance(item, dict):
+                            dt = str(item.get("modifiedDate") or item.get("date") or "").strip()
+                            who = str(item.get("modifiedByFull") or item.get("author") or "").strip()
+                            body = str(item.get("remark") or item.get("text") or "").strip()
+                            if body:
+                                prefix = " | ".join(x for x in (dt, who) if x)
+                                remarks_out.append(f"- {prefix} | {body[:400]}" if prefix else f"- {body[:400]}")
+                        elif str(item).strip():
+                            remarks_out.append(f"- {str(item).strip()[:400]}")
+                rows = mongo.get("rows")
+                if not remarks_out and isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                    for item in (rows[0].get("remarks") or [])[:8]:
+                        if isinstance(item, dict):
+                            body = str(item.get("remark") or item.get("text") or "").strip()
+                            if body:
+                                remarks_out.append(f"- {body[:400]}")
+            if not remarks_out and isinstance(ops_row.get("remarks_preview"), list):
+                for t in ops_row["remarks_preview"][:5]:
+                    if str(t).strip():
+                        remarks_out.append(f"- {str(t).strip()[:400]}")
+            lines.extend(["", "### Voyage remarks"])
+            if remarks_out:
+                lines.extend(remarks_out)
+            else:
+                lines.append("- No remarks recorded for this voyage in the available data.")
+
+        return "\n".join(lines).strip()
+
     @staticmethod
     def _norm_imo_text(v: Any) -> str:
         if v in (None, ""):
@@ -2203,7 +2336,10 @@ class LLMClient:
     ) -> str:
         start = time.time()
         prompt_chars = len(system or "") + len(user or "")
-        try:
+        session_id = get_request_session_id()
+        tracing_on = os.getenv("LANGCHAIN_TRACING_V2", "").strip().lower() in ("1", "true", "yes", "on")
+
+        def _execute() -> str:
             completion = self.client.chat.completions.create(
                 model=self.config.model,
                 messages=[
@@ -2213,14 +2349,34 @@ class LLMClient:
                 temperature=(self.config.temperature if temperature is None else temperature),
                 max_tokens=max_tokens,
             )
-            response = completion.choices[0].message.content or ""
+            return completion.choices[0].message.content or ""
+
+        try:
+            if tracing_on and session_id:
+                try:
+                    from langsmith import trace as ls_trace
+
+                    with ls_trace(
+                        name="groq_chat",
+                        run_type="llm",
+                        inputs={"prompt_chars": prompt_chars},
+                        session_name=session_id,
+                        metadata={"session_id": session_id},
+                    ) as run:
+                        response = _execute()
+                        run.end(outputs={"response_chars": len(response)})
+                        return response
+                except Exception:
+                    pass
+            response = _execute()
             elapsed = round(time.time() - start, 3)
             logger.info(
-                "LLM_CALL | model=%s | latency=%ss | prompt_chars=%s | response_chars=%s",
+                "LLM_CALL | model=%s | latency=%ss | prompt_chars=%s | response_chars=%s | session=%s",
                 self.config.model,
                 elapsed,
                 prompt_chars,
                 len(response),
+                session_id or "-",
             )
             return response
         except Exception as exc:

@@ -460,9 +460,10 @@ class OpsAgent:
             if not voyage_number and not voyage_id:
                 raise ValueError(get_ops_validation_message("voyage_summary_requires_reference"))
             params = {
-                "voyage_number": str(int(voyage_number)) if voyage_number is not None else None,
+                "voyage_number": str(int(voyage_number)) if voyage_number is not None and not voyage_id else None,
                 "voyage_id": str(voyage_id) if voyage_id is not None else None,
                 "vessel_imo": str(vessel_imo) if vessel_imo is not None else None,
+                "limit": 1,
             }
             # Tenants without finance KPI still need ops voyage rows; kpi.* SQL joins finance_voyage_kpi.
             if not session_may_access_finance_kpi(session_context):
