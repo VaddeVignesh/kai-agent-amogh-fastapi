@@ -625,9 +625,12 @@ llm_client:
   ranking_answer_hint: |
     Each object in merged_rows has numeric fields pnl, revenue, total_expense at the top level. You MUST include PnL and Revenue (and Total expense when present) as columns in the Results table. Do NOT say financial metrics are not available.
   ops_only_voyage_answer_instruction: |
-    HARD CONSTRAINT: This login cannot read canonical financial KPI tables (revenue, total expenses, PnL, TCE, commission).
-    Do NOT estimate, derive, infer, or calculate those figures from fixtures, hire rates, legs, bills of lading, remarks, or any other operational text.
-    If the user asks for financial totals, say that commercial financial KPIs are not available for this workspace and answer with operational facts only (ports, delays, grades, remarks, module type) that appear explicitly in the payload.
+    WORKSPACE: Operations-only login (no finance KPI tables). Write in clear business English for a shipping operator deciding what happened on a voyage.
+    HARD CONSTRAINT: Do NOT invent or estimate PnL, revenue, total expense, TCE, or commission. Do not treat hire rates, fixture revenue lines, or accrued columns as financial KPIs.
+    USE THE DATA: Prefer artifacts.merged_rows[0] when present (offhire_days, is_delayed, delay_reason, key_ports, cargo_grades, remarks). Also use ops.rows and mongo.rows (legs, fixturePorts, remarks).
+    STRUCTURE: Open with a 1-2 sentence verdict on operational performance (delays, route, cargo, remarks). Then short sections: Operational snapshot (delays/offhire), Route & ports, Cargo grades, Remarks (summarize; tag [Operational Issue] / [Administrative] / [Delay Related] when obvious). End with one line that finance KPIs are outside this role's access.
+    If ports or grades exist in JSON, list them with load/discharge context when available — never say "not available" when key_ports, cargo_grades, legs, or fixturePorts are populated.
+    For "what went wrong" questions, interpret remarks and delay fields in prose (no raw admin hire-update dumps as the whole story).
   out_of_scope_responses:
     greeting: |
       ### Hello
@@ -648,6 +651,16 @@ llm_client:
       - "For voyage 1901, summarize financials, key ports, cargo grades, and remarks"
       - "Top 10 voyages by commission and include key ports and cargo grades"
       - "For port Rotterdam, summarize the most common cargo grades across voyages"
+    read_only_mutation: |
+      ### Summary
+      - I can't delete, update, or modify  database. This assistant is **read-only** (analytics and reporting only).
+
+      ### What I can do instead
+      - Show a **financial and operational summary** for a voyage (e.g. "For Lady Amanda voyage 2204, give me the financial summary").
+      - Run **fleet analysis** (e.g. high revenue / low PnL voyages).
+
+      ### Note
+      - No rows were deleted or changed in Postgres or MongoDB.
     weather: |
       ### Summary
       - I can't provide live weather/forecast data from this system.
@@ -706,6 +719,8 @@ graph_router:
     1. FINANCIAL DATA (ACTUAL settled figures, use these for PnL/revenue/expense/TCE)
     2. METADATA (use these for ports, cargo, remarks, fixture, bunkers)
     Never mix the two sources. Always prefer FINANCIAL DATA for any financial figure.
+    One voyage number maps to exactly ONE vessel — use only the vessel name/IMO in financial_data_postgres and the single metadata document.
+    Never state that multiple vessels are assigned to the same voyage number.
     Write a clean business answer for end users. Do NOT mention internal source names, system/debug wording,
     or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dataset shows'.
   voyage_metadata_answer_system_prompt: |

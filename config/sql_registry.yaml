@@ -428,6 +428,10 @@ queries:
                       %(vessel_imo)s IS NULL
                       OR REPLACE(o.vessel_imo::TEXT, '.0', '') = %(vessel_imo)s::TEXT
                     )
+                    AND (
+                      %(vessel_name)s IS NULL
+                      OR o.vessel_name ILIKE '%%' || %(vessel_name)s || '%%'
+                    )
                   ORDER BY o.voyage_end_date DESC NULLS LAST
                   LIMIT COALESCE(%(limit)s, 10);
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 
 from app.config.schema_loader import _read_yaml
@@ -28,6 +29,61 @@ def get_planner_finance_keywords() -> frozenset[str]:
 
 def get_planner_mongo_keywords() -> frozenset[str]:
     return _planner_source_keywords("mongo")
+
+
+def get_planner_ops_keywords() -> frozenset[str]:
+    rules = load_routing_rules()
+    values = rules.get("planner_ops_keywords", []) if isinstance(rules, dict) else []
+    if not isinstance(values, list):
+        values = []
+    return frozenset(str(value).strip().lower() for value in values if str(value).strip())
+
+
+def is_voyage_operational_profile_query(
+    user_input: str,
+    slots: dict | None = None,
+) -> bool:
+    """
+    True when the user asks for an operational diagnostic on a specific voyage
+    (delays, ports, grades, remarks) — should use voyage.summary (Postgres ops + Mongo),
+    not Mongo-only voyage.metadata.
+    """
+    slots = slots if isinstance(slots, dict) else {}
+    voyage_numbers = slots.get("voyage_numbers")
+    has_anchor = bool(
+        slots.get("voyage_number")
+        or slots.get("voyage_id")
+        or (isinstance(voyage_numbers, list) and len(voyage_numbers) > 0)
+    )
+    if not has_anchor:
+        return False
+    text_lower = (user_input or "").lower()
+    ops_kw = get_planner_ops_keywords()
+    mongo_kw = get_planner_mongo_keywords()
+    return any(kw in text_lower for kw in ops_kw) and any(kw in text_lower for kw in mongo_kw)
+
+
+def is_voyage_composite_profile_query(
+    user_input: str,
+    slots: dict | None = None,
+) -> bool:
+    """
+    True when the user asks for a combined financial + operational/mongo profile
+    for a specific voyage (e.g. executive summary with ports, remarks, and PnL).
+    """
+    slots = slots if isinstance(slots, dict) else {}
+    voyage_numbers = slots.get("voyage_numbers")
+    has_anchor = bool(
+        slots.get("voyage_number")
+        or slots.get("voyage_id")
+        or (isinstance(voyage_numbers, list) and len(voyage_numbers) > 0)
+    )
+    if not has_anchor:
+        return False
+    text_lower = (user_input or "").lower()
+    finance_kw = get_planner_finance_keywords()
+    mongo_kw = get_planner_mongo_keywords()
+    return any(kw in text_lower for kw in finance_kw) and any(kw in text_lower for kw in mongo_kw)
 
 
 def get_planner_default_primary_source() -> str:
@@ -155,6 +211,49 @@ def get_older_vessel_markers() -> list[str]:
 
 def get_simple_voyage_analytical_markers() -> list[str]:
     return _get_string_list("simple_voyage_analytical_markers")
+
+
+def get_read_only_mutation_markers() -> list[str]:
+    return _get_string_list("read_only_mutation_markers")
+
+
+_MUTATION_VERB_RE = re.compile(
+    r"\b(delete|remove|drop|truncate|wipe|erase|purge|destroy)\b",
+    re.IGNORECASE,
+)
+
+
+def is_read_only_mutation_request(text: str) -> bool:
+    """
+    True when the user asks to write/delete/modify stored voyage or warehouse data.
+    The analytics stack is read-only; these must not route to voyage.summary.
+    """
+    ul = (text or "").strip().lower()
+    if not ul:
+        return False
+    if any(marker in ul for marker in get_read_only_mutation_markers()):
+        return True
+    if _MUTATION_VERB_RE.search(ul) and any(
+        term in ul
+        for term in (
+            "row",
+            "rows",
+            "record",
+            "data",
+            "database",
+            "table",
+            "voyage",
+            "voyages",
+            "entry",
+            "entries",
+        )
+    ):
+        return True
+    if re.search(r"\b(insert|update|modify|alter)\b", ul, re.IGNORECASE) and any(
+        term in ul for term in ("row", "rows", "record", "data", "table", "database", "voyage")
+    ):
+        return True
+    return False
 
 
 def get_vessel_mention_stop_first_words() -> frozenset[str]:

@@ -67,6 +67,8 @@ from app.config.routing_rules_loader import (
     get_llm_metadata_keywords,
     get_llm_metadata_override_blocking_metric_terms,
     get_llm_mongo_only_voyage_fields,
+    is_voyage_composite_profile_query,
+    is_voyage_operational_profile_query,
     get_llm_out_of_scope_greeting_exact,
     get_llm_out_of_scope_greeting_prefixes,
     get_llm_out_of_scope_identity_phrases,
@@ -107,6 +109,10 @@ def _should_use_voyage_metadata(
     This override runs AFTER deterministic classification.
     """
     if intent_key not in ("voyage.summary", "voyage.detail"):
+        return False
+    if is_voyage_composite_profile_query(user_input, slots):
+        return False
+    if is_voyage_operational_profile_query(user_input, slots):
         return False
     voyage_numbers = (slots or {}).get("voyage_numbers")
     has_voyage_anchor = bool(
@@ -469,6 +475,18 @@ class LLMClient:
             .replace("\u00e2\u20ac\u02dc", "'")
         )
 
+        from app.config.routing_rules_loader import is_read_only_mutation_request
+
+        if is_read_only_mutation_request(text_norm):
+            return {
+                "intent_key": "out_of_scope",
+                "slots": {},
+                "is_followup": False,
+                "inherit_slots_from_session": [],
+                "backward_reference": False,
+                "followup_confidence": "low",
+            }
+
         # 1️⃣ Deterministic override
         deterministic = self._deterministic_intent(text_norm, session_context)
 
@@ -479,6 +497,15 @@ class LLMClient:
         voyages = re.findall(r"\b\d{3,4}\b", text_norm)
         if voyages:
             slots["voyage_numbers"] = [int(v) for v in voyages]
+            if len(slots["voyage_numbers"]) == 1:
+                slots["voyage_number"] = slots["voyage_numbers"][0]
+
+        for_voyage_vessel = re.search(
+            r"(?i)\bfor\s+([A-Z][a-z0-9]+(?:\s+[A-Z][a-z0-9]+){0,4})\s+voyage\b",
+            text_norm,
+        )
+        if for_voyage_vessel and "vessel_name" not in slots:
+            slots["vessel_name"] = for_voyage_vessel.group(1).strip()
 
         # IMO extraction (e.g. "IMO 9667485", "vessel IMO: 9667485")
         imo_match = re.search(r"\b(?:vessel\s+)?imo(?:\s*[:#-]?\s*|\s+)(\d{7,10})\b", text_norm, re.IGNORECASE)
@@ -561,11 +588,22 @@ class LLMClient:
             if ("commission" in tl) and ("top" in tl) and ("voyage" in tl):
                 deterministic = "ranking.voyages_by_commission"
 
-        # Loss-making / what went wrong → segment_performance composite (needs breakdown + remarks)
+        # Loss-making / what went wrong → fleet segment_performance unless anchored to one voyage.
         if not deterministic:
             tl = text_norm.lower()
             if ("loss-making" in tl) or ("loss making" in tl) or ("went wrong" in tl):
-                deterministic = "analysis.segment_performance"
+                has_voyage_anchor = bool(
+                    slots.get("voyage_number")
+                    or slots.get("voyage_id")
+                    or re.search(r"\bvoyage\s+\d{3,5}\b", tl)
+                )
+                if has_voyage_anchor and (
+                    is_voyage_operational_profile_query(text_norm, slots)
+                    or is_voyage_composite_profile_query(text_norm, slots)
+                ):
+                    deterministic = "voyage.summary"
+                else:
+                    deterministic = "analysis.segment_performance"
 
         tl = text_norm.lower()
         metadata_keywords = get_llm_metadata_keywords()
@@ -585,6 +623,8 @@ class LLMClient:
             has_small_voyage_anchor = isinstance(vnums, list) and 1 <= len(vnums) <= 3
             if looks_fleet_wide:
                 deterministic = "ranking.vessel_metadata"
+            elif has_voyage_anchor and is_voyage_operational_profile_query(text_norm, slots):
+                deterministic = "voyage.summary"
             elif has_vessel_anchor or has_small_voyage_anchor:
                 deterministic = "vessel.metadata" if has_vessel_anchor else "voyage.metadata"
             elif has_voyage_anchor:
@@ -768,9 +808,14 @@ class LLMClient:
         ) and not any(k in ql for k in ("top vessels", "which vessels", "across all vessels", "fleet")):
             intent = "vessel.summary"
 
+        # Read-only: never promote delete/update/modify asks to entity summaries.
+        if is_read_only_mutation_request(text_norm):
+            intent = "out_of_scope"
+            clean_slots = {k: v for k, v in clean_slots.items() if k in ("limit", "scenario")}
+
         # 5️⃣ Recovery for common "false out_of_scope" cases.
         # If we have strong entity slots, do not allow out_of_scope to block a valid answer.
-        if intent == "out_of_scope":
+        elif intent == "out_of_scope":
             if clean_slots.get("vessel_name"):
                 ql = text_norm.lower()
                 intent = "vessel.metadata" if any(k in ql for k in metadata_keywords) else "vessel.summary"
@@ -780,6 +825,13 @@ class LLMClient:
             elif clean_slots.get("voyage_numbers"):
                 ql = text_norm.lower()
                 intent = "voyage.metadata" if any(k in ql for k in metadata_keywords) else "voyage.summary"
+        elif is_read_only_mutation_request(text_norm) and intent in (
+            "voyage.summary",
+            "voyage.metadata",
+            "vessel.summary",
+            "vessel.metadata",
+        ):
+            intent = "out_of_scope"
 
         # cargo_grades post-processing — no hardcoding, LLM extracted these
         if clean_slots.get("cargo_grade") and not clean_slots.get("cargo_grades"):
@@ -1075,6 +1127,10 @@ class LLMClient:
 
             if any(k in q_lower for k in get_llm_out_of_scope_weather_keywords()):
                 return get_out_of_scope_response_template("weather")
+            from app.config.routing_rules_loader import is_read_only_mutation_request
+
+            if is_read_only_mutation_request(q):
+                return get_out_of_scope_response_template("read_only_mutation")
             return get_out_of_scope_response_template("default")
 
         merged = self._truncate_merged_data(merged, max_rows=10)
@@ -1100,6 +1156,7 @@ class LLMClient:
 
         style = self._derive_answer_style(question=question, intent_key=intent_key)
 
+        # Ops-only tenants: use LLM narrative (not the terse deterministic template) so demo answers stay business-friendly.
         if intent_key == "voyage.summary" and isinstance(merged_safe, dict) and not ops_only_hint:
             deterministic = self._build_deterministic_voyage_summary(
                 question=question,
@@ -1108,6 +1165,16 @@ class LLMClient:
             )
             if deterministic:
                 return deterministic
+
+        if ops_only_hint:
+            style = {
+                **style,
+                "narrative_summary": True,
+                "financial_first": False,
+                "ask_ports": True,
+                "ask_grades": True,
+                "ask_remarks": True,
+            }
 
         recent_context_turns = (
             []
@@ -2033,11 +2100,14 @@ class LLMClient:
             fin_row.get(k) not in (None, "")
             for k in ("pnl", "revenue", "total_expense", "tce", "total_commission")
         )
-        if not has_finance and not ops_row:
+        vname, imo = self._extract_voyage_identity(merged_safe)
+        if not has_finance and not ops_row and not (vname or imo):
             return ""
 
         vn = fin_row.get("voyage_number") or ops_row.get("voyage_number") or ""
-        vname, imo = self._extract_voyage_identity(merged_safe)
+        mongo_rows = (merged_safe.get("mongo") or {}).get("rows") if isinstance(merged_safe.get("mongo"), dict) else []
+        if not vn and isinstance(mongo_rows, list) and mongo_rows and isinstance(mongo_rows[0], dict):
+            vn = mongo_rows[0].get("voyageNumber") or mongo_rows[0].get("voyage_number") or ""
         lines: List[str] = ["### Summary"]
         id_parts = []
         if vn not in (None, ""):
@@ -2121,6 +2191,149 @@ class LLMClient:
             else:
                 lines.append("- No remarks recorded for this voyage in the available data.")
 
+        return "\n".join(lines).strip()
+
+    def _build_deterministic_ops_only_voyage_summary(
+        self,
+        *,
+        question: str,
+        merged_safe: Dict[str, Any],
+        style: Dict[str, Any],
+    ) -> str:
+        """
+        Ops-only RBAC (customer_ops_only): Postgres ops row + Mongo ports/grades/remarks.
+        No finance KPI; stable markdown without LLM inventing empty ports.
+        """
+        art = merged_safe.get("artifacts") if isinstance(merged_safe.get("artifacts"), dict) else {}
+        merged_rows = art.get("merged_rows") if isinstance(art.get("merged_rows"), list) else []
+        row = merged_rows[0] if merged_rows and isinstance(merged_rows[0], dict) else {}
+
+        ops_rows = (merged_safe.get("ops") or {}).get("rows") if isinstance(merged_safe.get("ops"), dict) else []
+        ops_row = ops_rows[0] if isinstance(ops_rows, list) and ops_rows and isinstance(ops_rows[0], dict) else {}
+        if not row and ops_row:
+            row = dict(ops_row)
+            if isinstance(ops_row.get("ports"), list):
+                row["key_ports"] = ops_row["ports"]
+            if isinstance(ops_row.get("cargo_grade_names"), list):
+                row["cargo_grades"] = ops_row["cargo_grade_names"]
+
+        vname, imo = self._extract_voyage_identity(merged_safe)
+        vn = row.get("voyage_number") or ops_row.get("voyage_number") or ""
+        if not vn and not vname and not row:
+            return ""
+
+        ql = (question or "").lower()
+        diagnostic = any(
+            p in ql
+            for p in ("what went wrong", "went wrong", "root cause", "operationally", "delay", "incident")
+        )
+
+        offhire = row.get("offhire_days") if row.get("offhire_days") not in (None, "") else ops_row.get("offhire_days")
+        is_delayed = row.get("is_delayed") if row.get("is_delayed") not in (None, "") else ops_row.get("is_delayed")
+        delay_reason = row.get("delay_reason") or ops_row.get("delay_reason") or ops_row.get("delay_reasons")
+
+        lines: List[str] = []
+        id_bits = []
+        if vn not in (None, ""):
+            id_bits.append(f"voyage **{vn}**")
+        if vname:
+            id_bits.append(f"**{vname}**")
+        if imo:
+            id_bits.append(f"(IMO {imo})")
+
+        try:
+            offhire_f = float(offhire) if offhire not in (None, "", [], {}) else 0.0
+        except (TypeError, ValueError):
+            offhire_f = 0.0
+
+        if diagnostic:
+            if is_delayed in (True, "true", "True", "t", "yes", 1) or offhire_f > 0:
+                verdict = f"For {', '.join(id_bits)}, operational records show delay or offhire exposure."
+            elif delay_reason not in (None, "", [], {}):
+                verdict = f"For {', '.join(id_bits)}, a delay reason is recorded in ops data."
+            else:
+                verdict = f"For {', '.join(id_bits)}, ops data does not show delays or offhire days; review remarks for execution issues."
+            lines.append(verdict)
+        else:
+            lines.append(f"Operational summary for {', '.join(id_bits)}.")
+
+        lines.extend(["", "### Summary"])
+        if vn not in (None, ""):
+            lines.append(f"- **Voyage:** {vn}")
+        if vname:
+            lines.append(f"- **Vessel:** {vname}")
+        if offhire not in (None, "", [], {}):
+            lines.append(f"- **Offhire days:** {offhire}")
+        if is_delayed not in (None, "", [], {}):
+            lines.append(f"- **Delayed:** {is_delayed}")
+        if delay_reason not in (None, "", [], {}):
+            lines.append(f"- **Delay reason:** {delay_reason}")
+
+        if style.get("ask_ports", True):
+            ports: List[str] = []
+            kp = row.get("key_ports")
+            if isinstance(kp, list):
+                for p in kp:
+                    if isinstance(p, dict):
+                        pn = str(p.get("portName") or p.get("port_name") or "").strip()
+                        if pn:
+                            ports.append(pn)
+                    elif str(p).strip():
+                        ports.append(str(p).strip())
+            lines.extend(["", "### Ports"])
+            if ports:
+                for p in ports[:12]:
+                    lines.append(f"- {p}")
+                if len(ports) > 12:
+                    lines.append(f"- (+{len(ports) - 12} more)")
+            else:
+                lines.append("- Not available in dataset.")
+
+        if style.get("ask_grades", True) or "grade" in ql:
+            grades: List[str] = []
+            cg = row.get("cargo_grades")
+            if isinstance(cg, list):
+                grades = [str(g).strip() for g in cg if str(g).strip()]
+            lines.extend(["", "### Cargo grades"])
+            if grades:
+                lines.append("- " + ", ".join(grades[:15]))
+            else:
+                lines.append("- Not available in dataset.")
+
+        if style.get("ask_remarks", True):
+            remarks_out: List[str] = []
+            mongo = merged_safe.get("mongo")
+            if isinstance(mongo, dict):
+                raw_remarks = mongo.get("remarks")
+                if isinstance(raw_remarks, list):
+                    for item in raw_remarks[:8]:
+                        if isinstance(item, dict):
+                            body = str(item.get("remark") or item.get("text") or "").strip()
+                            if body:
+                                remarks_out.append(f"- {body[:400]}")
+                mrows = mongo.get("rows")
+                if not remarks_out and isinstance(mrows, list) and mrows and isinstance(mrows[0], dict):
+                    for item in (mrows[0].get("remarks") or [])[:8]:
+                        if isinstance(item, dict):
+                            body = str(item.get("remark") or item.get("text") or "").strip()
+                            if body:
+                                remarks_out.append(f"- {body[:400]}")
+            rem = row.get("remarks")
+            if not remarks_out and isinstance(rem, str) and rem.strip():
+                remarks_out.append(f"- {rem.strip()[:400]}")
+            lines.extend(["", "### Remarks"])
+            if remarks_out:
+                lines.extend(remarks_out[:5])
+            else:
+                lines.append("- No remarks recorded for this voyage in the available data.")
+
+        lines.extend(
+            [
+                "",
+                "### Data scope",
+                "- Commercial financial KPIs (PnL, revenue, TCE) are not available for this workspace; this answer uses operational Postgres and Mongo fields only.",
+            ]
+        )
         return "\n".join(lines).strip()
 
     @staticmethod

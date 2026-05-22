@@ -30,6 +30,10 @@ from app.registries.intent_loader import get_yaml_registry_facade
 from app.registries.sql_registry import SQL_REGISTRY
 from app.services.response_merger import compact_payload
 from app.utils.ops_llm_shrink import shrink_ops_row_json_fields
+from app.utils.mongo_ops_slice import (
+    build_mongo_llm_row_for_ops_tenant,
+    build_voyage_summary_merged_row,
+)
 from app.adapters.mongo_adapter import narrow_voyage_rows_by_entity_slots
 from app.auth import session_may_access_finance_kpi
 from app.config.routing_rules_loader import (
@@ -110,6 +114,9 @@ from app.config.routing_rules_loader import (
     get_vessel_mention_false_prefixes,
     get_vessel_mention_stop_first_words,
     get_voyage_topic_keywords,
+    is_read_only_mutation_request,
+    is_voyage_composite_profile_query,
+    is_voyage_operational_profile_query,
 )
 from app.core.logger import get_logger
 
@@ -657,6 +664,7 @@ class GraphRouter:
             (re.compile(rf"\b(?:linked|tied)\s+to\s+({name})(?:'s|\s+)"), (1,)),
             (re.compile(rf"\bwith\s+({name})\s*\?"), (1,)),
             (re.compile(rf"\bfor\s+({name})\s*\?\s*$"), (1,)),
+            (re.compile(rf"(?i)\bfor\s+({name_cs})\s+voyage\b"), (1,)),
             (re.compile(rf"\b({name})'s\b"), (1,)),
             (re.compile(rf"\bbetween\s+({name})\s+and\s+({name})\b"), (1, 2)),
             (
@@ -1120,6 +1128,32 @@ class GraphRouter:
                     },
                 )
                 return state
+
+        # Read-only guard: delete/update/modify must never fast-path to voyage.summary.
+        if is_read_only_mutation_request(user_input):
+            from app.config.prompt_rules_loader import get_out_of_scope_response_template
+
+            intent_key = "out_of_scope"
+            cleaned_slots: Dict[str, Any] = {}
+            state["intent_key"] = intent_key
+            state["slots"] = cleaned_slots
+            state["answer"] = get_out_of_scope_response_template("read_only_mutation").strip()
+            artifacts = state.get("artifacts") or {}
+            artifacts["intent_key"] = intent_key
+            artifacts["slots"] = cleaned_slots
+            artifacts["user_input"] = user_input
+            state["artifacts"] = artifacts
+            self._trace(
+                state,
+                {
+                    "phase": "intent_extraction",
+                    "intent_key": intent_key,
+                    "slots": cleaned_slots,
+                    "likely_path": "single",
+                    "source": "read_only_mutation_fastpath",
+                },
+            )
+            return state
 
         # Fast-path obvious voyage lookup requests. This avoids an LLM intent call for
         # simple inputs like "show voyage 2205" while leaving analytical/follow-up
@@ -1972,6 +2006,18 @@ class GraphRouter:
                 intent_key = "analysis.segment_performance"
             elif "trend" in _ul_fin and ("month" in _ul_fin or "average" in _ul_fin):
                 intent_key = "aggregation.trends"
+
+        if intent_key == "voyage.metadata" and (
+            is_voyage_composite_profile_query(user_input, cleaned_slots)
+            or is_voyage_operational_profile_query(user_input, cleaned_slots)
+        ):
+            intent_key = "voyage.summary"
+            _dprint("   🔄 VOYAGE PROFILE: voyage.metadata → voyage.summary")
+
+        if is_read_only_mutation_request(user_input):
+            intent_key = "out_of_scope"
+            cleaned_slots = {}
+            _dprint("   🔄 READ-ONLY: mutation request → out_of_scope")
 
         # Pre-classify single vs composite
         is_single = self._is_single_entity_query(intent_key, cleaned_slots, user_input)
@@ -3717,6 +3763,15 @@ class GraphRouter:
 
         _dprint(f"\nSingle execution: {intent_key}")
 
+        if intent_key == "out_of_scope":
+            if state.get("answer"):
+                return state
+            from app.config.prompt_rules_loader import get_out_of_scope_response_template
+
+            if is_read_only_mutation_request(user_input):
+                state["answer"] = get_out_of_scope_response_template("read_only_mutation").strip()
+            return state
+
         def _registry_sql_from_result(res: Any) -> str | None:
             if not isinstance(res, dict):
                 return None
@@ -4511,25 +4566,31 @@ class GraphRouter:
             if not slots.get("voyage_number") and isinstance(slots.get("voyage_numbers"), list) and slots.get("voyage_numbers"):
                 slots["voyage_number"] = slots.get("voyage_numbers")[0]
 
-            # Canonical voyage resolve before finance call:
-            # when voyage_number is reused across vessels, adding canonical voyage_id/imo
-            # keeps the finance query anchored to the same voyage identity used by Mongo.
-            if slots.get("voyage_number") and (not slots.get("voyage_id") or not (slots.get("vessel_imo") or slots.get("imo"))):
-                try:
-                    canon = self.mongo_agent.fetch_full_voyage_context(
-                        voyage_number=slots.get("voyage_number"),
-                        voyage_id=slots.get("voyage_id"),
-                        entity_slots=slots,
-                    )
-                except Exception:
-                    canon = {}
-                if isinstance(canon, dict) and canon:
-                    if canon.get("voyage_id") and not slots.get("voyage_id"):
-                        slots["voyage_id"] = str(canon.get("voyage_id"))
-                    if canon.get("vessel_imo") and not (slots.get("vessel_imo") or slots.get("imo")):
-                        slots["vessel_imo"] = str(canon.get("vessel_imo"))
-                    if canon.get("vessel_name") and not slots.get("vessel_name"):
-                        slots["vessel_name"] = str(canon.get("vessel_name"))
+            # Mongo canonical identity first — one voyage → one vessel (never finance-led).
+            canon: Dict[str, Any] = {}
+            try:
+                canon = self.mongo_agent.fetch_full_voyage_context(
+                    voyage_number=slots.get("voyage_number"),
+                    voyage_id=slots.get("voyage_id"),
+                    entity_slots=slots,
+                )
+            except Exception:
+                canon = {}
+            if isinstance(canon, dict) and canon:
+                if canon.get("voyage_id"):
+                    slots["voyage_id"] = str(canon.get("voyage_id"))
+                if canon.get("vessel_imo"):
+                    slots["imo"] = str(canon.get("vessel_imo"))
+                    slots["vessel_imo"] = str(canon.get("vessel_imo"))
+                if canon.get("vessel_name"):
+                    slots["vessel_name"] = str(canon.get("vessel_name"))
+
+            if slots.get("voyage_number") and not slots.get("voyage_id"):
+                vn_disp = str(slots.get("voyage_number"))
+                answer = _router_fallback("voyage_reference_ambiguous_or_not_found", voyage_ref=vn_disp)
+                state["answer"] = answer
+                state["slots"] = slots
+                return state
 
             # Step 1: financials from Postgres (authoritative for PnL/revenue/expense/TCE/commission)
             self._trace(state, {
@@ -4558,6 +4619,34 @@ class GraphRouter:
             finance_safe = _json_safe(finance_data)
             finance_rows = finance_safe.get("rows") if isinstance(finance_safe, dict) else []
             finance_rows = finance_rows if isinstance(finance_rows, list) else []
+
+            def _norm_imo_multi(v: Any) -> str:
+                if v in (None, ""):
+                    return ""
+                s = str(v).strip()
+                if s.endswith(".0"):
+                    s = s[:-2]
+                return s
+
+            mongo_imo_m = _norm_imo_multi(canon.get("vessel_imo")) if isinstance(canon, dict) else ""
+            mongo_vname_m = str(canon.get("vessel_name") or "").strip().lower() if isinstance(canon, dict) else ""
+            mongo_vid_m = str(canon.get("voyage_id") or "").strip() if isinstance(canon, dict) else ""
+            if mongo_vid_m or mongo_imo_m or mongo_vname_m:
+                fin_scoped = []
+                for r in finance_rows:
+                    if not isinstance(r, dict):
+                        continue
+                    row_vid = str(r.get("voyage_id") or "").strip()
+                    row_imo = _norm_imo_multi(r.get("vessel_imo"))
+                    row_vname = str(r.get("vessel_name") or "").strip().lower()
+                    if mongo_vid_m and row_vid and row_vid == mongo_vid_m:
+                        fin_scoped.append(r)
+                    elif (mongo_imo_m and row_imo == mongo_imo_m) or (mongo_vname_m and row_vname == mongo_vname_m):
+                        fin_scoped.append(r)
+                if fin_scoped:
+                    finance_rows = fin_scoped[:1]
+                    finance_safe = {**finance_safe, "rows": finance_rows}
+
             finance_query_key = finance_safe.get("query_key") if isinstance(finance_safe, dict) else None
             finance_sql = None
             if finance_query_key in SQL_REGISTRY:
@@ -4577,20 +4666,9 @@ class GraphRouter:
                 "ok": True,
             })
 
-            # Pick finance row first so Mongo can align when voyageNumber is non-unique.
-            selected_fin = None
-            for r in finance_rows:
-                if not isinstance(r, dict):
-                    continue
-                if slots.get("voyage_number") is None or str(r.get("voyage_number")) == str(slots.get("voyage_number")):
-                    selected_fin = r
-                    break
-            if not selected_fin and finance_rows:
-                fr0 = finance_rows[0]
-                selected_fin = fr0 if isinstance(fr0, dict) else None
-            selected_fin = selected_fin or {}
+            selected_fin = finance_rows[0] if finance_rows and isinstance(finance_rows[0], dict) else {}
 
-            # Step 2: metadata from Mongo
+            # Step 2: metadata from Mongo (single canonical doc only)
             self._trace(state, {
                 "phase": "multi_step_start",
                 "step_index": 2,
@@ -4604,11 +4682,6 @@ class GraphRouter:
             mongo_docs: list[Dict[str, Any]] = []
             mongo_filter = None
             mongo_fetch_error = False
-            explicit_voyage_only = bool(
-                slots.get("voyage_number") not in (None, "", [], {})
-                and len(GraphRouter._explicit_vessel_mentions(user_input)) == 0
-                and not re.search(r"\b\d{7}\b", user_input or "")
-            )
             if slots.get("voyage_id") not in (None, ""):
                 mongo_filter = {"voyageId": str(slots.get("voyage_id"))}
                 try:
@@ -4619,54 +4692,18 @@ class GraphRouter:
                 if isinstance(fd, dict) and fd:
                     doc = fd
                     mongo_docs = [fd]
-            if not mongo_docs:
+            if not mongo_docs and isinstance(canon, dict) and canon.get("voyage_id"):
                 try:
-                    vnum = slots.get("voyage_number")
-                    if vnum not in (None, ""):
-                        iv = int(vnum)
-                        mongo_filter = {"voyageNumber": str(iv)}
-                        batch = self.mongo_agent.adapter.list_voyages_by_number(
-                            iv,
-                            projection=projection,
-                            limit=get_mongo_limit("voyage_metadata_context_batch", 40),
-                        )
-                        merge_sl = {**slots}
-                        if selected_fin and not explicit_voyage_only:
-                            if selected_fin.get("vessel_name") and not str(merge_sl.get("vessel_name") or "").strip():
-                                merge_sl["vessel_name"] = selected_fin.get("vessel_name")
-                            vimo = selected_fin.get("vessel_imo") or selected_fin.get("imo")
-                            if vimo and not str(merge_sl.get("imo") or merge_sl.get("vessel_imo") or "").strip():
-                                merge_sl["imo"] = vimo
-                            if selected_fin.get("voyage_id") and not str(merge_sl.get("voyage_id") or "").strip():
-                                merge_sl["voyage_id"] = selected_fin.get("voyage_id")
-                        narrowed = narrow_voyage_rows_by_entity_slots(batch, merge_sl)
-                        picked = None
-                        if explicit_voyage_only and narrowed:
-                            def _doc_rank(d: Dict[str, Any]) -> tuple[str, str]:
-                                if not isinstance(d, dict):
-                                    return ("", "")
-                                return (
-                                    str(d.get("startDateUtc") or d.get("extracted_at") or ""),
-                                    str(d.get("voyageId") or ""),
-                                )
-                            picked = sorted(narrowed, key=_doc_rank, reverse=True)[0]
-                        else:
-                            picked = self._pick_voyage_doc_aligned_to_finance(narrowed, selected_fin)
-                        if picked:
-                            doc = picked
-                            mongo_docs = [picked]
-                        elif len(narrowed) == 1:
-                            doc = narrowed[0]
-                            mongo_docs = [narrowed[0]]
-                        elif narrowed:
-                            mongo_docs = narrowed
-                            doc = {}
+                    fd = self.mongo_agent.adapter.fetch_voyage(str(canon.get("voyage_id")), projection=projection)
+                    if isinstance(fd, dict) and fd:
+                        doc = fd
+                        mongo_docs = [fd]
+                        mongo_filter = {"voyageId": str(canon.get("voyage_id"))}
                 except Exception:
-                    doc = {}
                     mongo_fetch_error = True
             if not isinstance(doc, dict):
                 doc = {}
-            mongo_row_count = len(mongo_docs) if mongo_docs else (1 if doc else 0)
+            mongo_row_count = 1 if doc else 0
             self._trace(state, {
                 "phase": "multi_step_result",
                 "step_index": 2,
@@ -4695,9 +4732,9 @@ class GraphRouter:
                 if isinstance(mv0, dict) and mv0.get("vesselName"):
                     mongo_vessel_name = mv0.get("vesselName")
             financial_data_postgres = {
-                "voyage_id": selected_fin.get("voyage_id"),
+                "voyage_id": selected_fin.get("voyage_id") or canon.get("voyage_id"),
                 "voyage_number": selected_fin.get("voyage_number") or slots.get("voyage_number"),
-                "vessel_name": (mongo_vessel_name or selected_fin.get("vessel_name")) if explicit_voyage_only else (selected_fin.get("vessel_name") or mongo_vessel_name),
+                "vessel_name": mongo_vessel_name or selected_fin.get("vessel_name") or canon.get("vessel_name"),
                 "pnl": selected_fin.get("pnl"),
                 "revenue": selected_fin.get("revenue"),
                 "total_expense": selected_fin.get("total_expense"),
@@ -4705,12 +4742,8 @@ class GraphRouter:
                 "total_commission": selected_fin.get("total_commission"),
                 "scenario": selected_fin.get("scenario"),
             }
-            if len(mongo_docs) == 1:
-                metadata_mongodb = select_voyage_sections(user_input, mongo_docs[0], session_context)
-            elif len(mongo_docs) > 1:
-                metadata_mongodb = {
-                    "voyages": [select_voyage_sections(user_input, d, session_context) for d in mongo_docs],
-                }
+            if doc:
+                metadata_mongodb = select_voyage_sections(user_input, doc, session_context)
             else:
                 metadata_mongodb = {}
 
@@ -5149,9 +5182,16 @@ class GraphRouter:
                 vid = mongo_safe.get("voyage_id")
                 vnum = mongo_safe.get("voyage_number")
                 remarks = mongo_safe.get("remarks") or []
-                fixtures = mongo_safe.get("fixtures") or []
                 if not session_may_access_finance_kpi(session_context):
-                    fixtures = []
+                    mongo_row_payload = build_mongo_llm_row_for_ops_tenant(mongo_safe)
+                else:
+                    fixtures = mongo_safe.get("fixtures") or []
+                    mongo_row_payload = {
+                        "voyageId": str(vid) if vid is not None else None,
+                        "voyageNumber": str(vnum) if vnum is not None else None,
+                        "remarks": remarks,
+                        "fixtures": fixtures,
+                    }
                 mongo_llm_like = {
                     "mode": "mongo_llm",
                     "ok": True,
@@ -5159,14 +5199,7 @@ class GraphRouter:
                     "filter": {"voyageId": str(vid)} if vid else ({"voyageNumber": str(vnum)} if vnum else {}),
                     "projection": get_mongo_projection("single_path_mongo_payload"),
                     "limit": 1,
-                    "rows": [
-                        {
-                            "voyageId": str(vid) if vid is not None else None,
-                            "voyageNumber": str(vnum) if vnum is not None else None,
-                            "remarks": remarks,
-                            "fixtures": fixtures,
-                        }
-                    ] if (vid or vnum) else [],
+                    "rows": [mongo_row_payload] if (vid or vnum) and mongo_row_payload else [],
                 }
 
             merged = {
@@ -5266,6 +5299,31 @@ class GraphRouter:
                 state["ops"] = ops_safe
                 state["mongo"] = mongo_llm_like
                 return state
+
+            # Ops-only tenants: give summarizer a flat merged_rows row (ports/grades/delays/remarks).
+            if not session_may_access_finance_kpi(session_context):
+                ops_rows_pre = ops_safe.get("rows") if isinstance(ops_safe, dict) else []
+                ops_row_pre = None
+                if isinstance(ops_rows_pre, list) and ops_rows_pre and isinstance(ops_rows_pre[0], dict):
+                    ops_row_pre = copy.deepcopy(ops_rows_pre[0])
+                    shrink_ops_row_json_fields(ops_row_pre, voyage_summary=True)
+                mongo_for_row: Dict[str, Any] = dict(mongo_safe) if isinstance(mongo_safe, dict) else {}
+                if isinstance(mongo_data, dict):
+                    for mk in ("legs", "fixtures", "remarks", "voyage_id", "voyage_number", "vessel_name", "vessel_imo"):
+                        if mongo_data.get(mk) not in (None, "", [], {}) and not mongo_for_row.get(mk):
+                            mongo_for_row[mk] = mongo_data.get(mk)
+                flat_row = build_voyage_summary_merged_row(
+                    ops_row=ops_row_pre,
+                    mongo_safe=mongo_for_row,
+                    slots=slots,
+                )
+                if flat_row:
+                    art = merged.get("artifacts")
+                    if not isinstance(art, dict):
+                        art = {"intent_key": intent_key, "slots": slots}
+                        merged["artifacts"] = art
+                    art["merged_rows"] = [flat_row]
+                    art["finance_kpi_unavailable"] = True
 
             try:
                 merged_llm = GraphRouter._sanitize_for_llm(compact_payload(merged))
@@ -6393,6 +6451,23 @@ class GraphRouter:
             mongo_rows: list[Dict[str, Any]] = []
             trace_queries: list[Dict[str, Any]] = []
 
+            # Mongo-only metadata still resolves one canonical voyage → one vessel.
+            try:
+                canon_ctx = self.mongo_agent.fetch_full_voyage_context(
+                    voyage_number=slots.get("voyage_number"),
+                    voyage_id=slots.get("voyage_id"),
+                    entity_slots=slots,
+                )
+            except Exception:
+                canon_ctx = {}
+            if isinstance(canon_ctx, dict) and canon_ctx.get("voyage_id"):
+                slots["voyage_id"] = str(canon_ctx.get("voyage_id"))
+                if canon_ctx.get("vessel_imo"):
+                    slots["imo"] = str(canon_ctx.get("vessel_imo"))
+                    slots["vessel_imo"] = str(canon_ctx.get("vessel_imo"))
+                if canon_ctx.get("vessel_name"):
+                    slots["vessel_name"] = str(canon_ctx.get("vessel_name"))
+
             # Primary anchors: voyage_id / voyage_number(s)
             if slots.get("voyage_id") not in (None, ""):
                 voyage_id = str(slots.get("voyage_id"))
@@ -6439,6 +6514,8 @@ class GraphRouter:
                     }
                 )
             for vnum in unique_vnums:
+                if slots.get("voyage_id") not in (None, ""):
+                    break
                 try:
                     batch = self.mongo_agent.adapter.list_voyages_by_number(
                         vnum,
@@ -6448,7 +6525,27 @@ class GraphRouter:
                 except Exception:
                     batch = []
                 narrowed = narrow_voyage_rows_by_entity_slots(batch, slots)
-                for doc in narrowed:
+                if len(narrowed) > 1 and not (slots.get("vessel_name") or slots.get("imo") or slots.get("vessel_imo")):
+                    try:
+                        picked = self.mongo_agent.fetch_full_voyage_context(
+                            voyage_number=vnum,
+                            voyage_id=slots.get("voyage_id"),
+                            entity_slots=slots,
+                        )
+                    except Exception:
+                        picked = {}
+                    if isinstance(picked, dict) and picked.get("voyage_id"):
+                        try:
+                            one_doc = self.mongo_agent.adapter.fetch_voyage(
+                                str(picked.get("voyage_id")),
+                                projection=projection,
+                            )
+                        except Exception:
+                            one_doc = None
+                        if isinstance(one_doc, dict) and one_doc:
+                            narrowed = [one_doc]
+                            slots["voyage_id"] = str(picked.get("voyage_id"))
+                for doc in narrowed[:1]:
                     if isinstance(doc, dict) and doc:
                         records.append(doc)
                         mongo_rows.append(doc)

@@ -1,6 +1,24 @@
 # Routing policy data.
 # Python should execute routing logic; this file owns tunable keyword sets.
 
+planner_ops_keywords:
+  - delay
+  - delays
+  - delayed
+  - offhire
+  - off-hire
+  - operational
+  - operationally
+  - what went wrong
+  - went wrong
+  - root cause
+  - incident
+  - demurrage
+  - waiting
+  - congestion
+  - laytime
+  - deviation
+
 planner_source_keywords:
   finance:
     - pnl
@@ -266,6 +284,23 @@ older_vessel_markers:
   - earlier vessel
   - before vessel
   - last vessel
+
+# Write/delete/modify data requests — analytics assistant is read-only (Postgres + Mongo).
+read_only_mutation_markers:
+  - delete
+  - remove row
+  - remove rows
+  - drop table
+  - drop the
+  - truncate
+  - wipe
+  - erase
+  - insert into
+  - update the row
+  - update rows
+  - modify the data
+  - change the data in
+  - alter table
 
 simple_voyage_analytical_markers:
   - compare

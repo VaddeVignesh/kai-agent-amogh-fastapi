@@ -14,6 +14,8 @@ from app.config.routing_rules_loader import (
     get_planner_single_vessel_composite_terms,
     get_planner_text_composite_overrides,
     get_planner_voyage_metadata_terms,
+    is_voyage_composite_profile_query,
+    is_voyage_operational_profile_query,
 )
 from app.registries.intent_loader import get_yaml_registry_facade
 
@@ -205,14 +207,30 @@ class Planner:
                 ],
             ), "cargo_grade_composite")
 
-        # MIXED voyage intent: financial + metadata in one anchored query.
+        # Composite voyage profile (executive summary, financial + ports/remarks):
+        # use voyage.summary single path — one canonical vessel + deterministic answer.
+        _has_voyage_anchor = bool(
+            slots.get("voyage_number")
+            or slots.get("voyage_id")
+            or (isinstance(slots.get("voyage_numbers"), list) and len(slots.get("voyage_numbers") or []) >= 1)
+        )
+        if _has_voyage_anchor and (
+            is_voyage_composite_profile_query(text, slots)
+            or is_voyage_operational_profile_query(text, slots)
+        ):
+            return _with_plan_log(ExecutionPlan(
+                plan_type="single",
+                intent_key="voyage.summary",
+                required_slots=[],
+                confidence=0.97,
+                steps=[],
+            ), "voyage_composite_profile_single")
+
+        # MIXED voyage intent: finance + mongo metadata (voyage.metadata only).
+        # voyage.summary already runs mongo + finance + ops on the single path with one canonical vessel.
         if (
-            intent_key in ("voyage.metadata", "voyage.summary")
-            and (
-                (isinstance(slots.get("voyage_numbers"), list) and len(slots.get("voyage_numbers") or []) >= 1)
-                or slots.get("voyage_number")
-                or slots.get("voyage_id")
-            )
+            intent_key == "voyage.metadata"
+            and _has_voyage_anchor
             and _is_mixed_voyage_query(text, session_context)
         ):
             return _with_plan_log(ExecutionPlan(
@@ -254,7 +272,11 @@ class Planner:
             rankingish = any(k in text_lower for k in get_planner_rankingish_terms())
             if not rankingish and ("voyage" in text_lower or (intent_key or "").startswith("voyage.")):
                 voyage_intent = intent_key if (intent_key or "").startswith("voyage.") else "voyage.summary"
-                if voyage_intent == "voyage.summary":
+                if (
+                    voyage_intent == "voyage.summary"
+                    and not is_voyage_composite_profile_query(text, slots)
+                    and not is_voyage_operational_profile_query(text, slots)
+                ):
                     if any(k in text_lower for k in get_planner_voyage_metadata_terms()):
                         voyage_intent = "voyage.metadata"
                 return _with_plan_log(ExecutionPlan(

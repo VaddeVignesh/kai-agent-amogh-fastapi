@@ -459,10 +459,12 @@ class OpsAgent:
             vessel_imo = s.get("imo") or s.get("vessel_imo")
             if not voyage_number and not voyage_id:
                 raise ValueError(get_ops_validation_message("voyage_summary_requires_reference"))
+            vessel_name = s.get("vessel_name")
             params = {
                 "voyage_number": str(int(voyage_number)) if voyage_number is not None and not voyage_id else None,
                 "voyage_id": str(voyage_id) if voyage_id is not None else None,
                 "vessel_imo": str(vessel_imo) if vessel_imo is not None else None,
+                "vessel_name": str(vessel_name).strip() if vessel_name not in (None, "", [], {}) else None,
                 "limit": 1,
             }
             # Tenants without finance KPI still need ops voyage rows; kpi.* SQL joins finance_voyage_kpi.
@@ -470,6 +472,14 @@ class OpsAgent:
                 return "ops.voyage_by_reference", params
             params["scenario"] = s.get("scenario") or get_default_scenario()
             return "kpi.voyage_by_reference", params
+
+        if intent_key in ("ops.port_query", "ops.voyages_by_port", "port.details") and not session_may_access_finance_kpi(
+            session_context
+        ):
+            port_name = s.get("port_name")
+            if not port_name:
+                raise ValueError(f"{intent_key} requires port_name")
+            return "ops.port_details", {"port_name": str(port_name).strip(), "limit": limit}
 
         if intent_key == "vessel.summary":
             vessel_ref = s.get("vessel_name") or s.get("imo")
