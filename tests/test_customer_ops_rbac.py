@@ -8,8 +8,14 @@ from app.config.response_rules_loader import get_finance_kpi_scope_restricted_us
 from app.agents.finance_agent import FinanceAgent
 from app.agents.ops_agent import OpsAgent
 from app.auth import ROLE_ACCESS, USERS, get_role_access, get_session_postgres_table_allowlist
+from app.llm.llm_client import LLMClient, LLMConfig
 from app.orchestration.graph_router import GraphRouter
 from app.sql.registry_role_access import is_registry_query_allowed_for_session
+from app.utils.mongo_ops_slice import (
+    build_mongo_llm_row_for_ops_tenant,
+    build_voyage_summary_merged_row,
+    operational_fixtures_for_summary,
+)
 
 
 def test_ops_only_voyage_snapshot_markdown_uses_shrunk_ports() -> None:
@@ -62,9 +68,10 @@ def test_registry_ops_voyage_by_reference_allowed_for_ops_only() -> None:
 def test_ops_map_intent_voyage_summary_sql_key_by_role() -> None:
     mock_pg = MagicMock()
     agent = OpsAgent(mock_pg)
-    slots = {"voyage_number": 2302}
-    qk_ops, _ = agent.map_intent("voyage.summary", slots, {"role_access": get_role_access("customer_ops_only")})
+    slots = {"voyage_number": 2302, "vessel_name": "Emma Grace"}
+    qk_ops, params = agent.map_intent("voyage.summary", slots, {"role_access": get_role_access("customer_ops_only")})
     assert qk_ops == "ops.voyage_by_reference"
+    assert params.get("vessel_name") == "Emma Grace"
     qk_full, params = agent.map_intent("voyage.summary", slots, {"role_access": get_role_access("customer")})
     assert qk_full == "kpi.voyage_by_reference"
     assert "scenario" in params
@@ -111,3 +118,51 @@ def test_ops_agent_run_allows_pure_ops_registry_query() -> None:
     mock_pg.fetch_all.assert_called_once_with(
         "kpi.vessel_most_common_grades", {"vessel_imos": ["123"]},
     )
+
+
+def test_operational_fixtures_keep_ports_not_hire_rates() -> None:
+    fixtures = [
+        {
+            "hireRate": 50000,
+            "fixturePorts": [{"portName": "Rotterdam", "activityType": "D"}],
+            "fixtureGrades": [{"gradeName": "NHC"}],
+        }
+    ]
+    slim = operational_fixtures_for_summary(fixtures)
+    assert len(slim) == 1
+    assert slim[0]["fixturePorts"][0]["portName"] == "Rotterdam"
+    assert slim[0]["fixtureGrades"][0]["gradeName"] == "NHC"
+    assert "hireRate" not in slim[0]
+
+
+def test_build_voyage_summary_merged_row_combines_ops_and_mongo() -> None:
+    ops_row = {
+        "voyage_number": 2305,
+        "vessel_name": "Emma Grace",
+        "offhire_days": 0,
+        "is_delayed": False,
+        "ports": ["Singapore"],
+        "cargo_grade_names": ["NHC"],
+    }
+    mongo_safe = {
+        "voyage_number": 2305,
+        "vessel_name": "Emma Grace",
+        "legs": [{"portName": "Rotterdam", "activityType": "D"}],
+        "fixtures": [{"fixturePorts": [{"portName": "Apapa", "activityType": "L"}], "fixtureGrades": []}],
+        "remarks": [{"remark": "Waiting at berth", "text": "Waiting at berth"}],
+    }
+    row = build_voyage_summary_merged_row(ops_row=ops_row, mongo_safe=mongo_safe, slots={})
+    assert "Singapore" in row.get("key_ports", [])
+    assert "Rotterdam" in row.get("key_ports", [])
+    assert "Apapa" in row.get("key_ports", [])
+    assert "NHC" in row.get("cargo_grades", [])
+
+
+def test_ops_port_query_maps_to_ops_port_details_for_ops_only() -> None:
+    mock_pg = MagicMock()
+    agent = OpsAgent(mock_pg)
+    ctx = {"role_access": get_role_access("customer_ops_only")}
+    qk, params = agent.map_intent("ops.port_query", {"port_name": "Singapore", "limit": 5}, ctx)
+    assert qk == "ops.port_details"
+    assert params.get("port_name") == "Singapore"
+    assert is_registry_query_allowed_for_session(qk, ctx) is True

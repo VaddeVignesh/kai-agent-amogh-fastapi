@@ -88,8 +88,8 @@ def test_graph_router_prompts_load_from_yaml() -> None:
     multi_voyage_prompt = get_graph_router_multi_voyage_answer_system_prompt()
     voyage_metadata_prompt = get_graph_router_voyage_metadata_answer_system_prompt()
 
-    assert "TWO sources" in multi_voyage_prompt
-    assert "FINANCIAL DATA" in multi_voyage_prompt
+    assert "voyages" in multi_voyage_prompt
+    assert "financial_data_postgres" in multi_voyage_prompt
     assert "Voyage Data" not in voyage_metadata_prompt
     assert "Format money fields" in voyage_metadata_prompt
     assert "modifiedByFull" in voyage_metadata_prompt

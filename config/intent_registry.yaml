@@ -58,6 +58,7 @@ intents:
     required_slots:
     - voyage_number
     optional_slots:
+    - voyage_numbers
     - voyage_id
     - scenario
     needs:

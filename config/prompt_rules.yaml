@@ -433,7 +433,9 @@ llm_client:
     - First identify the PRIMARY subject the rows should represent: voyages, vessels, cargo grades, ports, module types, or a single anchored entity.
     - Supporting columns do NOT change the primary subject. Example: if the user asks for voyages and also wants cargo grades/ports/remarks as extra columns, the intent is still a voyage intent.
     - If the user names a SPECIFIC vessel by name or IMO -> use vessel.summary or vessel.metadata
-    - If the user names a SPECIFIC voyage by number -> use voyage.summary
+    - If the user names ONE specific voyage by number -> use voyage.summary
+    - If the user names TWO OR MORE voyage numbers in the same "tell me about" / summary question (e.g. "voyage 1901 and 1902", "about 2302 and 2306") -> use voyage.summary (NOT comparison.voyages) and put EVERY mentioned number in slots.voyage_numbers (ordered list of ints). Do NOT put only the first number.
+    - Use comparison.voyages only when the user explicitly asks to compare (compare, vs, versus, difference between, better/worse between).
     - If the user asks about the ENTIRE fleet with no specific entity -> use ranking.*, aggregation.*, or analysis.* intents
     - Intents marked FLEET-WIDE must NEVER have vessel_name or voyage_number in slots - those fields should be absent
     - NEVER extract vessel_name from query phrases like "highest PnL", "most voyages", "best performing", "earned the most" - those are metrics, not vessel names
@@ -459,6 +461,16 @@ llm_client:
     - Use composite.query only when the question genuinely requires combining heterogeneous data in a way no single ranking/analysis intent can represent.
 
     SLOT EXTRACTION:
+    - voyage_numbers: list[int] | null
+      Extract EVERY voyage number the user explicitly mentions (3-5 digit labels such as 1901, 2302).
+      Examples:
+        "tell me about voyage 1901 and 1902"     -> [1901, 1902]  (intent voyage.summary)
+        "tell me about 2302 and 2306"            -> [2302, 2306]  (intent voyage.summary)
+        "compare voyage 1901 vs 1902"            -> [1901, 1902]  (intent comparison.voyages)
+        "financial summary for voyage 2306"      -> [2306] only; also set voyage_number=2306
+      If exactly one voyage number is mentioned, set voyage_number to that int AND voyage_numbers to a one-element list.
+      If two or more are mentioned, set voyage_numbers only (omit voyage_number).
+      Do NOT treat "top 10" limit as a voyage number.
     - cargo_grades: list[str] | null
       Any petroleum/chemical cargo grade or product type the user mentions
       (e.g. "Naphtha", "Crude", "VLSFO", "Jet Fuel", "DPP", "CPP", "LNG", "Gasoil", etc.).
@@ -715,13 +727,16 @@ llm_client:
 graph_router:
   multi_voyage_answer_system_prompt: |
     You are a voyage data analyst.
-    You have been given data from TWO sources:
-    1. FINANCIAL DATA (ACTUAL settled figures, use these for PnL/revenue/expense/TCE)
-    2. METADATA (use these for ports, cargo, remarks, fixture, bunkers)
-    Never mix the two sources. Always prefer FINANCIAL DATA for any financial figure.
-    One voyage number maps to exactly ONE vessel — use only the vessel name/IMO in financial_data_postgres and the single metadata document.
-    Never state that multiple vessels are assigned to the same voyage number.
-    Write a clean business answer for end users. Do NOT mention internal source names, system/debug wording,
+    Context JSON contains a `voyages` array — one entry per voyage number the user asked about.
+    For EACH entry use:
+    1. financial_data_postgres — ACTUAL settled figures (PnL/revenue/expense/TCE)
+    2. metadata_mongodb — ports, cargo, remarks, fixture, bunkers
+    3. ops_summary (when present) — operational highlights (offhire, delays, port calls)
+    Never mix financial and metadata sources. Always prefer financial_data_postgres for money metrics.
+    One voyage number maps to exactly ONE vessel per entry. Never state multiple vessels share one voyage number.
+    Write a separate clear section per voyage (e.g. "Voyage 1901", "Voyage 1902"). Do NOT write a comparison table
+    unless the user explicitly asked to compare voyages.
+    Do NOT mention internal source names, system/debug wording,
     or phrases like 'from PostgreSQL', 'from MongoDB', 'from provided data', or 'dataset shows'.
   voyage_metadata_answer_system_prompt: |
     You are a voyage data analyst.

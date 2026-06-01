@@ -94,6 +94,11 @@ from app.config.routing_rules_loader import (
     get_llm_voyage_resolved_vessel_metadata_terms,
 )
 from app.core.logger import get_logger
+from app.utils.voyage_slot_extract import (
+    extract_voyage_numbers_from_text,
+    merge_voyage_slot_fields,
+    normalize_query_text,
+)
 
 logger = get_logger("llm_client")
 
@@ -205,21 +210,15 @@ class LLMClient:
         if any(k in t for k in get_llm_scenario_comparison_terms()) or ("actual" in t and "variance" in t):
             return "analysis.scenario_comparison"
 
-        # Explicit voyage-to-voyage comparison with 2+ voyage numbers.
-        if any(k in t for k in get_llm_comparison_terms()):
-            nums = re.findall(r"\b\d{3,5}\b", t)
-            if len(nums) >= 2:
-                return "comparison.voyages"
-
         # Voyage-anchored port listing should stay voyage-scoped.
         if re.search(r"\bvoyage\s+\d{3,5}\b", t) and any(
             k in t for k in get_llm_voyage_port_listing_terms()
         ):
             return "voyage.metadata"
 
-        # 0) "Tell me about voyage 1901" / "voyage 1901 summary" → voyage summary
+        # 0) "Tell me about voyage 1901" / "voyage 1901 summary" → voyage summary (single only)
         if "voyage" in t and any(k in t for k in get_llm_entity_summary_terms()):
-            if re.search(r"\bvoyage\s+\d{3,5}\b", t):
+            if len(extract_voyage_numbers_from_text(text)) <= 1 and re.search(r"\bvoyage\s+\d{3,5}\b", t):
                 return "voyage.summary"
 
         # 0) "Tell me about vessel ..." → vessel summary
@@ -466,14 +465,7 @@ class LLMClient:
         session_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
 
-        # Normalize common apostrophe variants (incl. mojibake) to improve regex reliability.
-        text_norm = (text or "")
-        text_norm = (
-            text_norm.replace("\u2019", "'")
-            .replace("\u2018", "'")
-            .replace("\u00e2\u20ac\u2122", "'")
-            .replace("\u00e2\u20ac\u02dc", "'")
-        )
+        text_norm = normalize_query_text(text or "")
 
         from app.config.routing_rules_loader import is_read_only_mutation_request
 
@@ -490,15 +482,8 @@ class LLMClient:
         # 1️⃣ Deterministic override
         deterministic = self._deterministic_intent(text_norm, session_context)
 
-        # 2️⃣ Regex slot extraction (always)
+        # 2️⃣ Regex slot extraction (non-voyage fields only; voyage numbers come from LLM + fallback)
         slots: Dict[str, Any] = {}
-
-        # Voyage numbers
-        voyages = re.findall(r"\b\d{3,4}\b", text_norm)
-        if voyages:
-            slots["voyage_numbers"] = [int(v) for v in voyages]
-            if len(slots["voyage_numbers"]) == 1:
-                slots["voyage_number"] = slots["voyage_numbers"][0]
 
         for_voyage_vessel = re.search(
             r"(?i)\bfor\s+([A-Z][a-z0-9]+(?:\s+[A-Z][a-z0-9]+){0,4})\s+voyage\b",
@@ -675,7 +660,7 @@ class LLMClient:
             logger.debug(f"[intent_routing] final intent: {intent_key}")
             return {
                 "intent_key": intent_key,
-                "slots": self._sanitize_slots(slots),
+                "slots": self._sanitize_slots(merge_voyage_slot_fields(slots, text_norm)),
                 "is_followup": False,
                 "inherit_slots_from_session": [],
                 "backward_reference": False,
@@ -741,9 +726,13 @@ class LLMClient:
         if followup_confidence not in ("high", "medium", "low"):
             followup_confidence = "low"
 
-        # Merge regex + llm slots (regex wins)
-        llm_slots.update({k: v for k, v in slots.items()})
-        clean_slots = self._sanitize_slots(llm_slots)
+        # Merge: LLM slots primary for voyage numbers; regex fills vessel/imo/port/limit only
+        voyage_slot_keys = {"voyage_number", "voyage_numbers", "voyage_id"}
+        merged_slots = dict(llm_slots)
+        for key, value in slots.items():
+            if key not in voyage_slot_keys:
+                merged_slots[key] = value
+        clean_slots = self._sanitize_slots(merge_voyage_slot_fields(merged_slots, text_norm))
         ql = text_norm.lower()
         rankingish_terms = ("top", "rank", "ranking", "compare", "vs", "versus")
 
@@ -762,10 +751,25 @@ class LLMClient:
                     intent = "ranking.voyages_by_pnl"
 
         voyage_numbers_list = clean_slots.get("voyage_numbers") if isinstance(clean_slots.get("voyage_numbers"), list) else []
-        has_single_voyage_anchor = bool(clean_slots.get("voyage_number")) or len(voyage_numbers_list) == 1
+        if len(voyage_numbers_list) >= 2:
+            clean_slots.pop("voyage_number", None)
+        compare_explicit = any(
+            k in ql for k in ("compare", " versus", " vs ", "vs ", "difference between", "better than", "worse than")
+        )
+        if len(voyage_numbers_list) >= 2 and re.search(r"\bvoyag", ql):
+            if compare_explicit:
+                intent = "comparison.voyages"
+            else:
+                intent = "voyage.summary"
+            clean_slots.pop("vessel_name", None)
+            clean_slots.pop("imo", None)
+            clean_slots.pop("vessel_imo", None)
+        has_voyage_anchor = bool(clean_slots.get("voyage_number")) or len(voyage_numbers_list) >= 1
         asks_voyage_details = any(
             k in ql
             for k in (
+                "tell me about",
+                "about",
                 "what does the data show",
                 "summary",
                 "incident",
@@ -781,7 +785,7 @@ class LLMClient:
                 "cargo grade",
             )
         )
-        if has_single_voyage_anchor and asks_voyage_details and not any(k in ql for k in rankingish_terms):
+        if has_voyage_anchor and asks_voyage_details and not any(k in ql for k in rankingish_terms):
             if any(k in ql for k in metadata_keywords):
                 intent = "voyage.metadata"
             else:
@@ -889,9 +893,12 @@ class LLMClient:
                 vns = slots["voyage_numbers"]
                 if not isinstance(vns, list):
                     vns = [vns]
-                clean["voyage_numbers"] = [
-                    int(float(v)) for v in vns if str(v).isdigit()
-                ]
+                clean["voyage_numbers"] = []
+                for v in vns:
+                    try:
+                        clean["voyage_numbers"].append(int(float(v)))
+                    except (TypeError, ValueError):
+                        continue
             except Exception:
                 pass
 
@@ -2137,18 +2144,35 @@ class LLMClient:
 
         if style.get("ask_ports", True):
             ports: List[str] = []
+            def _append_port(value: Any) -> None:
+                if isinstance(value, dict):
+                    pn = str(
+                        value.get("portName")
+                        or value.get("port_name")
+                        or value.get("port")
+                        or value.get("name")
+                        or ""
+                    ).strip()
+                    if pn:
+                        ports.append(pn)
+                elif str(value).strip():
+                    ports.append(str(value).strip())
+
             if isinstance(ops_row.get("ports"), list):
-                ports = [str(p).strip() for p in ops_row["ports"] if str(p).strip()]
-            elif isinstance(ops_row.get("key_ports"), list):
+                for p in ops_row["ports"]:
+                    _append_port(p)
+            if isinstance(ops_row.get("key_ports"), list):
                 for p in ops_row["key_ports"]:
-                    if isinstance(p, dict):
-                        pn = str(p.get("portName") or p.get("port_name") or "").strip()
-                        if pn:
-                            ports.append(pn)
-                    elif str(p).strip():
-                        ports.append(str(p).strip())
-            elif isinstance(ops_row.get("ports_json"), list):
-                ports = [str(p).strip() for p in ops_row["ports_json"] if str(p).strip()]
+                    _append_port(p)
+            if isinstance(ops_row.get("ports_json"), list):
+                for p in ops_row["ports_json"]:
+                    _append_port(p)
+            # De-duplicate while preserving voyage order.
+            seen_ports: set[str] = set()
+            ports = [
+                p for p in ports
+                if not (p.casefold() in seen_ports or seen_ports.add(p.casefold()))
+            ]
             lines.extend(["", "### Main ports involved"])
             if ports:
                 for p in ports[:12]:

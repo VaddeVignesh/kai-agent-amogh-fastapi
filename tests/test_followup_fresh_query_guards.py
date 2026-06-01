@@ -53,6 +53,16 @@ def test_classify_turn_type_long_show_me_is_new_question_with_stale_result_set()
     assert GraphRouter._classify_turn_type(session_ctx=ctx, user_input=q) == "new_question"
 
 
+def test_named_vessel_performance_question_is_fresh_with_stale_result_set() -> None:
+    ctx: dict = {"last_result_set": {"rows": [{"voyage_number": 2306, "pnl": 419181.96}]}}
+    q = (
+        "how do Stena Superior performing well overall? Show its voyage history with PnL, "
+        "identify best and worst voyage, and include any remarks for those voyages."
+    )
+    assert GraphRouter._looks_like_explicit_fresh_entity_request(q) is True
+    assert GraphRouter._classify_turn_type(session_ctx=ctx, user_input=q) == "new_question"
+
+
 def test_parse_result_set_followup_returns_none_for_long_prefixed_query() -> None:
     ctx: dict = {"last_result_set": {"rows": [{"pnl": 1.0}]}}
     q = (

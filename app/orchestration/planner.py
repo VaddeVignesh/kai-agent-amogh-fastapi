@@ -267,25 +267,34 @@ class Planner:
                 ],
             ), "mixed_voyage_multi")
 
-        # SINGLE voyage only
-        if slots.get("voyage_numbers") and len(slots["voyage_numbers"]) == 1:
+        # SINGLE or multi voyage anchor (2+ numbers → per-voyage summary sections, not compare)
+        vnums = slots.get("voyage_numbers")
+        if isinstance(vnums, list) and len(vnums) >= 1:
             rankingish = any(k in text_lower for k in get_planner_rankingish_terms())
+            compare_explicit = any(
+                k in text_lower for k in ("compare", " versus", " vs ", "vs ", "difference between")
+            )
             if not rankingish and ("voyage" in text_lower or (intent_key or "").startswith("voyage.")):
-                voyage_intent = intent_key if (intent_key or "").startswith("voyage.") else "voyage.summary"
-                if (
-                    voyage_intent == "voyage.summary"
-                    and not is_voyage_composite_profile_query(text, slots)
-                    and not is_voyage_operational_profile_query(text, slots)
-                ):
-                    if any(k in text_lower for k in get_planner_voyage_metadata_terms()):
-                        voyage_intent = "voyage.metadata"
-                return _with_plan_log(ExecutionPlan(
-                    plan_type="single",
-                    intent_key=voyage_intent,
-                    required_slots=[],
-                    confidence=0.95,
-                    steps=[],
-                ), "single_voyage")
+                if len(vnums) >= 2 and compare_explicit:
+                    pass  # comparison.voyages composite path
+                else:
+                    voyage_intent = intent_key if (intent_key or "").startswith("voyage.") else "voyage.summary"
+                    if intent_key == "comparison.voyages" and len(vnums) >= 2 and not compare_explicit:
+                        voyage_intent = "voyage.summary"
+                    if (
+                        voyage_intent == "voyage.summary"
+                        and not is_voyage_composite_profile_query(text, slots)
+                        and not is_voyage_operational_profile_query(text, slots)
+                    ):
+                        if any(k in text_lower for k in get_planner_voyage_metadata_terms()):
+                            voyage_intent = "voyage.metadata"
+                    return _with_plan_log(ExecutionPlan(
+                        plan_type="single",
+                        intent_key=voyage_intent,
+                        required_slots=[],
+                        confidence=0.95,
+                        steps=[],
+                    ), "single_voyage" if len(vnums) == 1 else "multi_voyage_summary_single")
 
         # SINGLE vessel only
         if (
